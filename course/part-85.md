@@ -1,855 +1,1198 @@
-# Part 85: Microservices Debugging
+# Part 85: Debugging Microservices
 
 ## บทนำ
 
-การ debug ใน distributed system นั้นยากกว่า monolith มาก เพราะ error อาจเกิดจาก service ใดก็ได้ในหลาย services บทนี้จะให้ทั้ง tools, techniques, และ methodologies สำหรับ debug microservices อย่างมีประสิทธิภาพ
+การ debug ระบบ Microservices มีความซับซ้อนมากกว่า Monolith เนื่องจาก request หนึ่งอาจผ่านหลาย service การหา root cause จึงต้องใช้เครื่องมือหลายอย่างประกอบกัน บทนี้จะแนะนำวิธีการ debug ตั้งแต่ correlation IDs ไปจนถึง chaos engineering
 
 ---
 
-## Distributed Tracing Deep Dive
+## 1. Distributed Debugging with Correlation IDs
 
-### การตั้งค่า OpenTelemetry
+### 1.1 Correlation ID Middleware
 
 ```typescript
-// services/order/src/tracing.ts
-// ต้อง import ก่อน modules อื่นทั้งหมด (top of main.ts)
+// src/middleware/correlation.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import { AsyncLocalStorage } from 'async_hooks';
 
+interface RequestContext {
+  requestId: string;
+  correlationId: string;
+  userId?: string;
+  sessionId?: string;
+  startTime: number;
+}
+
+// เก็บ context ใน async context (ไม่ต้อง pass ตลอด)
+export const asyncLocalStorage = new AsyncLocalStorage<RequestContext>();
+
+export const correlationMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  // รับ correlation ID จาก upstream หรือสร้างใหม่
+  const correlationId = 
+    req.headers['x-correlation-id'] as string ||
+    req.headers['x-trace-id'] as string ||
+    uuidv4();
+  
+  const requestId = uuidv4();
+  
+  const context: RequestContext = {
+    requestId,
+    correlationId,
+    userId: req.headers['x-user-id'] as string,
+    sessionId: req.headers['x-session-id'] as string,
+    startTime: Date.now(),
+  };
+  
+  // ตั้ง response headers
+  res.setHeader('X-Request-ID', requestId);
+  res.setHeader('X-Correlation-ID', correlationId);
+  
+  // เก็บ context ใน AsyncLocalStorage
+  asyncLocalStorage.run(context, () => {
+    next();
+  });
+};
+
+// Helper function เพื่อดึง context
+export function getRequestContext(): RequestContext | undefined {
+  return asyncLocalStorage.getStore();
+}
+
+// ใช้ใน logger
+export function getCorrelationId(): string {
+  return getRequestContext()?.correlationId || 'unknown';
+}
+```
+
+### 1.2 Propagation ไปยัง Downstream Services
+
+```typescript
+// src/utils/http-client.ts
+import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import { getRequestContext } from './correlation';
+
+export function createTracedHttpClient(baseURL: string): AxiosInstance {
+  const client = axios.create({ baseURL });
+  
+  // Interceptor: เพิ่ม correlation headers ทุก outbound request
+  client.interceptors.request.use((config) => {
+    const ctx = getRequestContext();
+    
+    if (ctx) {
+      config.headers = config.headers || {};
+      config.headers['X-Correlation-ID'] = ctx.correlationId;
+      config.headers['X-Request-ID'] = ctx.requestId;
+      config.headers['X-Parent-Request-ID'] = ctx.requestId;
+      
+      if (ctx.userId) {
+        config.headers['X-User-ID'] = ctx.userId;
+      }
+    }
+    
+    return config;
+  });
+  
+  // Interceptor: log outbound requests
+  client.interceptors.request.use((config) => {
+    const ctx = getRequestContext();
+    console.log({
+      level: 'info',
+      message: 'Outbound HTTP request',
+      correlationId: ctx?.correlationId,
+      method: config.method?.toUpperCase(),
+      url: `${config.baseURL}${config.url}`,
+      timestamp: new Date().toISOString(),
+    });
+    return config;
+  });
+  
+  return client;
+}
+```
+
+---
+
+## 2. Remote Debugging with Node.js Inspector
+
+### 2.1 Debug Configuration
+
+```yaml
+# docker-compose.debug.yml
+version: '3.8'
+services:
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile.debug
+    command: node --inspect=0.0.0.0:9229 --inspect-brk dist/main.js
+    ports:
+      - "3001:3000"
+      - "9229:9229"  # Debug port
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./user-service/src:/app/src:ro
+```
+
+```dockerfile
+# Dockerfile.debug
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Install development tools
+RUN npm install -g @nestjs/cli
+
+EXPOSE 3000 9229
+CMD ["node", "--inspect=0.0.0.0:9229", "dist/main.js"]
+```
+
+### 2.2 VS Code Debug Configuration
+
+```json
+// .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug User Service (Docker)",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "address": "localhost",
+      "localRoot": "${workspaceFolder}/user-service",
+      "remoteRoot": "/app",
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "restart": true,
+      "timeout": 10000
+    },
+    {
+      "name": "Debug All Services",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "address": "localhost",
+      "sourceMaps": true,
+      "restart": true
+    },
+    {
+      "name": "Debug Tests",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--inspect-brk",
+        "${workspaceFolder}/node_modules/.bin/jest",
+        "--runInBand",
+        "--no-coverage"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
+```
+
+### 2.3 Production Debugging (Safe)
+
+```typescript
+// src/utils/conditional-debug.ts
+import inspector from 'inspector';
+
+export function enableDebugIfRequested(req: any) {
+  // เปิด debug เฉพาะเมื่อมี debug token ที่ถูกต้อง
+  const debugToken = req.headers['x-debug-token'];
+  const expectedToken = process.env.DEBUG_TOKEN;
+  
+  if (!debugToken || !expectedToken || debugToken !== expectedToken) {
+    return;
+  }
+  
+  // ตรวจสอบ rate limiting สำหรับ debug sessions
+  const session = new inspector.Session();
+  session.connect();
+  
+  // เปิด profiling เป็นเวลา 10 วินาที
+  session.post('Profiler.enable', () => {
+    session.post('Profiler.start', () => {
+      setTimeout(() => {
+        session.post('Profiler.stop', (err, { profile }) => {
+          // Save profile
+          console.log('Profile captured:', JSON.stringify(profile).length, 'bytes');
+          session.disconnect();
+        });
+      }, 10000);
+    });
+  });
+}
+```
+
+---
+
+## 3. Log Aggregation with ELK Stack
+
+### 3.1 Elasticsearch + Logstash + Kibana Setup
+
+```yaml
+# docker-compose.elk.yml
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: curl -s http://localhost:9200/_cluster/health
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    volumes:
+      - ./config/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./config/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    ports:
+      - "5044:5044"   # Beats input
+      - "5000:5000"   # TCP input
+      - "9600:9600"   # Monitoring
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    user: root
+    volumes:
+      - ./config/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - logstash
+
+volumes:
+  elasticsearch_data:
+```
+
+```yaml
+# config/logstash/pipeline/microservices.conf
+input {
+  beats {
+    port => 5044
+  }
+  tcp {
+    port => 5000
+    codec => json_lines
+  }
+}
+
+filter {
+  # Parse JSON logs
+  if [message] =~ /^\{/ {
+    json {
+      source => "message"
+      target => "parsed"
+    }
+    
+    if "_jsonparsefailure" not in [tags] {
+      mutate {
+        replace => {
+          "level" => "%{[parsed][level]}"
+          "correlationId" => "%{[parsed][correlationId]}"
+          "service" => "%{[parsed][service]}"
+          "message" => "%{[parsed][message]}"
+        }
+      }
+    }
+  }
+  
+  # Extract service name from Docker container
+  if [docker][container][labels][com_docker_compose_service] {
+    mutate {
+      add_field => {
+        "service" => "%{[docker][container][labels][com_docker_compose_service]}"
+      }
+    }
+  }
+  
+  # Parse timestamp
+  date {
+    match => ["[parsed][timestamp]", "ISO8601"]
+    target => "@timestamp"
+  }
+  
+  # Remove raw message after parsing
+  mutate {
+    remove_field => ["parsed", "message"]
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "microservices-logs-%{+YYYY.MM.dd}"
+    document_id => "%{correlationId}-%{[@timestamp]}"
+  }
+  
+  # Debug output
+  if [@metadata][pipeline] == "debug" {
+    stdout { codec => rubydebug }
+  }
+}
+```
+
+### 3.2 Structured Logging
+
+```typescript
+// src/utils/logger.ts
+import winston from 'winston';
+import { ElasticsearchTransport } from 'winston-elasticsearch';
+import { getRequestContext } from './correlation';
+
+const { combine, timestamp, errors, json } = winston.format;
+
+// Custom format เพิ่ม correlation info
+const correlationFormat = winston.format((info) => {
+  const ctx = getRequestContext();
+  if (ctx) {
+    info.correlationId = ctx.correlationId;
+    info.requestId = ctx.requestId;
+    info.userId = ctx.userId;
+  }
+  return info;
+})();
+
+export const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: combine(
+    timestamp({ format: 'YYYY-MM-DDTHH:mm:ss.SSSZ' }),
+    errors({ stack: true }),
+    correlationFormat,
+    json()
+  ),
+  defaultMeta: {
+    service: process.env.SERVICE_NAME || 'unknown',
+    version: process.env.APP_VERSION || '0.0.0',
+    environment: process.env.NODE_ENV || 'development',
+  },
+  transports: [
+    // Console output
+    new winston.transports.Console({
+      format: process.env.NODE_ENV === 'development'
+        ? winston.format.combine(
+            winston.format.colorize(),
+            winston.format.simple()
+          )
+        : json(),
+    }),
+    
+    // File transport
+    new winston.transports.File({
+      filename: '/var/log/app/error.log',
+      level: 'error',
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 5,
+    }),
+    
+    // Elasticsearch transport (production)
+    ...(process.env.ELASTICSEARCH_URL ? [
+      new ElasticsearchTransport({
+        level: 'info',
+        clientOpts: {
+          node: process.env.ELASTICSEARCH_URL,
+        },
+        index: `microservices-${process.env.SERVICE_NAME}`,
+      })
+    ] : []),
+  ],
+});
+
+// Convenience methods with structured data
+export const log = {
+  info: (message: string, data?: Record<string, any>) => 
+    logger.info(message, data),
+  
+  error: (message: string, error: Error, data?: Record<string, any>) =>
+    logger.error(message, {
+      ...data,
+      error: {
+        message: error.message,
+        name: error.name,
+        stack: error.stack,
+      },
+    }),
+  
+  warn: (message: string, data?: Record<string, any>) =>
+    logger.warn(message, data),
+  
+  debug: (message: string, data?: Record<string, any>) =>
+    logger.debug(message, data),
+    
+  // HTTP request logging
+  http: (req: any, res: any, duration: number) =>
+    logger.info('HTTP Request', {
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+      duration,
+      userAgent: req.headers['user-agent'],
+      ip: req.ip,
+    }),
+};
+```
+
+---
+
+## 4. Distributed Tracing Analysis (Jaeger/Zipkin)
+
+### 4.1 OpenTelemetry Setup
+
+```typescript
+// src/tracing.ts - ต้อง import ก่อน everything else
 import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
-import {
-  SimpleSpanProcessor,
-  BatchSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
-import { ExpressInstrumentation } from '@opentelemetry/instrumentation-express';
-import { NestInstrumentation } from '@opentelemetry/instrumentation-nestjs-core';
-import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
-import { RedisInstrumentation } from '@opentelemetry/instrumentation-redis';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
 
-const sdk = new NodeSDK({
-  resource: new Resource({
-    [SemanticResourceAttributes.SERVICE_NAME]: 'order-service',
+const resource = Resource.default().merge(
+  new Resource({
+    [SemanticResourceAttributes.SERVICE_NAME]: process.env.SERVICE_NAME || 'user-service',
     [SemanticResourceAttributes.SERVICE_VERSION]: process.env.APP_VERSION || '1.0.0',
     [SemanticResourceAttributes.DEPLOYMENT_ENVIRONMENT]: process.env.NODE_ENV || 'development',
-    'service.team': 'order-team',
-  }),
+  })
+);
 
-  spanProcessor: new BatchSpanProcessor(
-    new OTLPTraceExporter({
-      url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces',
-      headers: {
-        'X-Service-Token': process.env.OTEL_AUTH_TOKEN || '',
-      },
-    }),
-    {
-      maxQueueSize: 2048,
-      maxExportBatchSize: 512,
-      scheduledDelayMillis: 5000,
-    }
-  ),
+const traceExporter = new OTLPTraceExporter({
+  url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces',
+});
 
+const sdk = new NodeSDK({
+  resource,
+  spanProcessor: new BatchSpanProcessor(traceExporter),
   instrumentations: [
-    new HttpInstrumentation({
-      // Filter health checks from traces
-      ignoreIncomingRequestHook: (request) => {
-        return ['/health', '/metrics', '/ready'].includes(request.url || '');
-      },
-      // Add custom attributes to all spans
-      requestHook: (span, request) => {
-        span.setAttribute('http.request_id', 
-          request.headers['x-request-id'] as string || ''
-        );
+    getNodeAutoInstrumentations({
+      '@opentelemetry/instrumentation-fs': { enabled: false },
+      '@opentelemetry/instrumentation-http': {
+        requestHook: (span, request) => {
+          // เพิ่ม correlation ID ใน span attributes
+          const correlationId = (request as any).headers?.['x-correlation-id'];
+          if (correlationId) {
+            span.setAttribute('correlation.id', correlationId);
+          }
+        },
       },
     }),
-    new ExpressInstrumentation(),
-    new NestInstrumentation(),
-    new PgInstrumentation({
-      enhancedDatabaseReporting: true, // เก็บ query parameters (ระวัง PII)
-    }),
-    new RedisInstrumentation(),
   ],
 });
 
 sdk.start();
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  sdk.shutdown().then(() => process.exit(0));
-});
+// Manual tracing สำหรับ business logic
+export const tracer = trace.getTracer(process.env.SERVICE_NAME || 'user-service');
+
+export async function traceOperation<T>(
+  operationName: string,
+  operation: () => Promise<T>,
+  attributes?: Record<string, string | number | boolean>
+): Promise<T> {
+  const span = tracer.startSpan(operationName, { attributes });
+  
+  try {
+    const result = await context.with(
+      trace.setSpan(context.active(), span),
+      operation
+    );
+    span.setStatus({ code: SpanStatusCode.OK });
+    return result;
+  } catch (error) {
+    span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: (error as Error).message,
+    });
+    span.recordException(error as Error);
+    throw error;
+  } finally {
+    span.end();
+  }
+}
 ```
 
-### Custom Span สำหรับ Business Logic
+### 4.2 Jaeger Setup
+
+```yaml
+# docker-compose.tracing.yml
+version: '3.8'
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: elasticsearch
+      ES_SERVER_URLS: http://elasticsearch:9200
+    ports:
+      - "5775:5775/udp"   # UDP compact
+      - "6831:6831/udp"   # UDP binary
+      - "6832:6832/udp"   # UDP binary compact
+      - "5778:5778"       # HTTP configs
+      - "16686:16686"     # Jaeger UI
+      - "14268:14268"     # HTTP collector
+      - "4317:4317"       # OTLP gRPC
+      - "4318:4318"       # OTLP HTTP
+```
+
+---
+
+## 5. Memory Leak Detection
+
+### 5.1 Memory Monitoring
 
 ```typescript
-// services/order/src/order.service.ts
+// src/utils/memory-monitor.ts
+import v8 from 'v8';
+import { performance } from 'perf_hooks';
 
-import { Injectable } from '@nestjs/common';
-import { trace, context, SpanStatusCode, SpanKind } from '@opentelemetry/api';
+interface MemorySnapshot {
+  timestamp: string;
+  heapUsed: number;
+  heapTotal: number;
+  external: number;
+  rss: number;
+  heapUsedMB: number;
+  heapTotalMB: number;
+  rssMB: number;
+}
 
-@Injectable()
-export class OrderService {
-  private readonly tracer = trace.getTracer('order-service');
+export class MemoryMonitor {
+  private snapshots: MemorySnapshot[] = [];
+  private interval?: NodeJS.Timeout;
+  private readonly maxSnapshots = 100;
+  private readonly alertThresholdMB = 500;
 
-  async createOrder(
-    userId: string,
-    dto: CreateOrderDto,
-  ): Promise<Order> {
-    return this.tracer.startActiveSpan(
-      'order.create',
-      {
-        kind: SpanKind.INTERNAL,
-        attributes: {
-          'order.user_id': userId,
-          'order.item_count': dto.items.length,
-          'order.total_amount': dto.items.reduce(
-            (sum, item) => sum + item.price * item.quantity, 0
-          ),
-        },
-      },
-      async (span) => {
-        try {
-          // Validate inventory
-          const inventoryResult = await this.tracer.startActiveSpan(
-            'order.validate_inventory',
-            async (inventorySpan) => {
-              try {
-                const result = await this.inventoryService.validate(dto.items);
-                inventorySpan.setAttribute('inventory.available', result.available);
-                inventorySpan.setStatus({ code: SpanStatusCode.OK });
-                return result;
-              } catch (error) {
-                inventorySpan.recordException(error as Error);
-                inventorySpan.setStatus({ 
-                  code: SpanStatusCode.ERROR,
-                  message: error.message,
-                });
-                throw error;
-              } finally {
-                inventorySpan.end();
-              }
-            }
-          );
+  start(intervalMs: number = 10000): void {
+    this.interval = setInterval(() => {
+      this.takeSnapshot();
+    }, intervalMs);
+  }
 
-          if (!inventoryResult.available) {
-            span.setAttribute('order.failure_reason', 'INSUFFICIENT_INVENTORY');
-            throw new BadRequestException('Insufficient inventory');
-          }
+  stop(): void {
+    if (this.interval) {
+      clearInterval(this.interval);
+    }
+  }
 
-          // Create order in DB
-          const order = await this.tracer.startActiveSpan(
-            'order.persist',
-            async (dbSpan) => {
-              try {
-                const savedOrder = await this.orderRepo.save({
-                  userId,
-                  items: dto.items,
-                  status: 'PENDING',
-                });
-                dbSpan.setAttribute('db.rows_affected', 1);
-                dbSpan.setAttribute('order.id', savedOrder.id);
-                return savedOrder;
-              } finally {
-                dbSpan.end();
-              }
-            }
-          );
+  takeSnapshot(): MemorySnapshot {
+    const mem = process.memoryUsage();
+    
+    const snapshot: MemorySnapshot = {
+      timestamp: new Date().toISOString(),
+      heapUsed: mem.heapUsed,
+      heapTotal: mem.heapTotal,
+      external: mem.external,
+      rss: mem.rss,
+      heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
+      heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
+      rssMB: Math.round(mem.rss / 1024 / 1024 * 100) / 100,
+    };
+    
+    this.snapshots.push(snapshot);
+    
+    if (this.snapshots.length > this.maxSnapshots) {
+      this.snapshots.shift();
+    }
+    
+    // Alert if memory exceeds threshold
+    if (snapshot.heapUsedMB > this.alertThresholdMB) {
+      console.error({
+        level: 'error',
+        message: 'HIGH_MEMORY_USAGE',
+        snapshot,
+        alert: `Heap used ${snapshot.heapUsedMB}MB exceeds threshold ${this.alertThresholdMB}MB`,
+      });
+    }
+    
+    return snapshot;
+  }
 
-          span.setAttribute('order.id', order.id);
-          span.setStatus({ code: SpanStatusCode.OK });
-          return order;
+  // ตรวจหา memory leak โดยดูแนวโน้ม
+  detectLeak(): { isLeaking: boolean; growthRateMB: number; message: string } {
+    if (this.snapshots.length < 10) {
+      return { isLeaking: false, growthRateMB: 0, message: 'Insufficient data' };
+    }
+    
+    const recent = this.snapshots.slice(-10);
+    const first = recent[0].heapUsedMB;
+    const last = recent[recent.length - 1].heapUsedMB;
+    const growthMB = last - first;
+    const growthRate = growthMB / first;
+    
+    const isLeaking = growthRate > 0.2; // เพิ่มมากกว่า 20% ใน 10 snapshots
+    
+    return {
+      isLeaking,
+      growthRateMB: Math.round(growthMB * 100) / 100,
+      message: isLeaking 
+        ? `Potential memory leak: +${growthMB.toFixed(2)}MB (${(growthRate * 100).toFixed(1)}%) in last ${this.snapshots.length} samples`
+        : 'Memory usage appears stable',
+    };
+  }
 
-        } catch (error) {
-          span.recordException(error as Error);
-          span.setStatus({ 
-            code: SpanStatusCode.ERROR,
-            message: (error as Error).message,
-          });
-          throw error;
-        } finally {
-          span.end();
-        }
-      }
-    );
+  // Force GC (ต้องรัน Node.js ด้วย --expose-gc)
+  forceGC(): void {
+    if (global.gc) {
+      global.gc();
+    }
+  }
+
+  // Heap snapshot สำหรับ analysis ใน Chrome DevTools
+  writeHeapSnapshot(path: string): string {
+    return v8.writeHeapSnapshot(path);
+  }
+
+  getStats(): {
+    current: MemorySnapshot;
+    trend: ReturnType<MemoryMonitor['detectLeak']>;
+    v8Stats: v8.HeapStatistics;
+  } {
+    return {
+      current: this.takeSnapshot(),
+      trend: this.detectLeak(),
+      v8Stats: v8.getHeapStatistics(),
+    };
+  }
+}
+
+// Memory leak ตัวอย่าง (และวิธีแก้)
+class LeakyEventEmitter {
+  private emitter = new EventEmitter();
+  private handlers: Function[] = [];
+  
+  // ❌ Bad: สะสม listeners ไม่ได้ลบ
+  addListenerBad(event: string, handler: Function) {
+    this.emitter.on(event as any, handler as any);
+    this.handlers.push(handler);
+  }
+  
+  // ✅ Good: ลบ listener เมื่อไม่ใช้
+  addListenerGood(event: string, handler: Function): () => void {
+    this.emitter.on(event as any, handler as any);
+    
+    // Return cleanup function
+    return () => {
+      this.emitter.off(event as any, handler as any);
+    };
   }
 }
 ```
 
 ---
 
-## Log Correlation
-
-### Structured Logging ที่ติด Trace Context
+## 6. CPU Profiling in Production
 
 ```typescript
-// shared/src/logging/logger.service.ts
+// src/utils/cpu-profiler.ts
+import v8Profiler from 'v8-profiler-next';
+import fs from 'fs';
+import path from 'path';
 
-import { Injectable, LoggerService } from '@nestjs/common';
-import { context, trace } from '@opentelemetry/api';
-import * as winston from 'winston';
-
-@Injectable()
-export class CorrelatedLogger implements LoggerService {
-  private readonly winston: winston.Logger;
-
-  constructor() {
-    this.winston = winston.createLogger({
-      level: process.env.LOG_LEVEL || 'info',
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.errors({ stack: true }),
-        winston.format.json(),
-        // เพิ่ม trace context โดยอัตโนมัติ
-        winston.format((info) => {
-          const span = trace.getActiveSpan();
-          if (span) {
-            const spanContext = span.spanContext();
-            info.traceId = spanContext.traceId;
-            info.spanId = spanContext.spanId;
-            info.traceFlags = spanContext.traceFlags;
+export class CPUProfiler {
+  private isProfilering = false;
+  
+  async profileEndpoint(
+    handler: () => Promise<void>,
+    options: {
+      duration: number;     // milliseconds
+      outputPath?: string;
+      title?: string;
+    }
+  ): Promise<string> {
+    if (this.isProfilering) {
+      throw new Error('Profiling already in progress');
+    }
+    
+    this.isProfilering = true;
+    const title = options.title || `profile-${Date.now()}`;
+    
+    v8Profiler.startProfiling(title, true);
+    
+    try {
+      // รัน handler ที่ต้องการ profile
+      await handler();
+      
+      // รอจนครบเวลา
+      if (options.duration > 0) {
+        await new Promise(resolve => setTimeout(resolve, options.duration));
+      }
+    } finally {
+      const profile = v8Profiler.stopProfiling(title);
+      this.isProfilering = false;
+      
+      return new Promise((resolve, reject) => {
+        profile.export((error: Error | null, result: string | Buffer) => {
+          profile.delete();
+          
+          if (error) {
+            reject(error);
+            return;
           }
-          return info;
-        })(),
-      ),
-      defaultMeta: {
-        service: process.env.SERVICE_NAME || 'unknown-service',
-        version: process.env.APP_VERSION || '1.0.0',
-        environment: process.env.NODE_ENV || 'development',
-      },
-      transports: [
-        new winston.transports.Console({
-          format: process.env.NODE_ENV === 'development'
-            ? winston.format.combine(
-                winston.format.colorize(),
-                winston.format.simple()
-              )
-            : winston.format.json(),
-        }),
-      ],
+          
+          const outputPath = options.outputPath || 
+            path.join('/tmp', `${title}.cpuprofile`);
+          
+          fs.writeFileSync(outputPath, result as string);
+          resolve(outputPath);
+        });
+      });
+    }
+  }
+  
+  // Profile endpoint สำหรับ production (ต้องมี auth)
+  createProfileEndpoint() {
+    return async (req: any, res: any) => {
+      const duration = parseInt(req.query.duration) || 5000;
+      const maxDuration = 30000; // สูงสุด 30 วินาที
+      
+      if (duration > maxDuration) {
+        return res.status(400).json({ error: 'Duration too long' });
+      }
+      
+      const outputPath = await this.profileEndpoint(
+        async () => {},
+        { duration: Math.min(duration, maxDuration) }
+      );
+      
+      res.download(outputPath, 'profile.cpuprofile', () => {
+        fs.unlinkSync(outputPath);
+      });
+    };
+  }
+}
+```
+
+---
+
+## 7. Database Query Analysis
+
+```typescript
+// src/utils/query-analyzer.ts
+import { DataSource } from 'typeorm';
+
+interface SlowQuery {
+  query: string;
+  duration: number;
+  timestamp: Date;
+  correlationId?: string;
+  parameters?: any[];
+}
+
+export class QueryAnalyzer {
+  private slowQueries: SlowQuery[] = [];
+  private readonly slowQueryThresholdMs = 1000;
+
+  setupLogging(dataSource: DataSource): void {
+    // TypeORM query logging
+    (dataSource.driver as any).afterQuery = (
+      query: string,
+      parameters: any[],
+      queryRunner: any
+    ) => {
+      const duration = queryRunner.data?.queryTime;
+      
+      if (duration > this.slowQueryThresholdMs) {
+        const slowQuery: SlowQuery = {
+          query,
+          duration,
+          timestamp: new Date(),
+          correlationId: getCorrelationId(),
+          parameters,
+        };
+        
+        this.slowQueries.push(slowQuery);
+        
+        console.warn({
+          level: 'warn',
+          message: 'SLOW_QUERY',
+          query: query.substring(0, 500),
+          duration,
+          correlationId: slowQuery.correlationId,
+        });
+        
+        // Alert if too slow
+        if (duration > 5000) {
+          this.alertSlowQuery(slowQuery);
+        }
+      }
+    };
+  }
+
+  async analyzeQuery(dataSource: DataSource, query: string): Promise<{
+    executionPlan: any;
+    estimatedCost: number;
+    recommendations: string[];
+  }> {
+    // PostgreSQL EXPLAIN ANALYZE
+    const plan = await dataSource.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query}`);
+    
+    const executionPlan = plan[0]['QUERY PLAN'][0];
+    const estimatedCost = executionPlan['Plan']['Total Cost'];
+    
+    const recommendations = this.generateRecommendations(executionPlan);
+    
+    return { executionPlan, estimatedCost, recommendations };
+  }
+
+  private generateRecommendations(plan: any): string[] {
+    const recommendations: string[] = [];
+    
+    const checkNode = (node: any) => {
+      // Sequential scan บน large tables
+      if (node['Node Type'] === 'Seq Scan' && node['Actual Rows'] > 1000) {
+        recommendations.push(
+          `Consider adding index on table "${node['Relation Name']}" ` +
+          `(seq scan returned ${node['Actual Rows']} rows)`
+        );
+      }
+      
+      // Hash join ที่ใช้ memory มาก
+      if (node['Node Type'] === 'Hash' && node['Peak Memory Usage'] > 10000) {
+        recommendations.push(
+          `Hash join using ${node['Peak Memory Usage']}KB memory, consider nested loop`
+        );
+      }
+      
+      if (node['Plans']) {
+        node['Plans'].forEach(checkNode);
+      }
+    };
+    
+    checkNode(plan['Plan']);
+    return recommendations;
+  }
+
+  private async alertSlowQuery(query: SlowQuery): Promise<void> {
+    // ส่ง alert ไปยัง monitoring system
+    console.error({
+      level: 'error',
+      message: 'CRITICAL_SLOW_QUERY',
+      ...query,
     });
   }
 
-  log(message: string, context?: string, metadata?: object): void {
-    this.winston.info(message, { context, ...metadata });
-  }
-
-  error(message: string, trace?: string, context?: string): void {
-    this.winston.error(message, { trace, context });
-  }
-
-  warn(message: string, context?: string): void {
-    this.winston.warn(message, { context });
-  }
-
-  debug(message: string, context?: string): void {
-    this.winston.debug(message, { context });
-  }
-}
-```
-
-```json
-// ตัวอย่าง correlated log output:
-{
-  "timestamp": "2024-01-15T10:23:45.123Z",
-  "level": "error",
-  "message": "Failed to process payment",
-  "service": "order-service",
-  "version": "1.2.3",
-  "environment": "production",
-  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "spanId": "00f067aa0ba902b7",
-  "traceFlags": 1,
-  "context": "OrderService",
-  "orderId": "ord-12345",
-  "userId": "usr-67890",
-  "error": {
-    "message": "Payment gateway timeout",
-    "stack": "Error: Payment gateway timeout\n    at PaymentService..."
+  getSlowQueryReport(): { queries: SlowQuery[]; stats: any } {
+    const avgDuration = this.slowQueries.reduce((sum, q) => sum + q.duration, 0) /
+                       (this.slowQueries.length || 1);
+    
+    return {
+      queries: this.slowQueries.slice(-50),
+      stats: {
+        total: this.slowQueries.length,
+        avgDuration,
+        maxDuration: Math.max(...this.slowQueries.map(q => q.duration), 0),
+      },
+    };
   }
 }
 ```
 
 ---
 
-## kubectl Debugging Commands
-
-### Essential Debugging Commands
-
-```bash
-#!/bin/bash
-# scripts/debug-toolkit.sh
-# รวม debugging commands ที่ใช้บ่อย
-
-SERVICE_NAME="order-service"
-NAMESPACE="production"
-
-echo "=== Pod Status ==="
-kubectl get pods -n $NAMESPACE -l app=$SERVICE_NAME -o wide
-
-echo "=== Recent Events ==="
-kubectl get events -n $NAMESPACE --field-selector involvedObject.name=$SERVICE_NAME \
-  --sort-by='.lastTimestamp' | tail -20
-
-echo "=== Resource Usage ==="
-kubectl top pods -n $NAMESPACE -l app=$SERVICE_NAME
-
-echo "=== Pod Logs (last 100 lines) ==="
-kubectl logs -n $NAMESPACE -l app=$SERVICE_NAME \
-  --tail=100 \
-  --prefix \
-  --timestamps
-
-echo "=== Previous Container Logs (if crashed) ==="
-kubectl logs -n $NAMESPACE -l app=$SERVICE_NAME \
-  --previous \
-  --tail=50
-
-# Stream logs with filtering
-echo "=== Stream ERROR logs ==="
-kubectl logs -n $NAMESPACE -l app=$SERVICE_NAME \
-  --follow \
-  --timestamps \
-  | grep -i "error\|exception\|fatal"
-```
-
-```bash
-# Debug specific pod ที่มีปัญหา
-
-# 1. Describe pod เพื่อดู events และ container status
-kubectl describe pod -n production order-service-7d8f9c-xxxxx
-
-# 2. Exec เข้าไปใน container เพื่อ inspect
-kubectl exec -n production -it order-service-7d8f9c-xxxxx -- /bin/sh
-
-# ภายใน container:
-# Check environment variables
-env | grep -E "DATABASE|REDIS|API_KEY"
-
-# Check DNS resolution
-nslookup user-service.production.svc.cluster.local
-
-# Check connectivity
-wget -qO- http://user-service:3000/health
-curl -v http://product-service:3001/health
-
-# Check file system
-df -h
-ls -la /app
-
-# Check processes
-ps aux
-
-# 3. Port-forward สำหรับ local debugging
-kubectl port-forward -n production service/order-service 3000:3000
-
-# แล้วเรียก API จาก local machine:
-curl http://localhost:3000/health
-curl http://localhost:3000/api/v1/orders
-
-# 4. Copy files จาก pod
-kubectl cp production/order-service-7d8f9c-xxxxx:/app/logs/error.log ./error.log
-
-# 5. Check ConfigMap และ Secrets
-kubectl get configmap -n production order-service-config -o yaml
-kubectl get secret -n production order-service-secrets -o jsonpath='{.data}' | base64 -d
-
-# 6. Debug node affinity / scheduling issues
-kubectl describe node <node-name> | grep -A 20 "Conditions:"
-kubectl get pod -n production order-service-7d8f9c-xxxxx -o yaml | grep -A 10 "affinity"
-```
-
-### Debug Network Issues
-
-```bash
-# Deploy temporary debug pod
-kubectl run -n production debug-pod \
-  --image=nicolaka/netshoot \
-  --rm \
-  --restart=Never \
-  -it \
-  -- /bin/bash
-
-# ภายใน debug-pod:
-
-# Test DNS
-dig order-service.production.svc.cluster.local
-
-# Test TCP connectivity
-nc -zv order-service 3000
-nc -zv user-service 3000
-
-# Check network policies
-# (ต้องทำจาก outside pod)
-kubectl get networkpolicies -n production -o yaml
-
-# Trace network path
-traceroute order-service
-
-# Check if service endpoints are correct
-kubectl get endpoints -n production order-service
-
-# Check iptables rules (บน node)
-kubectl debug node/<node-name> -it --image=ubuntu -- chroot /host bash
-iptables -L -n -v | grep order-service
-```
-
----
-
-## Ephemeral Containers
-
-```bash
-# Kubernetes 1.23+ รองรับ Ephemeral Containers
-# ใช้สำหรับ debug production containers ที่ไม่มี shell
-
-# Add debug container ไปยัง running pod
-kubectl debug -n production \
-  -it order-service-7d8f9c-xxxxx \
-  --image=busybox:latest \
-  --target=order-service \
-  -- sh
-
-# ใช้ image ที่มี debugging tools
-kubectl debug -n production \
-  -it order-service-7d8f9c-xxxxx \
-  --image=nicolaka/netshoot \
-  --target=order-service \
-  -- bash
-
-# ภายใน ephemeral container:
-# Share process namespace กับ main container
-ls /proc/1/root/app  # เข้าถึง filesystem ของ main container
-cat /proc/1/environ  # environment variables ของ main container
-
-# Network debugging
-ss -tlnp
-netstat -tulpn
-
-# Process inspection
-cat /proc/1/cmdline | tr '\0' ' '
-```
-
-```yaml
-# Distroless image debugging (containers ที่ไม่มี shell)
-# services/order/kubernetes/debug-pod.yaml
-
-apiVersion: v1
-kind: Pod
-metadata:
-  name: order-service-debug
-  namespace: production
-  labels:
-    app: order-service-debug
-spec:
-  # Shared process namespace
-  shareProcessNamespace: true
-  
-  containers:
-  - name: order-service
-    image: company/order-service:latest
-    # ... regular config ...
-  
-  # Ephemeral debug container (via kubectl debug is better,
-  # but this shows the concept)
-  - name: debugger
-    image: nicolaka/netshoot
-    command: ['sleep', '3600']
-    securityContext:
-      capabilities:
-        add: ['SYS_PTRACE']
-```
-
----
-
-## Telepresence สำหรับ Local Development
-
-### Setup Telepresence
-
-```bash
-# Install Telepresence
-curl -fL https://app.getambassador.io/download/tel2/linux/amd64/latest/telepresence -o telepresence
-chmod +x telepresence
-sudo mv telepresence /usr/local/bin/
-
-# Connect Telepresence ไปยัง Kubernetes cluster
-telepresence connect
-
-# ตอนนี้ local machine สามารถ access kubernetes services ได้โดยตรง
-curl http://user-service.production:3000/health
-
-# Intercept order-service traffic ไปยัง local instance
-# (requests ที่ไปยัง order-service ใน k8s จะ route มา local แทน)
-telepresence intercept order-service \
-  --namespace production \
-  --port 3000 \
-  --env-file .env.k8s  # export environment variables จาก pod
-
-# ตอนนี้รัน local service ที่ใช้ environment จาก production
-npm run start:dev
-
-# Intercept แค่ requests ที่มี specific header
-telepresence intercept order-service \
-  --namespace production \
-  --port 3000 \
-  --http-header "x-dev-user=john"
-
-# ดู intercepts ที่ active
-telepresence list
-
-# หยุด intercept
-telepresence leave order-service
-```
-
-### Local Development Workflow
+## 8. Network Debugging Tools
 
 ```typescript
-// .env.k8s จะถูก export โดย Telepresence อัตโนมัติ
-// services/order/.env.k8s
+// src/utils/network-debugger.ts
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import net from 'net';
+import dns from 'dns';
 
-/*
-DATABASE_URL=postgresql://order_svc:pass@order-db.production:5432/orders
-REDIS_URL=redis://redis.production:6379
-USER_SERVICE_URL=http://user-service.production:3000
-PRODUCT_SERVICE_URL=http://product-service.production:3001
-*/
+const execAsync = promisify(exec);
+const dnsResolve = promisify(dns.resolve);
 
-// services/order/src/main.ts
-async function bootstrap() {
-  // local service ใช้ environment จาก Kubernetes
-  // แต่ code รันใน local machine → breakpoints ทำงาน!
-  const app = await NestFactory.create(AppModule);
-  
-  // VSCode debugger สามารถ attach ได้
-  const port = process.env.PORT || 3000;
-  await app.listen(port);
-  
-  console.log(`Service running on port ${port}`);
-  console.log(`Connected to K8s services via Telepresence`);
-}
-```
+export class NetworkDebugger {
+  // ตรวจสอบ connectivity ไปยัง service
+  async checkConnectivity(host: string, port: number, timeout: number = 5000): Promise<{
+    connected: boolean;
+    latencyMs?: number;
+    error?: string;
+  }> {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const socket = new net.Socket();
+      
+      socket.setTimeout(timeout);
+      
+      socket.connect(port, host, () => {
+        const latencyMs = Date.now() - start;
+        socket.destroy();
+        resolve({ connected: true, latencyMs });
+      });
+      
+      socket.on('timeout', () => {
+        socket.destroy();
+        resolve({ connected: false, error: `Connection timed out after ${timeout}ms` });
+      });
+      
+      socket.on('error', (err) => {
+        resolve({ connected: false, error: err.message });
+      });
+    });
+  }
 
-```json
-// .vscode/launch.json - Debug configuration
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "node",
-      "request": "launch",
-      "name": "Debug Order Service (Telepresence)",
-      "program": "${workspaceFolder}/dist/main.js",
-      "preLaunchTask": "build",
-      "envFile": "${workspaceFolder}/.env.k8s",
-      "sourceMaps": true,
-      "smartStep": true,
-      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
-      "resolveSourceMapLocations": ["${workspaceFolder}/**", "!**/node_modules/**"]
-    }
-  ]
-}
-```
+  // DNS lookup
+  async resolveDNS(hostname: string): Promise<{
+    addresses: string[];
+    latencyMs: number;
+  }> {
+    const start = Date.now();
+    const addresses = await dnsResolve(hostname);
+    return {
+      addresses,
+      latencyMs: Date.now() - start,
+    };
+  }
 
----
-
-## Common Issues Checklist
-
-```bash
-#!/bin/bash
-# scripts/debug-checklist.sh
-# Run ก่อน escalate ทุกครั้ง
-
-SERVICE=$1
-NAMESPACE=${2:-production}
-
-echo "🔍 Debugging: $SERVICE in $NAMESPACE"
-echo "=================================================="
-
-echo ""
-echo "1️⃣  Pod Status"
-kubectl get pods -n $NAMESPACE -l app=$SERVICE
-
-echo ""
-echo "2️⃣  Recent Events (last 1 hour)"
-kubectl get events -n $NAMESPACE \
-  --field-selector involvedObject.name=$SERVICE \
-  --sort-by='.lastTimestamp' | \
-  awk -v d="$(date -d '1 hour ago' +%s)" \
-  'NR==1{print} NR>1 && $1 != "0s"{print}'
-
-echo ""
-echo "3️⃣  Resource Usage"
-kubectl top pods -n $NAMESPACE -l app=$SERVICE 2>/dev/null || \
-  echo "metrics-server not available"
-
-echo ""
-echo "4️⃣  Service Endpoints"
-kubectl get endpoints -n $NAMESPACE $SERVICE
-
-echo ""
-echo "5️⃣  Recent Errors in Logs"
-kubectl logs -n $NAMESPACE -l app=$SERVICE \
-  --tail=200 --timestamps \
-  | grep -iE "error|exception|fatal|panic" \
-  | tail -20
-
-echo ""
-echo "6️⃣  HPA Status"
-kubectl get hpa -n $NAMESPACE | grep $SERVICE
-
-echo ""
-echo "7️⃣  Resource Limits"
-kubectl get pod -n $NAMESPACE -l app=$SERVICE \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.containers[*]}  {.name}: CPU={.resources.limits.cpu}, Memory={.resources.limits.memory}{"\n"}{end}{end}'
-
-echo ""
-echo "8️⃣  ConfigMap Versions"
-kubectl get configmap -n $NAMESPACE | grep $SERVICE
-
-echo ""
-echo "9️⃣  Secret Versions"
-kubectl get secrets -n $NAMESPACE | grep $SERVICE
-
-echo ""
-echo "🔟  Network Policy"
-kubectl get networkpolicies -n $NAMESPACE | grep $SERVICE
-```
-
----
-
-## Remote Debugging ใน Kubernetes
-
-```yaml
-# kubernetes/debug/order-service-debug.yaml
-# Deploy debug version ที่เปิด debug port
-
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: order-service-debug
-  namespace: staging
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: order-service-debug
-  template:
-    metadata:
-      labels:
-        app: order-service-debug
-    spec:
-      containers:
-      - name: order-service
-        image: company/order-service:debug
-        command: ["node", "--inspect=0.0.0.0:9229", "dist/main.js"]
-        ports:
-        - containerPort: 3000
-          name: http
-        - containerPort: 9229
-          name: debug
-        env:
-        - name: NODE_ENV
-          value: "staging"
-        securityContext:
-          # ต้องการสำหรับ node inspect
-          capabilities:
-            add: ["SYS_PTRACE"]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: order-service-debug
-  namespace: staging
-spec:
-  selector:
-    app: order-service-debug
-  ports:
-  - name: http
-    port: 3000
-  - name: debug
-    port: 9229
-```
-
-```bash
-# Port-forward debug port
-kubectl port-forward -n staging \
-  service/order-service-debug \
-  9229:9229 \
-  3000:3000 &
-
-# ตอนนี้เปิด Chrome DevTools:
-# chrome://inspect
-# หรือ VSCode debugger:
-```
-
-```json
-// .vscode/launch.json สำหรับ remote K8s debugging
-{
-  "configurations": [
-    {
-      "type": "node",
-      "request": "attach",
-      "name": "Attach to K8s Pod",
-      "port": 9229,
-      "localRoot": "${workspaceFolder}",
-      "remoteRoot": "/app",
-      "sourceMaps": true,
-      "skipFiles": ["<node_internals>/**"]
-    }
-  ]
+  // Health check endpoints
+  async checkServiceHealth(services: Record<string, string>): Promise<
+    Record<string, { healthy: boolean; latencyMs?: number; error?: string }>
+  > {
+    const results: Record<string, any> = {};
+    
+    await Promise.all(
+      Object.entries(services).map(async ([name, url]) => {
+        const start = Date.now();
+        try {
+          const response = await fetch(`${url}/health`, {
+            signal: AbortSignal.timeout(5000),
+          });
+          results[name] = {
+            healthy: response.ok,
+            latencyMs: Date.now() - start,
+            statusCode: response.status,
+          };
+        } catch (error) {
+          results[name] = {
+            healthy: false,
+            latencyMs: Date.now() - start,
+            error: (error as Error).message,
+          };
+        }
+      })
+    );
+    
+    return results;
+  }
 }
 ```
 
 ---
 
-## Debugging Performance Issues
-
-```bash
-# Clinic.js สำหรับ Node.js performance profiling
-
-# Profile service ใน staging
-kubectl exec -n staging -it order-service-xxx -- sh
-
-# ภายใน container:
-npm install -g clinic
-clinic doctor -- node dist/main.js
-# สร้าง HTML report
-
-# หรือใช้ --prof flag:
-node --prof dist/main.js
-# แล้ว analyze:
-node --prof-process isolate-*.log > profile.txt
-```
+## 9. Chaos Engineering for Debugging
 
 ```typescript
-// services/order/src/debug/performance-monitor.ts
-
+// src/chaos/chaos-monkey.ts
 import { Injectable } from '@nestjs/common';
+import { Request, Response, NextFunction } from 'express';
+
+interface ChaosConfig {
+  enabled: boolean;
+  probability: number;    // 0-1, โอกาสที่จะเกิด chaos
+  type: ChaosType;
+  targetPaths?: string[]; // paths ที่ affect
+  excludePaths?: string[];
+}
+
+type ChaosType = 
+  | 'latency'             // เพิ่ม latency
+  | 'error'               // ส่ง error response
+  | 'timeout'             // ทำให้ timeout
+  | 'cpu_spike'           // spike CPU
+  | 'memory_pressure';    // pressure memory
 
 @Injectable()
-export class PerformanceMonitor {
-  // ตรวจจับ slow database queries
-  async analyzeSlowQueries(): Promise<SlowQueryReport[]> {
-    const result = await this.dataSource.query(`
-      SELECT
-        query,
-        calls,
-        total_time,
-        mean_time,
-        max_time,
-        stddev_time,
-        rows
-      FROM pg_stat_statements
-      WHERE mean_time > 100  -- queries ที่ใช้เวลา > 100ms
-      ORDER BY mean_time DESC
-      LIMIT 20
-    `);
+export class ChaosMonkey {
+  private config: ChaosConfig = {
+    enabled: process.env.CHAOS_ENABLED === 'true',
+    probability: parseFloat(process.env.CHAOS_PROBABILITY || '0.01'),
+    type: 'latency',
+  };
 
-    return result.map(row => ({
-      query: row.query,
-      avgMs: parseFloat(row.mean_time),
-      maxMs: parseFloat(row.max_time),
-      callCount: parseInt(row.calls),
-    }));
+  // Middleware สำหรับ inject chaos
+  middleware() {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      if (!this.config.enabled) return next();
+      if (!this.shouldApplyChaos(req.path)) return next();
+      if (Math.random() > this.config.probability) return next();
+      
+      console.warn({
+        level: 'warn',
+        message: 'CHAOS_INJECTED',
+        type: this.config.type,
+        path: req.path,
+        correlationId: req.headers['x-correlation-id'],
+      });
+      
+      switch (this.config.type) {
+        case 'latency':
+          const delay = Math.random() * 5000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          break;
+          
+        case 'error':
+          return res.status(500).json({
+            error: { code: 'CHAOS_ERROR', message: 'Chaos monkey struck!' }
+          });
+          
+        case 'timeout':
+          await new Promise(resolve => setTimeout(resolve, 60000));
+          return;
+          
+        case 'cpu_spike':
+          this.spikeCPU(1000);
+          break;
+          
+        case 'memory_pressure':
+          this.pressureMemory(50);
+          break;
+      }
+      
+      next();
+    };
   }
 
-  // Memory leak detection
-  monitorMemory(): void {
-    const threshold = 0.8; // 80% of heap limit
-    
-    setInterval(() => {
-      const usage = process.memoryUsage();
-      const heapUsedPercent = usage.heapUsed / usage.heapTotal;
-      
-      if (heapUsedPercent > threshold) {
-        console.error('MEMORY_WARNING', {
-          heapUsed: `${Math.round(usage.heapUsed / 1024 / 1024)}MB`,
-          heapTotal: `${Math.round(usage.heapTotal / 1024 / 1024)}MB`,
-          percentage: `${Math.round(heapUsedPercent * 100)}%`,
-          rss: `${Math.round(usage.rss / 1024 / 1024)}MB`,
-        });
-        
-        // Force GC (ถ้า run with --expose-gc flag)
-        if (global.gc) {
-          global.gc();
-          console.log('Forced garbage collection');
-        }
-      }
-    }, 30000); // check ทุก 30 วินาที
+  private shouldApplyChaos(path: string): boolean {
+    if (this.config.excludePaths?.some(p => path.startsWith(p))) {
+      return false;
+    }
+    if (this.config.targetPaths?.length) {
+      return this.config.targetPaths.some(p => path.startsWith(p));
+    }
+    return true;
+  }
+
+  private spikeCPU(durationMs: number): void {
+    const end = Date.now() + durationMs;
+    while (Date.now() < end) {
+      // Busy loop
+      Math.random() * Math.random();
+    }
+  }
+
+  private pressureMemory(sizeMB: number): void {
+    const arr = new Array(sizeMB * 1024 * 256).fill(0);
+    setTimeout(() => arr.length = 0, 5000); // Release after 5s
+  }
+
+  updateConfig(newConfig: Partial<ChaosConfig>): void {
+    this.config = { ...this.config, ...newConfig };
   }
 }
 ```
 
 ---
 
-## Distributed Debugging Workflow
+## 10. Debugging Checklist และ Runbook
 
-```
-การ Debug Incident ใน Production:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```typescript
+// src/debugging/runbook.ts
 
-Step 1: Identify Scope
-┌─────────────────────────────────────────────────┐
-│ Alert fires: order creation error rate > 1%     │
-│                                                  │
-│ Check: ✓ Error started when?                    │
-│ Check: ✓ Which service is erroring?             │
-│ Check: ✓ Is it all users or subset?             │
-└─────────────────────────────────────────────────┘
-            │
-            ▼
-Step 2: Get Trace ID
-┌─────────────────────────────────────────────────┐
-│ From error log:                                 │
-│ {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736"}  │
-│                                                  │
-│ Open Jaeger: /search?traceID=4bf92f...          │
-└─────────────────────────────────────────────────┘
-            │
-            ▼
-Step 3: Follow the Trace
-┌─────────────────────────────────────────────────┐
-│ order-service (45ms) ──OK──►                   │
-│   user-service (5ms)  ──OK──►                  │
-│   product-service (8ms) ──OK──►                │
-│   payment-service (30ms) ──ERROR──► ← HERE!    │
-└─────────────────────────────────────────────────┘
-            │
-            ▼
-Step 4: Analyze Error Span
-┌─────────────────────────────────────────────────┐
-│ Span: payment-service.charge                    │
-│ Error: "Connection timeout to payment gateway"  │
-│ Duration: 30000ms (timeout!)                    │
-│ Tags:                                           │
-│   payment.gateway: "stripe"                     │
-│   payment.gateway.region: "us-east-1"          │
-└─────────────────────────────────────────────────┘
-            │
-            ▼
-Step 5: Check Service Logs
-kubectl logs -n production -l app=payment-service |
-  grep "4bf92f3577b34da6a3ce929d0e0e4736"
+/**
+ * RUNBOOK: Debug High Latency Issue
+ * 
+ * 1. ตรวจสอบ error rate: Kibana -> Metrics -> Error Rate
+ * 2. ตรวจสอบ trace: Jaeger -> Search -> Service = affected-service
+ * 3. ดู slow spans ใน trace
+ * 4. ตรวจสอบ database queries ใน trace
+ * 5. ตรวจสอบ resource usage: Kubernetes -> pod metrics
+ */
+
+export class DebuggingRunbook {
+  async diagnoseHighLatency(serviceName: string, correlationId?: string) {
+    const steps: Array<{ step: string; action: string; result?: any }> = [];
+    
+    // Step 1: Check recent errors
+    const errorRate = await this.metricsService.getErrorRate(serviceName, '5m');
+    steps.push({
+      step: '1. Error Rate Check',
+      action: `Query error rate for ${serviceName} in last 5 minutes`,
+      result: `${errorRate.toFixed(2)}% error rate`,
+    });
+    
+    // Step 2: Check P99 latency
+    const p99Latency = await this.metricsService.getP99Latency(serviceName, '5m');
+    steps.push({
+      step: '2. Latency Check',
+      action: `Query P99 latency for ${serviceName}`,
+      result: `${p99Latency}ms P99 latency`,
+    });
+    
+    // Step 3: Find slow traces
+    const slowTraces = await this.tracingService.findSlowTraces(serviceName, {
+      minDuration: 5000,
+      limit: 10,
+    });
+    steps.push({
+      step: '3. Slow Traces',
+      action: 'Find traces slower than 5 seconds',
+      result: `Found ${slowTraces.length} slow traces`,
+    });
+    
+    // Step 4: Check database
+    const slowQueries = await this.dbAnalyzer.getSlowQueryReport();
+    steps.push({
+      step: '4. Database Analysis',
+      action: 'Check slow queries',
+      result: slowQueries.stats,
+    });
+    
+    return steps;
+  }
+}
 ```
 
 ---
 
-## สรุป
+## สรุปท้ายบท
 
-Debugging microservices ต้องการ systematic approach:
+| เครื่องมือ | ใช้สำหรับ | Setup Complexity |
+|-----------|---------|-----------------|
+| Correlation IDs | ติดตาม request ข้าม services | ต่ำ |
+| Node.js Inspector | Debug code ตรงๆ | ต่ำ |
+| ELK Stack | Log aggregation & search | กลาง |
+| OpenTelemetry + Jaeger | Distributed tracing | กลาง |
+| Memory Monitor | Detect memory leaks | ต่ำ |
+| CPU Profiler | Find performance bottlenecks | ต่ำ |
+| Query Analyzer | Database optimization | กลาง |
+| Network Debugger | Service connectivity | ต่ำ |
+| Chaos Monkey | Test resilience | กลาง |
 
-| เครื่องมือ | ใช้เมื่อ |
-|-----------|---------|
-| Distributed Tracing (Jaeger) | ติดตาม request ข้าม services |
-| Structured Logs + correlation | หาต้นเหตุของ error |
-| kubectl debug | inspect pods ที่ distroless |
-| Ephemeral containers | debug without restart |
-| Telepresence | local dev กับ K8s services |
-| Port-forward | test service โดยตรง |
-| Performance profiler | CPU/memory issues |
+### Debug Workflow
 
-Golden rules สำหรับ debug microservices:
-1. **Trace ID เป็น key** — ทุก request ต้องมี trace ID
-2. **Logs ต้อง structured** — JSON + correlation IDs
-3. **Never debug blind** — มี metrics, traces, logs ก่อนจะ debug
-4. **Reproduce locally ก่อน** — ใช้ Telepresence intercept
-5. **Fix root cause** — ไม่ใช่แค่ symptom
+1. **Error Reported** -> ดู Correlation ID จาก response
+2. **Search Logs** -> Kibana: `correlationId:"xxx"`
+3. **View Trace** -> Jaeger: Search by traceId
+4. **Identify Bottleneck** -> Slow span ใน trace
+5. **Deep Dive** -> Remote debug หรือ heap snapshot
+6. **Fix & Verify** -> Deploy + monitor metrics
