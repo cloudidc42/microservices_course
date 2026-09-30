@@ -1,894 +1,965 @@
-# Part 88: Microservices Capacity Planning
+# Part 88: Capacity Planning
 
 ## บทนำ
 
-Capacity Planning คือการวางแผนล่วงหน้าว่าระบบต้องการ resources เท่าไหร่เพื่อรองรับ load ที่คาดการณ์ไว้ การทำ Capacity Planning ที่ดีช่วยประหยัดค่าใช้จ่าย ป้องกัน outage และทำให้ทีมมั่นใจในการ scale
+Capacity Planning (การวางแผนความสามารถ) คือกระบวนการกำหนดทรัพยากรที่จำเป็นสำหรับระบบในอนาคต บทนี้จะแนะนำวิธีการสร้าง model การคาดการณ์ load การวางแผน database, network, cache และ cost optimization สำหรับระบบ Microservices
 
 ---
 
-## Load Forecasting
+## 1. Load Modeling and Forecasting
 
-### การเก็บข้อมูล Baseline
+### 1.1 Traffic Pattern Analysis
 
 ```typescript
-// services/metrics/src/capacity/traffic-analyzer.ts
+// src/capacity/traffic-analyzer.ts
+import { DataSource } from 'typeorm';
 
-import { Injectable } from '@nestjs/common';
-import { PrometheusService } from './prometheus.service';
+interface TrafficMetrics {
+  timestamp: Date;
+  requestsPerSecond: number;
+  p50LatencyMs: number;
+  p95LatencyMs: number;
+  p99LatencyMs: number;
+  errorRate: number;
+  activeConnections: number;
+  cpuUsagePercent: number;
+  memoryUsageMB: number;
+}
 
-@Injectable()
+interface TrafficForecast {
+  date: Date;
+  forecastedRPS: number;
+  confidenceInterval: {
+    lower: number;
+    upper: number;
+  };
+  trend: 'increasing' | 'decreasing' | 'stable';
+  seasonality: {
+    hourOfDay: number;
+    dayOfWeek: number;
+    monthOfYear: number;
+  };
+}
+
 export class TrafficAnalyzer {
-  constructor(private readonly prometheus: PrometheusService) {}
+  constructor(private dataSource: DataSource) {}
 
-  async analyzeTrafficPatterns(): Promise<TrafficPattern> {
-    // ดึง 30 วันย้อนหลัง
-    const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
-    const now = Math.floor(Date.now() / 1000);
+  async analyzeTrafficPatterns(
+    serviceName: string,
+    days: number = 30
+  ): Promise<{
+    hourlyAverage: number[];    // RPS per hour (0-23)
+    weeklyPattern: number[];    // RPS per day (0-6, Mon-Sun)
+    peakMultiplier: number;     // Peak vs Average ratio
+    growthRate: number;         // Month-over-month growth %
+  }> {
+    const fromDate = new Date();
+    fromDate.setDate(fromDate.getDate() - days);
+    
+    // Query Prometheus/metrics database
+    const metrics = await this.dataSource.query(`
+      SELECT 
+        date_trunc('hour', timestamp) as hour,
+        avg(requests_per_second) as avg_rps,
+        max(requests_per_second) as max_rps,
+        extract(hour from timestamp) as hour_of_day,
+        extract(dow from timestamp) as day_of_week
+      FROM service_metrics
+      WHERE service_name = $1
+        AND timestamp >= $2
+      GROUP BY 1, 4, 5
+      ORDER BY 1
+    `, [serviceName, fromDate]);
+    
+    // Calculate hourly averages (0-23)
+    const hourlyAverage = new Array(24).fill(0);
+    const hourlyCounts = new Array(24).fill(0);
+    
+    for (const row of metrics) {
+      const hour = parseInt(row.hour_of_day);
+      hourlyAverage[hour] += parseFloat(row.avg_rps);
+      hourlyCounts[hour]++;
+    }
+    
+    for (let i = 0; i < 24; i++) {
+      if (hourlyCounts[i] > 0) {
+        hourlyAverage[i] /= hourlyCounts[i];
+      }
+    }
+    
+    // Weekly pattern (0=Sun, 1=Mon, ..., 6=Sat)
+    const weeklyPattern = new Array(7).fill(0);
+    const weeklyCounts = new Array(7).fill(0);
+    
+    for (const row of metrics) {
+      const dow = parseInt(row.day_of_week);
+      weeklyPattern[dow] += parseFloat(row.avg_rps);
+      weeklyCounts[dow]++;
+    }
+    
+    for (let i = 0; i < 7; i++) {
+      if (weeklyCounts[i] > 0) {
+        weeklyPattern[i] /= weeklyCounts[i];
+      }
+    }
+    
+    const avgRPS = hourlyAverage.reduce((a, b) => a + b) / 24;
+    const maxRPS = Math.max(...metrics.map((m: any) => parseFloat(m.max_rps)));
+    const peakMultiplier = maxRPS / avgRPS;
+    
+    // Calculate growth rate (compare first week vs last week)
+    const growthRate = this.calculateGrowthRate(metrics);
+    
+    return { hourlyAverage, weeklyPattern, peakMultiplier, growthRate };
+  }
 
-    // Request rate per hour
-    const hourlyRates = await this.prometheus.queryRange(
-      'sum(rate(http_requests_total[5m]))',
-      thirtyDaysAgo,
-      now,
-      '1h'
-    );
-
-    // Peak analysis
-    const peakRPS = Math.max(...hourlyRates.map(r => r.value));
-    const avgRPS = hourlyRates.reduce((sum, r) => sum + r.value, 0) / hourlyRates.length;
-    const medianRPS = this.median(hourlyRates.map(r => r.value));
-
-    // Day-of-week pattern
-    const dowPattern = this.analyzeDayOfWeekPattern(hourlyRates);
-
-    // Peak hours analysis
-    const peakHours = this.analyzePeakHours(hourlyRates);
-
-    return {
-      peakRPS,
-      avgRPS,
-      medianRPS,
-      peakToAvgRatio: peakRPS / avgRPS,
-      dowPattern,
-      peakHours,
+  async forecastTraffic(
+    currentRPS: number,
+    growthRateMonthly: number,
+    months: number
+  ): Promise<TrafficForecast[]> {
+    const forecasts: TrafficForecast[] = [];
+    
+    for (let m = 1; m <= months; m++) {
+      const forecastedRPS = currentRPS * Math.pow(1 + growthRateMonthly / 100, m);
       
-      // Thai market specific patterns
-      patterns: {
-        campaignEffect: this.detectCampaignEffect(hourlyRates),
-        lunchTimePeak: this.detectLunchTimePeak(hourlyRates),
-        paydayEffect: this.detectPaydayEffect(hourlyRates),
-      },
-    };
-  }
-
-  // คำนวณ growth rate จาก historical data
-  async calculateGrowthRate(weeks = 12): Promise<GrowthAnalysis> {
-    const data = await this.getWeeklyPeaks(weeks);
-    
-    // Linear regression สำหรับ trend
-    const regression = this.linearRegression(
-      data.map((_, i) => i),
-      data.map(d => d.peakRPS)
-    );
-
-    const weeklyGrowthRate = regression.slope / data[0].peakRPS;
-    const monthlyGrowthRate = weeklyGrowthRate * 4;
-    const yearlyGrowthRate = weeklyGrowthRate * 52;
-
-    return {
-      weeklyGrowthPercent: weeklyGrowthRate * 100,
-      monthlyGrowthPercent: monthlyGrowthRate * 100,
-      yearlyGrowthPercent: yearlyGrowthRate * 100,
-      currentPeakRPS: data[data.length - 1].peakRPS,
-      projectedPeakRPS: {
-        in3months: data[data.length - 1].peakRPS * (1 + monthlyGrowthRate * 3),
-        in6months: data[data.length - 1].peakRPS * (1 + monthlyGrowthRate * 6),
-        in12months: data[data.length - 1].peakRPS * (1 + yearlyGrowthRate),
-      },
-    };
-  }
-
-  private linearRegression(xs: number[], ys: number[]): { slope: number; intercept: number } {
-    const n = xs.length;
-    const sumX = xs.reduce((a, b) => a + b, 0);
-    const sumY = ys.reduce((a, b) => a + b, 0);
-    const sumXY = xs.reduce((sum, x, i) => sum + x * ys[i], 0);
-    const sumX2 = xs.reduce((sum, x) => sum + x * x, 0);
-    
-    const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-    const intercept = (sumY - slope * sumX) / n;
-    
-    return { slope, intercept };
-  }
-
-  private median(values: number[]): number {
-    const sorted = [...values].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 !== 0
-      ? sorted[mid]
-      : (sorted[mid - 1] + sorted[mid]) / 2;
-  }
-}
-```
-
----
-
-## Capacity Modeling
-
-### Resource Estimation Calculator
-
-```typescript
-// tools/capacity/src/capacity-calculator.ts
-
-interface ServiceCapacityConfig {
-  name: string;
-  
-  // Current measurements
-  currentRPS: number;           // requests per second
-  avgResponseTimeMs: number;    // average response time
-  p99ResponseTimeMs: number;    // p99 response time
-  cpuUsagePercentAtCurrentLoad: number;  // CPU % at current load
-  memoryUsageMBAtCurrentLoad: number;   // Memory MB at current load
-  
-  // Resource per pod
-  podCPULimit: string;     // e.g., "1000m"
-  podMemoryLimit: string;  // e.g., "512Mi"
-  
-  // Current scale
-  currentReplicas: number;
-}
-
-interface CapacityProjection {
-  targetRPS: number;
-  requiredReplicas: number;
-  requiredCPU: string;
-  requiredMemory: string;
-  estimatedCostPerMonth: number;
-  safetyMarginPercent: number;
-}
-
-export class CapacityCalculator {
-  // Little's Law: N = λ × W
-  // N = concurrent users, λ = arrival rate, W = time in system
-  calculateConcurrentUsers(
-    rps: number,
-    avgResponseTimeMs: number
-  ): number {
-    return rps * (avgResponseTimeMs / 1000);
-  }
-
-  // คำนวณจำนวน replicas ที่ต้องการ
-  calculateRequiredReplicas(
-    config: ServiceCapacityConfig,
-    targetRPS: number,
-    safetyMarginPercent = 30,
-  ): CapacityProjection {
-    const scaleFactor = targetRPS / config.currentRPS;
-    const safetyMultiplier = 1 + safetyMarginPercent / 100;
-
-    // CPU-based calculation
-    const cpuUtilizationRatio = config.cpuUsagePercentAtCurrentLoad / 100;
-    const replicasForCPU = Math.ceil(
-      config.currentReplicas * scaleFactor * safetyMultiplier * cpuUtilizationRatio * (1 / 0.7) // target 70% utilization
-    );
-
-    // Memory-based calculation
-    const memoryPerRequestMB = config.memoryUsageMBAtCurrentLoad / config.currentRPS;
-    const targetMemoryMB = memoryPerRequestMB * targetRPS * safetyMultiplier;
-    const podMemoryMB = this.parseMemory(config.podMemoryLimit);
-    const replicasForMemory = Math.ceil(targetMemoryMB / (podMemoryMB * 0.8));
-
-    const requiredReplicas = Math.max(replicasForCPU, replicasForMemory, 2); // minimum 2 for HA
-
-    // Cost estimation (AWS EKS on-demand, ap-southeast-1)
-    const podCPU = this.parseCPU(config.podCPULimit);
-    const totalCPU = podCPU * requiredReplicas;
-    const totalMemoryGB = (podMemoryMB / 1024) * requiredReplicas;
-    
-    // Rough cost: EC2 m5.xlarge (4 vCPU, 16GB) = ~$0.23/hour in Singapore
-    const estimatedCostPerMonth = 
-      (totalCPU / 4 + totalMemoryGB / 16) * 0.23 * 24 * 30;
-
-    return {
-      targetRPS,
-      requiredReplicas,
-      requiredCPU: `${Math.ceil(podCPU * requiredReplicas)}m`,
-      requiredMemory: `${Math.ceil(podMemoryMB * requiredReplicas)}Mi`,
-      estimatedCostPerMonth,
-      safetyMarginPercent,
-    };
-  }
-
-  // Generate capacity plan
-  generateCapacityPlan(
-    services: ServiceCapacityConfig[],
-    scenarios: { name: string; multiplier: number }[],
-  ): CapacityPlan {
-    const plan: CapacityPlan = {
-      generatedAt: new Date(),
-      scenarios: [],
-    };
-
-    for (const scenario of scenarios) {
-      const serviceProjections = services.map(service => ({
-        serviceName: service.name,
-        projection: this.calculateRequiredReplicas(
-          service,
-          service.currentRPS * scenario.multiplier,
-        ),
-      }));
-
-      const totalMonthlyCost = serviceProjections.reduce(
-        (sum, s) => sum + s.projection.estimatedCostPerMonth,
-        0
-      );
-
-      plan.scenarios.push({
-        name: scenario.name,
-        loadMultiplier: scenario.multiplier,
-        services: serviceProjections,
-        totalMonthlyCostUSD: totalMonthlyCost,
+      // 95% confidence interval (using simplified model)
+      const uncertainty = 0.15 * m; // uncertainty grows with time
+      
+      const date = new Date();
+      date.setMonth(date.getMonth() + m);
+      
+      forecasts.push({
+        date,
+        forecastedRPS,
+        confidenceInterval: {
+          lower: forecastedRPS * (1 - uncertainty),
+          upper: forecastedRPS * (1 + uncertainty),
+        },
+        trend: growthRateMonthly > 2 ? 'increasing' : 
+               growthRateMonthly < -2 ? 'decreasing' : 'stable',
+        seasonality: {
+          hourOfDay: this.getPeakHour(),
+          dayOfWeek: 1, // Monday typically highest
+          monthOfYear: 11, // December peak for e-commerce
+        },
       });
     }
-
-    return plan;
+    
+    return forecasts;
   }
 
-  private parseCPU(cpu: string): number {
-    if (cpu.endsWith('m')) return parseInt(cpu) / 1000;
-    return parseFloat(cpu);
+  private calculateGrowthRate(metrics: any[]): number {
+    if (metrics.length < 14) return 0;
+    
+    const firstWeek = metrics.slice(0, 7);
+    const lastWeek = metrics.slice(-7);
+    
+    const firstAvg = firstWeek.reduce((sum: number, m: any) => 
+      sum + parseFloat(m.avg_rps), 0) / firstWeek.length;
+    const lastAvg = lastWeek.reduce((sum: number, m: any) => 
+      sum + parseFloat(m.avg_rps), 0) / lastWeek.length;
+    
+    return ((lastAvg - firstAvg) / firstAvg) * 100;
   }
 
-  private parseMemory(memory: string): number {
-    if (memory.endsWith('Mi')) return parseInt(memory);
-    if (memory.endsWith('Gi')) return parseInt(memory) * 1024;
-    return parseInt(memory);
+  private getPeakHour(): number {
+    return 14; // 2 PM typically
   }
 }
 ```
 
----
+### 1.2 Load Testing สำหรับ Capacity Estimation
 
-## Stress Testing
+```typescript
+// src/capacity/load-test.ts
+// ใช้ k6 script
 
-### k6 Load Testing Scripts
-
-```javascript
-// tests/load/order-service.k6.js
-// Full load test suite สำหรับ Order Service
-
+// k6 load test script
+export default function k6Script() {
+  return `
 import http from 'k6/http';
-import { check, group, sleep } from 'k6';
+import { check, sleep } from 'k6';
 import { Rate, Trend, Counter } from 'k6/metrics';
-import { SharedArray } from 'k6/data';
 
-// Custom metrics
 const errorRate = new Rate('error_rate');
-const orderCreationDuration = new Trend('order_creation_duration_ms');
-const successfulOrders = new Counter('successful_orders');
+const responseTime = new Trend('response_time_ms');
+const requestCount = new Counter('request_count');
 
-// Test configuration
 export const options = {
-  scenarios: {
-    // Smoke test - ตรวจสอบว่าระบบ work
-    smoke: {
-      executor: 'constant-vus',
-      vus: 1,
-      duration: '1m',
-      tags: { test_type: 'smoke' },
-    },
-    
-    // Load test - normal expected load
-    load: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '5m', target: 50 },   // ramp up
-        { duration: '20m', target: 50 },  // stay at 50 VUs
-        { duration: '5m', target: 0 },    // ramp down
-      ],
-      tags: { test_type: 'load' },
-    },
-    
-    // Stress test - beyond normal load
-    stress: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '5m', target: 100 },
-        { duration: '10m', target: 100 },
-        { duration: '5m', target: 200 },
-        { duration: '10m', target: 200 },
-        { duration: '5m', target: 300 },
-        { duration: '10m', target: 300 },
-        { duration: '5m', target: 0 },
-      ],
-      tags: { test_type: 'stress' },
-    },
-    
-    // Spike test - sudden traffic spike
-    spike: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '30s', target: 10 },
-        { duration: '1m', target: 500 }, // spike!
-        { duration: '30s', target: 10 },
-      ],
-      tags: { test_type: 'spike' },
-    },
-    
-    // Soak test - extended normal load
-    soak: {
-      executor: 'constant-vus',
-      vus: 50,
-      duration: '2h',
-      tags: { test_type: 'soak' },
-    },
-  },
-  
+  stages: [
+    { duration: '2m', target: 100 },    // Ramp up to 100 users
+    { duration: '5m', target: 100 },    // Steady state
+    { duration: '2m', target: 500 },    // Ramp up to 500 users
+    { duration: '5m', target: 500 },    // Steady state
+    { duration: '2m', target: 1000 },   // Ramp up to 1000 users
+    { duration: '5m', target: 1000 },   // Steady state at peak
+    { duration: '2m', target: 0 },      // Ramp down
+  ],
   thresholds: {
-    'http_req_duration': ['p(95)<500', 'p(99)<1000'],
-    'http_req_failed': ['rate<0.01'],         // < 1% error rate
-    'order_creation_duration_ms': ['p(95)<300'],
-    'error_rate': ['rate<0.01'],
+    http_req_duration: ['p(99)<500'],   // 99% ต้องเร็วกว่า 500ms
+    http_req_failed: ['rate<0.01'],     // Error rate < 1%
   },
 };
 
-const BASE_URL = __ENV.BASE_URL || 'https://api-staging.company.com';
-const AUTH_TOKEN = __ENV.AUTH_TOKEN;
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:3000';
 
-// Preload test data
-const testUsers = new SharedArray('users', () => {
-  return JSON.parse(open('./data/test-users.json'));
-});
-
-const testProducts = new SharedArray('products', () => {
-  return JSON.parse(open('./data/test-products.json'));
-});
-
-export default function() {
-  const user = testUsers[Math.floor(Math.random() * testUsers.length)];
-  
-  group('Order Creation Flow', () => {
-    const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${AUTH_TOKEN || user.token}`,
-      'X-Request-ID': `k6-${__VU}-${__ITER}-${Date.now()}`,
-      'Idempotency-Key': `k6-order-${__VU}-${__ITER}`,
-    };
-
-    // Step 1: Create order
-    const orderPayload = JSON.stringify({
-      items: [
-        {
-          productId: testProducts[Math.floor(Math.random() * testProducts.length)].id,
-          quantity: Math.floor(Math.random() * 3) + 1,
-        }
-      ],
-      shippingAddress: {
-        street: '123 Sukhumvit Road',
-        city: 'Bangkok',
-        province: 'Bangkok',
-        postalCode: '10110',
-        countryCode: 'TH',
-      },
-    });
-
-    const createStart = Date.now();
-    const createResponse = http.post(
-      `${BASE_URL}/api/v1/orders`,
-      orderPayload,
-      { headers, timeout: '10s' }
-    );
-    orderCreationDuration.add(Date.now() - createStart);
-
-    const createSuccess = check(createResponse, {
-      'create order: status 201': (r) => r.status === 201,
-      'create order: has orderId': (r) => {
-        const body = JSON.parse(r.body);
-        return body.id !== undefined;
-      },
-      'create order: response time < 500ms': (r) => r.timings.duration < 500,
-    });
-
-    if (!createSuccess) {
-      errorRate.add(1);
-      return;
-    }
-
-    errorRate.add(0);
-    successfulOrders.add(1);
-
-    const order = JSON.parse(createResponse.body);
-
-    // Step 2: Get order
-    const getResponse = http.get(
-      `${BASE_URL}/api/v1/orders/${order.id}`,
-      { headers }
-    );
-
-    check(getResponse, {
-      'get order: status 200': (r) => r.status === 200,
-      'get order: correct ID': (r) => JSON.parse(r.body).id === order.id,
-    });
-
-    sleep(Math.random() * 2 + 1); // Think time 1-3 seconds
+export default function () {
+  const res = http.get(\`\${BASE_URL}/api/v1/users\`, {
+    headers: {
+      'Authorization': 'Bearer test-token',
+      'X-Correlation-ID': \`k6-\${__VU}-\${__ITER}\`,
+    },
+    timeout: '10s',
   });
+  
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'response time < 500ms': (r) => r.timings.duration < 500,
+  });
+  
+  errorRate.add(res.status !== 200);
+  responseTime.add(res.timings.duration);
+  requestCount.add(1);
+  
+  sleep(0.1); // 100ms between requests
 }
-
-export function handleSummary(data) {
-  return {
-    'results/load-test-summary.json': JSON.stringify(data, null, 2),
-    'results/load-test-summary.html': htmlReport(data),
-  };
+  `;
 }
-```
-
-```bash
-#!/bin/bash
-# scripts/run-load-test.sh
-
-# Run specific scenario
-k6 run \
-  --env BASE_URL=https://api-staging.company.com \
-  --env AUTH_TOKEN=$(cat .test-token) \
-  --out influxdb=http://influxdb:8086/k6 \
-  --tag environment=staging \
-  --scenario load \
-  tests/load/order-service.k6.js
-
-# Run all scenarios (parallel)
-k6 run \
-  --env BASE_URL=https://api-staging.company.com \
-  tests/load/order-service.k6.js \
-  2>&1 | tee results/$(date +%Y%m%d_%H%M%S)-load-test.log
 ```
 
 ---
 
-## Bottleneck Analysis
-
-### Resource Profiling ใน Production
+## 2. Resource Utilization Baselines
 
 ```typescript
-// services/order/src/capacity/bottleneck-detector.ts
+// src/capacity/resource-baseline.ts
+interface ResourceBaseline {
+  service: string;
+  environment: string;
+  measuredAt: Date;
+  cpu: {
+    idle: number;
+    p50LoadRPS: number;    // CPU% ที่ 50% of peak RPS
+    p100LoadRPS: number;   // CPU% ที่ 100% of peak RPS
+    ceiling: number;       // Maximum RPS ก่อน CPU > 80%
+  };
+  memory: {
+    baselineMB: number;    // ใช้ตอน idle
+    perRequestMB: number;  // Memory เพิ่มต่อ request
+    maxMB: number;         // Pod memory limit
+    recommendedMB: number; // 70% ของ max
+  };
+  connections: {
+    dbPoolSize: number;
+    redisPoolSize: number;
+    maxConcurrent: number;
+  };
+  network: {
+    avgRequestBytes: number;
+    avgResponseBytes: number;
+    peakMbps: number;
+  };
+}
 
-import { Injectable, Logger } from '@nestjs/common';
+export class ResourceBaselineCalculator {
+  async calculateBaseline(
+    serviceName: string,
+    peakRPS: number
+  ): Promise<ResourceBaseline> {
+    // Query metrics from Prometheus
+    const cpuAt50 = await this.getMetric(serviceName, 'cpu', peakRPS * 0.5);
+    const cpuAt100 = await this.getMetric(serviceName, 'cpu', peakRPS);
+    
+    // Calculate linear regression for CPU vs RPS
+    const cpuPerRPS = (cpuAt100 - cpuAt50) / (peakRPS * 0.5);
+    const cpuCeiling = (80 - cpuAt50) / cpuPerRPS + peakRPS * 0.5;
+    
+    return {
+      service: serviceName,
+      environment: process.env.NODE_ENV || 'production',
+      measuredAt: new Date(),
+      cpu: {
+        idle: 2.5,          // 2.5% baseline CPU
+        p50LoadRPS: cpuAt50,
+        p100LoadRPS: cpuAt100,
+        ceiling: cpuCeiling,
+      },
+      memory: {
+        baselineMB: 256,    // 256MB baseline
+        perRequestMB: 0.05, // 50KB per request
+        maxMB: 1024,        // 1GB limit
+        recommendedMB: 716, // 70% of max
+      },
+      connections: {
+        dbPoolSize: Math.ceil(peakRPS / 10), // 1 DB conn per 10 RPS
+        redisPoolSize: Math.ceil(peakRPS / 50),
+        maxConcurrent: peakRPS * 2, // Allow 2x burst
+      },
+      network: {
+        avgRequestBytes: 500,
+        avgResponseBytes: 2000,
+        peakMbps: (peakRPS * (500 + 2000) * 8) / 1e6,
+      },
+    };
+  }
 
-interface BottleneckAnalysis {
-  bottleneck: 'CPU' | 'MEMORY' | 'DATABASE' | 'NETWORK' | 'NONE';
-  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
-  details: string;
+  calculateRequiredInstances(
+    baseline: ResourceBaseline,
+    forecastedRPS: number,
+    safetyFactor: number = 1.3
+  ): {
+    minInstances: number;
+    recommendedInstances: number;
+    maxInstances: number;
+    reasoning: string;
+  } {
+    const effectiveRPS = forecastedRPS * safetyFactor;
+    
+    // Based on CPU ceiling
+    const instancesByCPU = Math.ceil(effectiveRPS / baseline.cpu.ceiling);
+    
+    // Based on memory (assume 1 request in flight per ms = RPS/1000 concurrent)
+    const concurrentRequests = forecastedRPS / 1000;
+    const memoryNeeded = baseline.memory.baselineMB + 
+                        concurrentRequests * baseline.memory.perRequestMB;
+    const instancesByMemory = Math.ceil(memoryNeeded / baseline.memory.maxMB);
+    
+    const recommended = Math.max(instancesByCPU, instancesByMemory, 2);
+    
+    return {
+      minInstances: recommended,
+      recommendedInstances: recommended + 1, // n+1 for zero-downtime deploys
+      maxInstances: recommended * 3, // Auto-scale ceiling
+      reasoning: `CPU ceiling: ${Math.round(baseline.cpu.ceiling)} RPS/instance, ` +
+                `needs ${instancesByCPU} instances. ` +
+                `Memory: ${Math.round(memoryNeeded)}MB needed, ` +
+                `needs ${instancesByMemory} instances.`,
+    };
+  }
+
+  private async getMetric(service: string, metric: string, rps: number): Promise<number> {
+    // Mock: ในความเป็นจริงจะ query Prometheus
+    return metric === 'cpu' ? rps * 0.08 : rps * 50 / 1024;
+  }
+}
+```
+
+---
+
+## 3. Database Capacity Planning
+
+```typescript
+// src/capacity/database-planner.ts
+interface DatabaseCapacityPlan {
+  service: string;
+  currentMetrics: {
+    sizeGB: number;
+    rowCount: number;
+    queryRPS: number;
+    avgQueryMs: number;
+    connectionPoolSize: number;
+    activeConnections: number;
+  };
+  projections: {
+    months3: DatabaseProjection;
+    months6: DatabaseProjection;
+    months12: DatabaseProjection;
+  };
   recommendations: string[];
 }
 
-@Injectable()
-export class BottleneckDetector {
-  private readonly logger = new Logger(BottleneckDetector.name);
-
-  async analyze(): Promise<BottleneckAnalysis[]> {
-    const bottlenecks: BottleneckAnalysis[] = [];
-
-    // Check CPU bottleneck
-    const cpuUsage = await this.getCpuUsage();
-    if (cpuUsage > 0.8) {
-      bottlenecks.push({
-        bottleneck: 'CPU',
-        severity: cpuUsage > 0.95 ? 'CRITICAL' : 'HIGH',
-        details: `CPU usage at ${(cpuUsage * 100).toFixed(1)}%`,
-        recommendations: [
-          'Scale horizontally (increase replica count)',
-          'Increase CPU limits',
-          'Profile CPU-intensive operations',
-          'Check for blocking event loop operations',
-        ],
-      });
-    }
-
-    // Check memory bottleneck
-    const memUsage = await this.getMemoryUsage();
-    if (memUsage > 0.85) {
-      bottlenecks.push({
-        bottleneck: 'MEMORY',
-        severity: memUsage > 0.95 ? 'CRITICAL' : 'HIGH',
-        details: `Memory usage at ${(memUsage * 100).toFixed(1)}%`,
-        recommendations: [
-          'Check for memory leaks',
-          'Increase memory limits',
-          'Review caching strategies',
-          'Enable GC profiling',
-        ],
-      });
-    }
-
-    // Check database connection pool
-    const dbPoolUtilization = await this.getDBPoolUtilization();
-    if (dbPoolUtilization > 0.9) {
-      bottlenecks.push({
-        bottleneck: 'DATABASE',
-        severity: dbPoolUtilization > 0.95 ? 'CRITICAL' : 'HIGH',
-        details: `DB connection pool ${(dbPoolUtilization * 100).toFixed(1)}% utilized`,
-        recommendations: [
-          'Increase connection pool size',
-          'Add read replicas for read-heavy workloads',
-          'Implement connection pooling (PgBouncer)',
-          'Optimize slow queries',
-          'Consider caching frequently read data',
-        ],
-      });
-    }
-
-    return bottlenecks;
-  }
-
-  private async getCpuUsage(): Promise<number> {
-    // Query Prometheus
-    const result = await this.prometheus.query(
-      'sum(rate(process_cpu_seconds_total{service="order-service"}[5m]))'
-    );
-    return parseFloat(result.value);
-  }
-
-  private async getMemoryUsage(): Promise<number> {
-    const used = await this.prometheus.query(
-      'process_resident_memory_bytes{service="order-service"}'
-    );
-    const limit = await this.prometheus.query(
-      'container_spec_memory_limit_bytes{container="order-service"}'
-    );
-    return parseFloat(used.value) / parseFloat(limit.value);
-  }
-
-  private async getDBPoolUtilization(): Promise<number> {
-    const result = await this.prometheus.query(
-      `
-      sum(pg_stat_activity_count{datname="orders", state="active"}) /
-      sum(pg_settings_max_connections{datname="orders"})
-      `
-    );
-    return parseFloat(result.value);
-  }
+interface DatabaseProjection {
+  sizeGB: number;
+  rowCount: number;
+  queryRPS: number;
+  requiredConnections: number;
+  storageAlertDate: Date | null;
+  actionRequired: boolean;
 }
-```
 
----
-
-## Auto-scaling Configuration
-
-### Kubernetes HPA + KEDA
-
-```yaml
-# kubernetes/autoscaling/order-service-hpa.yaml
-
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: order-service-hpa
-  namespace: production
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: order-service
-  
-  minReplicas: 3
-  maxReplicas: 50
-  
-  metrics:
-  # CPU-based scaling
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70  # Scale up ถ้า CPU > 70%
-  
-  # Memory-based scaling
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
-  
-  # Custom metric: Request rate (ต้องการ custom metrics adapter)
-  - type: External
-    external:
-      metric:
-        name: requests_per_second
-        selector:
-          matchLabels:
-            service: order-service
-      target:
-        type: AverageValue
-        averageValue: "100"  # Target 100 RPS per pod
-  
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 60   # ไม่ scale up บ่อยกว่า 1 นาที
-      policies:
-      - type: Pods
-        value: 5           # เพิ่มได้ครั้งละไม่เกิน 5 pods
-        periodSeconds: 60
-      - type: Percent
-        value: 100         # หรือ double ใน 60 วินาที
-        periodSeconds: 60
-      selectPolicy: Max    # ใช้ policy ที่ได้ผลมากกว่า
+export class DatabaseCapacityPlanner {
+  async planCapacity(
+    dbName: string,
+    growthRateMonthly: number = 15  // 15% per month
+  ): Promise<DatabaseCapacityPlan> {
+    const current = await this.getCurrentMetrics(dbName);
     
-    scaleDown:
-      stabilizationWindowSeconds: 300  # รอ 5 นาทีก่อน scale down
-      policies:
-      - type: Pods
-        value: 2           # ลดครั้งละไม่เกิน 2 pods
-        periodSeconds: 120
-```
-
-```yaml
-# kubernetes/autoscaling/order-service-keda.yaml
-# KEDA (Kubernetes Event-Driven Autoscaling) - scale based on Kafka lag
-
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: order-service-scaledobject
-  namespace: production
-spec:
-  scaleTargetRef:
-    name: order-service
-  
-  minReplicaCount: 2
-  maxReplicaCount: 50
-  
-  triggers:
-  # Scale based on Kafka consumer lag
-  - type: kafka
-    metadata:
-      bootstrapServers: kafka.production:9092
-      consumerGroup: order-service-consumer-group
-      topic: order.events.incoming
-      lagThreshold: "100"       # Scale up ถ้า lag > 100 messages per partition
-      activationLagThreshold: "10"
-  
-  # Scale based on Prometheus metrics
-  - type: prometheus
-    metadata:
-      serverAddress: http://prometheus.monitoring:9090
-      metricName: http_requests_in_flight
-      threshold: "50"
-      query: sum(http_requests_in_flight{service="order-service"})
-  
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleDown:
-          stabilizationWindowSeconds: 300
-```
-
----
-
-## Cost Estimation
-
-### AWS Cost Calculator
-
-```typescript
-// tools/capacity/src/cost-estimator.ts
-
-interface AWSRegionPricing {
-  ec2PerVCPUHour: number;    // USD per vCPU per hour
-  ec2PerGBMemHour: number;   // USD per GB RAM per hour
-  eksPer10kNodes: number;    // EKS control plane cost per 10 node hours
-  rdsStoragePerGBMonth: number;
-  rdsPer2vcpuHour: number;
-  transferPerGB: number;     // Data transfer out cost
-}
-
-// Asia Pacific (Singapore) - ap-southeast-1 pricing (approximate)
-const AP_SE_1_PRICING: AWSRegionPricing = {
-  ec2PerVCPUHour: 0.048,    // Fargate, 2 vCPU = ~$0.096/hr
-  ec2PerGBMemHour: 0.0052,  // Fargate, 1GB = ~$0.0052/hr
-  eksPer10kNodes: 0.10,     // EKS cluster fee + node time
-  rdsStoragePerGBMonth: 0.138,
-  rdsPer2vcpuHour: 0.109,   // db.t3.medium
-  transferPerGB: 0.08,
-};
-
-export class CostEstimator {
-  estimateMonthlyInfrastructureCost(
-    config: InfrastructureConfig,
-    pricing: AWSRegionPricing = AP_SE_1_PRICING,
-  ): CostBreakdown {
-    const HOURS_PER_MONTH = 730;
-
-    // EKS Compute (Fargate)
-    const computeCost = config.services.reduce((total, service) => {
-      const cpuCost = service.cpuVCPU * service.replicas * 
-        pricing.ec2PerVCPUHour * HOURS_PER_MONTH;
-      const memoryCost = service.memoryGB * service.replicas * 
-        pricing.ec2PerGBMemHour * HOURS_PER_MONTH;
-      return total + cpuCost + memoryCost;
-    }, 0);
-
-    // RDS (Aurora PostgreSQL)
-    const dbCost = config.databases.reduce((total, db) => {
-      const instanceCost = (db.vCPU / 2) * pricing.rdsPer2vcpuHour * HOURS_PER_MONTH;
-      const storageCost = db.storageGB * pricing.rdsStoragePerGBMonth;
-      const replicaCost = instanceCost * db.readReplicas * 0.8; // replicas slightly cheaper
-      return total + instanceCost + storageCost + replicaCost;
-    }, 0);
-
-    // Data Transfer
-    const transferCost = config.estimatedMonthlyDataTransferGB * pricing.transferPerGB;
-
-    // Load Balancer (ALB)
-    const lbCost = config.loadBalancers * 22.27; // ~$22.27/month per ALB
-
-    const totalCost = computeCost + dbCost + transferCost + lbCost;
-
+    const project = (months: number): DatabaseProjection => {
+      const growthFactor = Math.pow(1 + growthRateMonthly / 100, months);
+      const projectedSize = current.sizeGB * growthFactor;
+      const projectedRows = current.rowCount * growthFactor;
+      const projectedRPS = current.queryRPS * growthFactor;
+      const projectedConnections = Math.ceil(projectedRPS / 10);
+      
+      // คำนวณว่าจะเต็ม disk เมื่อไหร่
+      const diskCapacityGB = 500; // Assume 500GB disk
+      const monthsUntilFull = Math.log(diskCapacityGB / current.sizeGB) / 
+                              Math.log(1 + growthRateMonthly / 100);
+      
+      const storageAlertDate = new Date();
+      storageAlertDate.setMonth(
+        storageAlertDate.getMonth() + monthsUntilFull
+      );
+      
+      return {
+        sizeGB: Math.round(projectedSize * 100) / 100,
+        rowCount: Math.round(projectedRows),
+        queryRPS: Math.round(projectedRPS),
+        requiredConnections: projectedConnections,
+        storageAlertDate: monthsUntilFull <= 18 ? storageAlertDate : null,
+        actionRequired: projectedConnections > 100 || projectedSize > 200,
+      };
+    };
+    
+    const recommendations = this.generateRecommendations(current, growthRateMonthly);
+    
     return {
-      compute: computeCost,
-      database: dbCost,
-      dataTransfer: transferCost,
-      loadBalancer: lbCost,
-      total: totalCost,
-      breakdown: {
-        computePercent: (computeCost / totalCost) * 100,
-        databasePercent: (dbCost / totalCost) * 100,
-        transferPercent: (transferCost / totalCost) * 100,
+      service: dbName,
+      currentMetrics: current,
+      projections: {
+        months3: project(3),
+        months6: project(6),
+        months12: project(12),
       },
+      recommendations,
+    };
+  }
+
+  private generateRecommendations(
+    current: DatabaseCapacityPlan['currentMetrics'],
+    growthRate: number
+  ): string[] {
+    const recommendations: string[] = [];
+    
+    // Connection pool
+    if (current.activeConnections > current.connectionPoolSize * 0.8) {
+      recommendations.push(
+        `Connection pool at ${Math.round(current.activeConnections / current.connectionPoolSize * 100)}% capacity. ` +
+        `Consider increasing pool size or adding read replicas.`
+      );
+    }
+    
+    // Query performance
+    if (current.avgQueryMs > 100) {
+      recommendations.push(
+        `Average query time ${current.avgQueryMs}ms exceeds 100ms SLA. ` +
+        `Review query plans and add indexes.`
+      );
+    }
+    
+    // Growth rate
+    if (growthRate > 20) {
+      recommendations.push(
+        `High growth rate (${growthRate}%/month). Consider:
+        1. Partitioning large tables by date
+        2. Archiving data older than 6 months
+        3. Upgrading to larger instance class in 3-6 months`
+      );
+    }
+    
+    // Size
+    if (current.sizeGB > 100) {
+      recommendations.push(
+        `Database size ${current.sizeGB}GB. Consider:
+        1. Enable table partitioning
+        2. Review and implement data archival strategy
+        3. Use Read Replicas for read-heavy workloads`
+      );
+    }
+    
+    return recommendations;
+  }
+
+  private async getCurrentMetrics(dbName: string): Promise<DatabaseCapacityPlan['currentMetrics']> {
+    // Query from monitoring system
+    return {
+      sizeGB: 45,
+      rowCount: 10000000,
+      queryRPS: 500,
+      avgQueryMs: 35,
+      connectionPoolSize: 100,
+      activeConnections: 75,
     };
   }
 }
 ```
 
-### Cost Optimization Recommendations
-
-```
-Cost Optimization Checklist:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. Right-sizing (ลดต้นทุน 20-40%)
-   [ ] วิเคราะห์ CPU/Memory utilization จาก metrics
-   [ ] ลด resource limits ที่ over-provisioned
-   [ ] ใช้ Vertical Pod Autoscaler (VPA) แนะนำขนาดที่เหมาะสม
-
-2. Spot Instances (ลดต้นทุน 60-90%)
-   [ ] Stateless services ที่รับ interruption ได้ → Spot/Preemptible
-   [ ] ใช้ spot instances สำหรับ batch workloads
-   [ ] Configure proper interruption handling
-
-3. Reserved Capacity (ลดต้นทุน 30-60%)
-   [ ] Production workloads ที่ stable → Reserved instances 1-3 ปี
-   [ ] Database instances → Reserved DB instances
-
-4. Auto-scaling (ลดต้นทุน 20-30%)
-   [ ] Cluster Autoscaler ลด nodes ช่วงกลางคืน
-   [ ] HPA ลด pods เมื่อ traffic ต่ำ
-   [ ] Schedule-based scaling (scale down นอกเวลาทำการ)
-
-5. Storage Optimization (ลดต้นทุน 15-25%)
-   [ ] S3 Intelligent-Tiering สำหรับ infrequent access data
-   [ ] EBS gp3 แทน gp2 (ราคาถูกกว่า 20%)
-   [ ] Archive logs ไปยัง Glacier หลัง 90 วัน
-
-6. Network Optimization (ลดต้นทุน 10-20%)
-   [ ] VPC Endpoints แทน Internet Gateway สำหรับ AWS services
-   [ ] CloudFront สำหรับ static content
-   [ ] ลด cross-AZ data transfer
-```
-
 ---
 
-## Capacity Planning Dashboard
+## 4. Kubernetes Resource Right-Sizing
 
-```yaml
-# grafana/dashboards/capacity-planning.json (abbreviated)
+```typescript
+// src/capacity/k8s-rightsizer.ts
+interface K8sResourceSpec {
+  requests: { cpu: string; memory: string };
+  limits: { cpu: string; memory: string };
+}
 
-panels:
-  - title: "Current vs. Projected Load"
-    type: timeseries
-    targets:
-      - expr: "sum(rate(http_requests_total[5m])) * on() group_left vector(1)"
-        legendFormat: "Current RPS"
-      - expr: "forecast_request_rate_next_30d"
-        legendFormat: "30-day Forecast"
+interface RightSizingRecommendation {
+  service: string;
+  current: K8sResourceSpec;
+  recommended: K8sResourceSpec;
+  potentialSavings: {
+    cpu: string;
+    memory: string;
+    estimatedCostSavingPercent: number;
+  };
+  reasoning: string;
+}
+
+export class KubernetesRightSizer {
+  async analyzeAndRecommend(
+    namespace: string,
+    deploymentName: string,
+    lookbackDays: number = 14
+  ): Promise<RightSizingRecommendation> {
+    // Query VPA recommendations from Kubernetes
+    const vpaRecommendation = await this.getVPARecommendation(
+      namespace, 
+      deploymentName
+    );
     
-  - title: "Resource Headroom"
-    type: gauge
-    targets:
-      - expr: |
-          (
-            sum(kube_pod_container_resource_limits{resource="cpu",
-                container="order-service"}) -
-            sum(rate(container_cpu_usage_seconds_total{
-                container="order-service"}[5m]))
-          ) / 
-          sum(kube_pod_container_resource_limits{resource="cpu",
-              container="order-service"}) * 100
-    thresholds:
-      - color: red
-        value: 0
-      - color: yellow
-        value: 20
-      - color: green
-        value: 40
+    // Query actual usage from Prometheus
+    const actualUsage = await this.getActualUsage(
+      namespace, 
+      deploymentName, 
+      lookbackDays
+    );
+    
+    // Calculate recommendations with headroom
+    const HEADROOM_FACTOR = 1.2; // 20% headroom
+    
+    const recommendedCpuMilli = Math.ceil(
+      actualUsage.p99CpuMilli * HEADROOM_FACTOR
+    );
+    const recommendedMemoryMB = Math.ceil(
+      actualUsage.p99MemoryMB * HEADROOM_FACTOR
+    );
+    
+    const current = await this.getCurrentSpec(namespace, deploymentName);
+    
+    return {
+      service: deploymentName,
+      current,
+      recommended: {
+        requests: {
+          cpu: `${Math.ceil(recommendedCpuMilli * 0.5)}m`, // Request = 50% of limit
+          memory: `${Math.ceil(recommendedMemoryMB * 0.7)}Mi`,
+        },
+        limits: {
+          cpu: `${recommendedCpuMilli}m`,
+          memory: `${recommendedMemoryMB}Mi`,
+        },
+      },
+      potentialSavings: this.calculateSavings(current, {
+        requests: {
+          cpu: `${Math.ceil(recommendedCpuMilli * 0.5)}m`,
+          memory: `${Math.ceil(recommendedMemoryMB * 0.7)}Mi`,
+        },
+        limits: {
+          cpu: `${recommendedCpuMilli}m`,
+          memory: `${recommendedMemoryMB}Mi`,
+        },
+      }),
+      reasoning: `Based on ${lookbackDays} days: P99 CPU=${actualUsage.p99CpuMilli}m, P99 Memory=${actualUsage.p99MemoryMB}MB`,
+    };
+  }
 
-  - title: "Auto-scaling Events (24h)"
-    type: timeseries
-    targets:
-      - expr: "changes(kube_deployment_spec_replicas{deployment='order-service'}[1h])"
-        legendFormat: "Scaling Events"
+  private async getActualUsage(
+    namespace: string,
+    deployment: string,
+    days: number
+  ): Promise<{ p99CpuMilli: number; p99MemoryMB: number }> {
+    // Prometheus queries
+    const cpuQuery = `
+      quantile_over_time(0.99, 
+        rate(container_cpu_usage_seconds_total{
+          namespace="${namespace}",
+          pod=~"${deployment}-.*"
+        }[5m])[${days}d:5m]
+      ) * 1000
+    `;
+    
+    const memQuery = `
+      quantile_over_time(0.99,
+        container_memory_working_set_bytes{
+          namespace="${namespace}",
+          pod=~"${deployment}-.*"
+        }[${days}d:5m]
+      ) / (1024 * 1024)
+    `;
+    
+    // In reality, query Prometheus API
+    return { p99CpuMilli: 250, p99MemoryMB: 384 };
+  }
 
-  - title: "Error Budget Burn Rate"
-    type: stat
-    targets:
-      - expr: |
-          (
-            sum(rate(http_requests_total{status=~"5..",service="order-service"}[1h])) /
-            sum(rate(http_requests_total{service="order-service"}[1h]))
-          ) / (1 - 0.999) * 100
-        legendFormat: "Error Budget Burn Rate %"
+  private calculateSavings(
+    current: K8sResourceSpec,
+    recommended: K8sResourceSpec
+  ): RightSizingRecommendation['potentialSavings'] {
+    const currentCpuMilli = parseInt(current.requests.cpu);
+    const recommendedCpuMilli = parseInt(recommended.requests.cpu);
+    const savingPercent = ((currentCpuMilli - recommendedCpuMilli) / currentCpuMilli) * 100;
+    
+    return {
+      cpu: `${currentCpuMilli - recommendedCpuMilli}m`,
+      memory: `${parseInt(current.requests.memory) - parseInt(recommended.requests.memory)}Mi`,
+      estimatedCostSavingPercent: Math.max(0, savingPercent),
+    };
+  }
+
+  private async getCurrentSpec(namespace: string, deployment: string): Promise<K8sResourceSpec> {
+    return {
+      requests: { cpu: '500m', memory: '512Mi' },
+      limits: { cpu: '1000m', memory: '1Gi' },
+    };
+  }
+
+  private async getVPARecommendation(namespace: string, deployment: string): Promise<any> {
+    return null;
+  }
+}
 ```
 
 ---
 
-## Capacity Review Process
+## 5. Cache Sizing Strategies
 
-```
-Monthly Capacity Review Meeting Agenda:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```typescript
+// src/capacity/cache-sizer.ts
+interface CacheCapacityPlan {
+  service: string;
+  currentStats: {
+    hitRate: number;
+    memoryUsedMB: number;
+    keyCount: number;
+    avgValueSizeBytes: number;
+    evictionRate: number;
+  };
+  recommendations: {
+    targetHitRate: number;
+    recommendedMemoryMB: number;
+    ttlSettings: Record<string, number>;
+    evictionPolicy: string;
+  };
+}
 
-Attendees: Engineering Lead, SRE, Product Manager, Finance
+export class CacheSizer {
+  async planCacheCapacity(
+    serviceName: string,
+    rps: number
+  ): Promise<CacheCapacityPlan> {
+    const currentStats = await this.getCurrentStats(serviceName);
+    
+    // Target hit rate: 80%+
+    const targetHitRate = 0.85;
+    
+    // Calculate cache size needed for target hit rate
+    // ใช้ working set estimation
+    const uniqueKeysPerHour = rps * 3600 * (1 - targetHitRate);
+    const avgTTLHours = 1;
+    const workingSetKeys = uniqueKeysPerHour * avgTTLHours;
+    const recommendedMemoryMB = Math.ceil(
+      (workingSetKeys * currentStats.avgValueSizeBytes) / 1024 / 1024 * 1.5
+    );
+    
+    return {
+      service: serviceName,
+      currentStats,
+      recommendations: {
+        targetHitRate,
+        recommendedMemoryMB,
+        ttlSettings: {
+          user_profiles: 3600,       // 1 hour
+          product_catalog: 86400,    // 24 hours
+          session_data: 1800,        // 30 minutes
+          config: 3600,              // 1 hour
+          search_results: 300,       // 5 minutes
+        },
+        evictionPolicy: currentStats.hitRate < 0.7 ? 
+          'allkeys-lru' : 'volatile-lru',
+      },
+    };
+  }
 
-1. Traffic Review (15 min)
-   - Current traffic vs. last month
-   - Growth rate calculation
-   - Upcoming events that will impact load
-     (campaigns, holidays, special events)
-
-2. Resource Utilization Review (15 min)
-   - Services with > 70% CPU/Memory utilization
-   - Database query performance trends
-   - Network bandwidth usage
-
-3. Incident Review Impact (10 min)
-   - Incidents caused by capacity issues
-   - Near-miss situations
-
-4. Forecast (15 min)
-   - 30-day projection
-   - 90-day projection
-   - Upcoming product launches impact
-
-5. Budget Review (10 min)
-   - Current cloud spend vs. budget
-   - Cost optimization opportunities
-   - Projected spend for next quarter
-
-6. Action Items (15 min)
-   - Services needing right-sizing
-   - Services needing scale-up
-   - Cost optimization initiatives
+  private async getCurrentStats(serviceName: string): Promise<CacheCapacityPlan['currentStats']> {
+    return {
+      hitRate: 0.72,
+      memoryUsedMB: 256,
+      keyCount: 500000,
+      avgValueSizeBytes: 512,
+      evictionRate: 0.02,
+    };
+  }
+}
 ```
 
 ---
 
-## สรุป
+## 6. Cost Optimization Strategies
 
-Capacity Planning ต้องทำอย่างสม่ำเสมอและ data-driven:
+```typescript
+// src/capacity/cost-optimizer.ts
+interface CostModel {
+  onDemand: number;      // $/hour
+  reserved1Year: number; // $/hour (equivalent)
+  reserved3Year: number; // $/hour (equivalent)
+  spot: number;          // $/hour (average)
+  savingsFor1Year: number;  // % savings vs on-demand
+  savingsFor3Year: number;
+  spotSavings: number;
+}
 
-| กระบวนการ | ความถี่ | เครื่องมือ |
-|-----------|---------|-----------|
-| Traffic monitoring | Real-time | Grafana |
-| Growth analysis | Weekly | Custom analytics |
-| Load forecasting | Monthly | Historical data + regression |
-| Stress testing | Per release | k6 |
-| Resource review | Monthly | Kubernetes metrics |
-| Cost optimization | Quarterly | AWS Cost Explorer |
+const EC2_PRICING: Record<string, CostModel> = {
+  't3.small': {
+    onDemand: 0.0208,
+    reserved1Year: 0.0124,
+    reserved3Year: 0.0083,
+    spot: 0.0062,
+    savingsFor1Year: 40,
+    savingsFor3Year: 60,
+    spotSavings: 70,
+  },
+  't3.medium': {
+    onDemand: 0.0416,
+    reserved1Year: 0.0249,
+    reserved3Year: 0.0166,
+    spot: 0.0125,
+    savingsFor1Year: 40,
+    savingsFor3Year: 60,
+    spotSavings: 70,
+  },
+  'c5.xlarge': {
+    onDemand: 0.17,
+    reserved1Year: 0.102,
+    reserved3Year: 0.068,
+    spot: 0.051,
+    savingsFor1Year: 40,
+    savingsFor3Year: 60,
+    spotSavings: 70,
+  },
+};
 
-Formula ที่จำเป็น:
-- **Required Replicas** = (Target RPS / Current RPS) × Current Replicas × Safety Margin
-- **Concurrent Users** (Little's Law) = Arrival Rate × Response Time
-- **Error Budget** = 1 - SLO (e.g., 99.9% SLO = 0.1% error budget)
+export class CostOptimizer {
+  analyzePurchaseOptions(
+    instanceType: string,
+    hoursPerMonth: number,
+    baselineInstances: number
+  ): {
+    currentCost: number;
+    optimizedCost: number;
+    savings: number;
+    strategy: string;
+    recommendations: string[];
+  } {
+    const pricing = EC2_PRICING[instanceType];
+    if (!pricing) throw new Error(`Unknown instance type: ${instanceType}`);
+    
+    const currentCost = pricing.onDemand * hoursPerMonth * baselineInstances;
+    
+    // Strategy: Mixed purchase for cost optimization
+    // - Baseline (80%): Reserved 1-year for predictable load
+    // - Burst (20%): Spot instances for scale-out
+    const reservedInstances = Math.ceil(baselineInstances * 0.8);
+    const spotInstances = baselineInstances - reservedInstances;
+    
+    const optimizedCost = 
+      (pricing.reserved1Year * hoursPerMonth * reservedInstances) +
+      (pricing.spot * hoursPerMonth * spotInstances);
+    
+    const savings = currentCost - optimizedCost;
+    const savingsPercent = (savings / currentCost) * 100;
+    
+    return {
+      currentCost: Math.round(currentCost * 100) / 100,
+      optimizedCost: Math.round(optimizedCost * 100) / 100,
+      savings: Math.round(savings * 100) / 100,
+      strategy: `${reservedInstances}x Reserved 1-year + ${spotInstances}x Spot`,
+      recommendations: [
+        `Save $${Math.round(savings)}/month (${Math.round(savingsPercent)}%) by mixing Reserved and Spot instances`,
+        `Use Reserved Instances for ${reservedInstances} baseline nodes`,
+        `Use Spot Instances with Karpenter for burst capacity`,
+        `Enable Savings Plans for additional flexibility`,
+        `Review instance sizing monthly using AWS Cost Anomaly Detection`,
+      ],
+    };
+  }
 
-กุญแจสำคัญ: Plan for 2x current capacity เสมอ และ test กับ load 3x ก่อน production
+  // Kubernetes cost optimization
+  generateKarpenterNodePool(): string {
+    return `
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["2"]
+      nodeClassRef:
+        name: default
+      # Prefer spot instances
+      expireAfter: 720h
+  limits:
+    cpu: "1000"
+    memory: 1000Gi
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: AL2
+  role: "KarpenterNodeRole"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "my-cluster"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "my-cluster"
+  # Cost optimization: use ARM (Graviton) instances
+  instanceStorePolicy: RAID0
+`;
+  }
+}
+```
+
+---
+
+## 7. Multi-Region Capacity Planning
+
+```typescript
+// src/capacity/multi-region.ts
+interface RegionCapacityPlan {
+  region: string;
+  userBase: number;          // Users in this region
+  trafficPercent: number;    // % of total traffic
+  latencyRequirement: number; // ms SLA
+  currentInstances: number;
+  recommendedInstances: number;
+  failoverCapacity: number;   // Extra capacity for regional failover
+  costPerMonth: number;
+}
+
+export class MultiRegionCapacityPlanner {
+  planMultiRegion(
+    totalUsers: number,
+    totalRPS: number,
+    regions: Array<{
+      name: string;
+      userPercent: number;
+      latencySLA: number;
+    }>
+  ): RegionCapacityPlan[] {
+    const plans: RegionCapacityPlan[] = [];
+    
+    for (const region of regions) {
+      const regionUsers = Math.ceil(totalUsers * region.userPercent / 100);
+      const regionRPS = Math.ceil(totalRPS * region.userPercent / 100);
+      
+      // Add 50% extra capacity for regional failover
+      const failoverCapacity = Math.ceil(regionRPS * 0.5);
+      
+      // Calculate instances needed (assume 100 RPS per instance)
+      const instancesForNormal = Math.ceil(regionRPS / 100);
+      const instancesWithFailover = Math.ceil((regionRPS + failoverCapacity) / 100);
+      
+      // Calculate cost (using c5.large at $0.085/hour)
+      const costPerMonth = instancesWithFailover * 0.085 * 24 * 30;
+      
+      plans.push({
+        region: region.name,
+        userBase: regionUsers,
+        trafficPercent: region.userPercent,
+        latencyRequirement: region.latencySLA,
+        currentInstances: instancesForNormal,
+        recommendedInstances: instancesWithFailover,
+        failoverCapacity: instancesWithFailover - instancesForNormal,
+        costPerMonth: Math.round(costPerMonth * 100) / 100,
+      });
+    }
+    
+    return plans;
+  }
+
+  generateTerraformConfig(plans: RegionCapacityPlan[]): string {
+    return plans.map(plan => `
+# Region: ${plan.region}
+module "eks_${plan.region.replace('-', '_')}" {
+  source = "./modules/eks"
+  
+  region             = "${plan.region}"
+  cluster_name       = "microservices-${plan.region}"
+  
+  node_groups = {
+    application = {
+      desired_size = ${plan.recommendedInstances}
+      min_size     = ${Math.max(2, Math.ceil(plan.currentInstances * 0.5))}
+      max_size     = ${plan.recommendedInstances * 3}
+      
+      instance_types = ["c5.large", "c5a.large", "c5n.large"]
+      capacity_type  = "SPOT"
+    }
+    
+    system = {
+      desired_size = 2
+      min_size     = 2
+      max_size     = 4
+      instance_types = ["t3.medium"]
+      capacity_type  = "ON_DEMAND"
+    }
+  }
+}
+`).join('\n');
+  }
+}
+```
+
+---
+
+## สรุปท้ายบท
+
+| หัวข้อ | วิธีการ | เครื่องมือ |
+|--------|---------|-----------|
+| Traffic Forecasting | Linear regression + seasonality | Prometheus, Grafana |
+| Load Testing | Ramp testing + soak testing | k6, Artillery |
+| Resource Baseline | P95/P99 CPU & Memory | VPA, Prometheus |
+| DB Capacity | Growth rate projection | pg_stat_statements |
+| K8s Right-Sizing | VPA recommendations | Kubernetes VPA |
+| Cache Sizing | Hit rate optimization | Redis INFO |
+| Cost Optimization | Reserved + Spot mix | AWS Cost Explorer |
+| Multi-Region | Traffic distribution | Route53, Global Accelerator |
+
+### Capacity Planning Calendar
+
+- **Weekly**: ตรวจสอบ resource utilization trends
+- **Monthly**: Review growth forecasts, update capacity plans
+- **Quarterly**: Review cost optimization, Reserved Instance renewals
+- **Annually**: Major capacity review, infrastructure refresh
+
+### Rules of Thumb
+
+1. **CPU**: อย่าให้เกิน 70% sustained, 80% peak
+2. **Memory**: อย่าให้เกิน 80% (ป้องกัน OOMKilled)
+3. **DB Connections**: อย่าให้เกิน 80% ของ pool size
+4. **Cache Hit Rate**: ควรอยู่ที่ 80%+ ถ้าต่ำกว่าให้ขยาย cache
+5. **Reserved Instances**: 70-80% ของ baseline เป็น Reserved, ที่เหลือ Spot
