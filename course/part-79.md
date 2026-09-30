@@ -2,2316 +2,1758 @@
 
 ## บทนำ
 
-Scalability คือความสามารถของระบบในการรองรับ load ที่เพิ่มขึ้น โดยไม่ให้ performance ลดลง บทนี้จะครอบคลุม patterns สำคัญสำหรับการ scale microservices ตั้งแต่ horizontal scaling ไปจนถึง global load balancing
+Scalability คือความสามารถของระบบในการรองรับ load ที่เพิ่มขึ้น บทนี้ครอบคลุม Horizontal/Vertical Scaling, Database Replicas, CQRS, Event Sourcing, Stateless Design, Session Management, Caching, Kafka Scaling, Auto-scaling และ Load Testing
 
 ---
 
-## 79.1 Horizontal Scaling: Stateless Service Design
-
-### หลักการ Stateless Service
-
-Stateless service หมายความว่า instance ใดๆ ก็สามารถ handle request ใดๆ ได้ โดยไม่ต้องพึ่งพา local state
-
-**ข้อดี:**
-- Scale in/out ได้อิสระ
-- ทน fault ได้ดีกว่า
-- Deploy แบบ rolling update ได้ง่าย
-- Load balancing ทำงานได้อย่างมีประสิทธิภาพ
-
-### Session Externalization ไปยัง Redis
+## 1. Horizontal vs Vertical Scaling
 
 ```typescript
-// session-manager.ts
-import { createClient, RedisClientType } from 'redis';
-import * as crypto from 'crypto';
+// scaling-strategies.ts
+// เปรียบเทียบและ implement scaling strategies
 
-interface Session {
-  id: string;
-  userId: string;
-  email: string;
-  roles: string[];
-  data: Record<string, unknown>;
-  createdAt: Date;
-  lastAccessedAt: Date;
-  expiresAt: Date;
+interface ScalingStrategy {
+  type: 'horizontal' | 'vertical';
+  trigger: 'manual' | 'auto';
+  metric: string;
+  threshold: number;
+  cooldown: number; // seconds
 }
 
-interface SessionStore {
-  get(sessionId: string): Promise<Session | null>;
-  set(session: Session): Promise<void>;
-  delete(sessionId: string): Promise<void>;
-  refresh(sessionId: string, ttlSeconds: number): Promise<boolean>;
-  getUserSessions(userId: string): Promise<string[]>;
-  deleteUserSessions(userId: string): Promise<number>;
-}
-
-class RedisSessionStore implements SessionStore {
-  private client: RedisClientType;
-  private keyPrefix: string;
-  private userIndexPrefix: string;
-  private defaultTtlSeconds: number;
-
-  constructor(
-    redisUrl: string,
-    options: {
-      keyPrefix?: string;
-      defaultTtlSeconds?: number;
-    } = {}
-  ) {
-    this.client = createClient({ url: redisUrl }) as RedisClientType;
-    this.keyPrefix = options.keyPrefix ?? 'session:';
-    this.userIndexPrefix = 'user_sessions:';
-    this.defaultTtlSeconds = options.defaultTtlSeconds ?? 3600; // 1 hour
-  }
-
-  async connect(): Promise<void> {
-    await this.client.connect();
-  }
-
-  async disconnect(): Promise<void> {
-    await this.client.disconnect();
-  }
-
-  private sessionKey(sessionId: string): string {
-    return `${this.keyPrefix}${sessionId}`;
-  }
-
-  private userIndexKey(userId: string): string {
-    return `${this.userIndexPrefix}${userId}`;
-  }
-
-  async get(sessionId: string): Promise<Session | null> {
-    const data = await this.client.get(this.sessionKey(sessionId));
-    if (!data) return null;
-
-    const session = JSON.parse(data) as Session;
-    session.createdAt = new Date(session.createdAt);
-    session.lastAccessedAt = new Date(session.lastAccessedAt);
-    session.expiresAt = new Date(session.expiresAt);
-
-    // Update lastAccessedAt
-    session.lastAccessedAt = new Date();
-    await this.set(session);
-
-    return session;
-  }
-
-  async set(session: Session, ttlSeconds?: number): Promise<void> {
-    const ttl = ttlSeconds ?? this.defaultTtlSeconds;
-    const key = this.sessionKey(session.id);
-    const data = JSON.stringify(session);
-
-    // Use pipeline สำหรับ atomic operation
-    const pipeline = this.client.multi();
-    pipeline.set(key, data, { EX: ttl });
-    pipeline.sAdd(this.userIndexKey(session.userId), session.id);
-    pipeline.expire(this.userIndexKey(session.userId), ttl + 60); // User index expires slightly later
-    await pipeline.exec();
-  }
-
-  async delete(sessionId: string): Promise<void> {
-    const session = await this.get(sessionId);
-    if (!session) return;
-
-    const pipeline = this.client.multi();
-    pipeline.del(this.sessionKey(sessionId));
-    pipeline.sRem(this.userIndexKey(session.userId), sessionId);
-    await pipeline.exec();
-  }
-
-  async refresh(sessionId: string, ttlSeconds: number): Promise<boolean> {
-    const exists = await this.client.expire(
-      this.sessionKey(sessionId),
-      ttlSeconds
-    );
-    return exists === 1;
-  }
-
-  async getUserSessions(userId: string): Promise<string[]> {
-    return this.client.sMembers(this.userIndexKey(userId));
-  }
-
-  async deleteUserSessions(userId: string): Promise<number> {
-    const sessionIds = await this.getUserSessions(userId);
-    
-    if (sessionIds.length === 0) return 0;
-
-    const pipeline = this.client.multi();
-    sessionIds.forEach(id => pipeline.del(this.sessionKey(id)));
-    pipeline.del(this.userIndexKey(userId));
-    
-    const results = await pipeline.exec();
-    return sessionIds.length;
-  }
-}
-
-class StatelessSessionManager {
-  private store: RedisSessionStore;
-
-  constructor(redisUrl: string) {
-    this.store = new RedisSessionStore(redisUrl, {
-      keyPrefix: 'app:session:',
-      defaultTtlSeconds: 3600,
-    });
-  }
-
-  async initialize(): Promise<void> {
-    await this.store.connect();
-  }
-
-  async createSession(
-    userId: string,
-    email: string,
-    roles: string[],
-    additionalData?: Record<string, unknown>
-  ): Promise<Session> {
-    const now = new Date();
-    const session: Session = {
-      id: crypto.randomBytes(32).toString('hex'),
-      userId,
-      email,
-      roles,
-      data: additionalData ?? {},
-      createdAt: now,
-      lastAccessedAt: now,
-      expiresAt: new Date(now.getTime() + 3600 * 1000),
-    };
-
-    await this.store.set(session);
-    return session;
-  }
-
-  async getSession(sessionId: string): Promise<Session | null> {
-    return this.store.get(sessionId);
-  }
-
-  async invalidateSession(sessionId: string): Promise<void> {
-    await this.store.delete(sessionId);
-  }
-
-  async invalidateUserSessions(userId: string): Promise<number> {
-    return this.store.deleteUserSessions(userId);
-  }
-}
-
-// Express middleware
-import { Request, Response, NextFunction } from 'express';
-
-function sessionMiddleware(manager: StatelessSessionManager) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const sessionId = req.cookies?.['session_id'] ?? 
-      req.headers['x-session-id'] as string;
-
-    if (!sessionId) {
-      return next();
-    }
-
-    const session = await manager.getSession(sessionId);
-    if (!session) {
-      res.clearCookie('session_id');
-      return next();
-    }
-
-    // Inject session into request
-    (req as any).session = session;
-    (req as any).user = {
-      id: session.userId,
-      email: session.email,
-      roles: session.roles,
-    };
-
-    next();
-  };
-}
-
-export { StatelessSessionManager, RedisSessionStore, sessionMiddleware };
-```
-
-### Kubernetes HorizontalPodAutoscaler สำหรับ Stateless Service
-
-```yaml
-# stateless-service-hpa.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api-service
-  namespace: production
-spec:
-  replicas: 3                   # Initial replicas
-  selector:
-    matchLabels:
-      app: api-service
-  template:
-    metadata:
-      labels:
-        app: api-service
-    spec:
-      # ไม่มี local state - ทุก pod เหมือนกัน
-      containers:
-        - name: api-service
-          image: myregistry/api-service:latest
-          ports:
-            - containerPort: 8080
-          env:
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: redis-credentials
-                  key: url
-            - name: DB_URL
-              valueFrom:
-                secretKeyRef:
-                  name: db-credentials
-                  key: url
-            # ไม่มี NODE_ID หรือ POD_IP ที่ใช้เก็บ state
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "256Mi"
-            limits:
-              cpu: "1000m"
-              memory: "512Mi"
-          readinessProbe:
-            httpGet:
-              path: /health/ready
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            successThreshold: 1
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /health/live
-              port: 8080
-            initialDelaySeconds: 30
-            periodSeconds: 10
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 5"]  # Graceful shutdown
-      terminationGracePeriodSeconds: 30
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    app: api-service
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: api-service-hpa
-  namespace: production
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api-service
-  minReplicas: 3
-  maxReplicas: 50
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 30
-      policies:
-        - type: Pods
-          value: 5
-          periodSeconds: 60
-        - type: Percent
-          value: 100
-          periodSeconds: 60
-      selectPolicy: Max
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-        - type: Pods
-          value: 2
-          periodSeconds: 60
-      selectPolicy: Min
-```
-
----
-
-## 79.2 Database Read Replicas: TypeScript ReadReplicaPool
-
-### Architecture แบบ Primary-Replica
-
-```typescript
-// read-replica-pool.ts
-import { Pool, PoolConfig, QueryResult } from 'pg';
-
-interface DatabaseConfig {
-  connectionString: string;
-  maxConnections: number;
-  idleTimeoutMillis: number;
-  connectionTimeoutMillis: number;
-}
-
-interface ReadReplicaPoolConfig {
-  primary: DatabaseConfig;
-  replicas: DatabaseConfig[];
-  replicaLoadBalancing: 'round-robin' | 'random' | 'least-connections';
-  replicaHealthCheckIntervalMs: number;
-  retryOnReplicaFailure: boolean;
-}
-
-interface PoolHealth {
-  connectionString: string;
-  healthy: boolean;
-  activeConnections: number;
-  idleConnections: number;
-  waitingRequests: number;
-  lastChecked: Date;
-  errorCount: number;
-}
-
-class ReadReplicaPool {
-  private primaryPool: Pool;
-  private replicaPools: Pool[];
-  private config: ReadReplicaPoolConfig;
-  private currentReplicaIndex = 0;
-  private replicaHealthMap: Map<Pool, PoolHealth>;
-  private healthCheckInterval: NodeJS.Timeout | null = null;
-
-  constructor(config: ReadReplicaPoolConfig) {
-    this.config = config;
-    this.replicaHealthMap = new Map();
-
-    // สร้าง Primary Pool
-    this.primaryPool = new Pool({
-      connectionString: config.primary.connectionString,
-      max: config.primary.maxConnections,
-      idleTimeoutMillis: config.primary.idleTimeoutMillis,
-      connectionTimeoutMillis: config.primary.connectionTimeoutMillis,
-    });
-
-    // สร้าง Replica Pools
-    this.replicaPools = config.replicas.map(replicaConfig => {
-      const pool = new Pool({
-        connectionString: replicaConfig.connectionString,
-        max: replicaConfig.maxConnections,
-        idleTimeoutMillis: replicaConfig.idleTimeoutMillis,
-        connectionTimeoutMillis: replicaConfig.connectionTimeoutMillis,
-      });
-
-      // Initialize health map
-      this.replicaHealthMap.set(pool, {
-        connectionString: replicaConfig.connectionString,
-        healthy: true,
-        activeConnections: 0,
-        idleConnections: 0,
-        waitingRequests: 0,
-        lastChecked: new Date(),
-        errorCount: 0,
-      });
-
-      return pool;
-    });
-
-    // Setup error handlers
-    this.setupErrorHandlers();
-    
-    // Start health checks
-    this.startHealthChecks();
-  }
-
-  private setupErrorHandlers(): void {
-    this.primaryPool.on('error', (err) => {
-      console.error('[ReadReplicaPool] Primary pool error:', err.message);
-    });
-
-    this.replicaPools.forEach((pool, index) => {
-      pool.on('error', (err) => {
-        console.error(`[ReadReplicaPool] Replica ${index} error:`, err.message);
-        const health = this.replicaHealthMap.get(pool);
-        if (health) {
-          health.errorCount++;
-          if (health.errorCount > 5) {
-            health.healthy = false;
-          }
-        }
-      });
-    });
-  }
-
-  private startHealthChecks(): void {
-    if (this.config.replicaHealthCheckIntervalMs <= 0) return;
-
-    this.healthCheckInterval = setInterval(
-      () => this.checkReplicaHealth(),
-      this.config.replicaHealthCheckIntervalMs
-    );
-  }
-
-  private async checkReplicaHealth(): Promise<void> {
-    const checks = this.replicaPools.map(async (pool) => {
-      const health = this.replicaHealthMap.get(pool)!;
-      
-      try {
-        const client = await pool.connect();
-        await client.query('SELECT 1');
-        client.release();
-
-        health.healthy = true;
-        health.errorCount = 0;
-        health.activeConnections = pool.totalCount - pool.idleCount;
-        health.idleConnections = pool.idleCount;
-        health.waitingRequests = pool.waitingCount;
-        health.lastChecked = new Date();
-      } catch (err: any) {
-        health.healthy = false;
-        health.errorCount++;
-        health.lastChecked = new Date();
-      }
-    });
-
-    await Promise.allSettled(checks);
-  }
-
-  private getHealthyReplicas(): Pool[] {
-    return this.replicaPools.filter(pool => {
-      const health = this.replicaHealthMap.get(pool);
-      return health?.healthy ?? false;
-    });
-  }
-
-  private selectReplica(): Pool | null {
-    const healthyReplicas = this.getHealthyReplicas();
-    
-    if (healthyReplicas.length === 0) return null;
-
-    switch (this.config.replicaLoadBalancing) {
-      case 'round-robin':
-        this.currentReplicaIndex = 
-          (this.currentReplicaIndex + 1) % healthyReplicas.length;
-        return healthyReplicas[this.currentReplicaIndex];
-
-      case 'random':
-        return healthyReplicas[
-          Math.floor(Math.random() * healthyReplicas.length)
-        ];
-
-      case 'least-connections':
-        return healthyReplicas.reduce((min, pool) => {
-          const minHealth = this.replicaHealthMap.get(min)!;
-          const poolHealth = this.replicaHealthMap.get(pool)!;
-          return poolHealth.activeConnections < minHealth.activeConnections
-            ? pool
-            : min;
-        });
-
-      default:
-        return healthyReplicas[0];
-    }
-  }
-
-  // WRITE operations → Primary
-  async write<T = any>(
-    query: string,
-    params?: any[]
-  ): Promise<QueryResult<T>> {
-    return this.primaryPool.query<T>(query, params);
-  }
-
-  // READ operations → Replica (fallback to primary)
-  async read<T = any>(
-    query: string,
-    params?: any[]
-  ): Promise<QueryResult<T>> {
-    const replica = this.selectReplica();
-
-    if (!replica) {
-      console.warn('[ReadReplicaPool] No healthy replicas, falling back to primary');
-      return this.primaryPool.query<T>(query, params);
-    }
-
-    try {
-      return await replica.query<T>(query, params);
-    } catch (err) {
-      if (this.config.retryOnReplicaFailure) {
-        console.warn('[ReadReplicaPool] Replica query failed, retrying on primary');
-        const health = this.replicaHealthMap.get(replica);
-        if (health) {
-          health.healthy = false;
-          health.errorCount++;
-        }
-        return this.primaryPool.query<T>(query, params);
-      }
-      throw err;
-    }
-  }
-
-  // Transaction → Primary
-  async transaction<T>(
-    callback: (client: any) => Promise<T>
-  ): Promise<T> {
-    const client = await this.primaryPool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      const result = await callback(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-  }
-
-  getPoolStats(): Record<string, any> {
-    return {
-      primary: {
-        total: this.primaryPool.totalCount,
-        idle: this.primaryPool.idleCount,
-        waiting: this.primaryPool.waitingCount,
-      },
-      replicas: this.replicaPools.map((pool, i) => ({
-        index: i,
-        health: this.replicaHealthMap.get(pool),
-        total: pool.totalCount,
-        idle: pool.idleCount,
-        waiting: pool.waitingCount,
-      })),
-    };
-  }
-
-  async destroy(): Promise<void> {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-    }
-    
-    await Promise.all([
-      this.primaryPool.end(),
-      ...this.replicaPools.map(p => p.end()),
-    ]);
-  }
-}
-
-// ตัวอย่างการใช้งาน
-async function setupDatabase(): Promise<ReadReplicaPool> {
-  const pool = new ReadReplicaPool({
-    primary: {
-      connectionString: process.env.DB_PRIMARY_URL!,
-      maxConnections: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
-    },
-    replicas: [
-      {
-        connectionString: process.env.DB_REPLICA_1_URL!,
-        maxConnections: 30,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000,
-      },
-      {
-        connectionString: process.env.DB_REPLICA_2_URL!,
-        maxConnections: 30,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000,
-      },
+// Horizontal Scaling Configuration
+const horizontalScalingConfig = {
+  minReplicas: 2,
+  maxReplicas: 100,
+  targetCPUUtilizationPercentage: 60,
+  targetMemoryUtilizationPercentage: 70,
+  scaleUpCooldown: 60,   // seconds
+  scaleDownCooldown: 300, // seconds
+  scaleUpSteps: [
+    { pods: 1, periodSeconds: 60 },    // Add 1 pod in 60s
+    { pods: 5, periodSeconds: 60 },    // Add up to 5 pods in 60s
+  ],
+  scaleDownSteps: [
+    { pods: 1, periodSeconds: 120 },   // Remove 1 pod in 120s (careful)
+  ],
+};
+
+// Kubernetes HPA with KEDA
+const scalingDecision = {
+  cpuBased: {
+    advantages: [
+      'Simple to configure',
+      'Built-in Kubernetes metric',
+      'Works for CPU-intensive workloads',
     ],
-    replicaLoadBalancing: 'round-robin',
-    replicaHealthCheckIntervalMs: 30000,
-    retryOnReplicaFailure: true,
-  });
-
-  return pool;
-}
-
-// Usage in service layer
-async function getUser(db: ReadReplicaPool, userId: string) {
-  // READ → uses replica
-  const result = await db.read(
-    'SELECT id, email, name, created_at FROM users WHERE id = $1',
-    [userId]
-  );
-  return result.rows[0] ?? null;
-}
-
-async function createUser(
-  db: ReadReplicaPool,
-  email: string,
-  name: string
-) {
-  // WRITE → uses primary
-  const result = await db.write(
-    'INSERT INTO users (email, name, created_at) VALUES ($1, $2, NOW()) RETURNING *',
-    [email, name]
-  );
-  return result.rows[0];
-}
-
-export { ReadReplicaPool, setupDatabase };
-```
-
----
-
-## 79.3 CQRS for Scalability
-
-### Command DB (Write) vs Query DB (Read Replica) Routing
-
-```typescript
-// cqrs-router.ts
-import { Pool } from 'pg';
-import { EventEmitter } from 'events';
-
-// =================== Commands ===================
-interface Command {
-  type: string;
-  payload: Record<string, unknown>;
-  metadata: {
-    userId: string;
-    correlationId: string;
-    timestamp: Date;
-  };
-}
-
-interface CommandResult<T = any> {
-  success: boolean;
-  data?: T;
-  error?: string;
-  aggregateId?: string;
-}
-
-// =================== Queries ===================
-interface Query {
-  type: string;
-  params: Record<string, unknown>;
-}
-
-interface QueryResult<T = any> {
-  data: T;
-  total?: number;
-  page?: number;
-  pageSize?: number;
-}
-
-// =================== Event ===================
-interface DomainEvent {
-  id: string;
-  type: string;
-  aggregateId: string;
-  aggregateType: string;
-  payload: Record<string, unknown>;
-  metadata: {
-    userId?: string;
-    correlationId?: string;
-    timestamp: Date;
-    version: number;
-  };
-}
-
-type CommandHandler<C extends Command = Command, R = any> = (
-  command: C,
-  writeDb: Pool
-) => Promise<CommandResult<R>>;
-
-type QueryHandler<Q extends Query = Query, R = any> = (
-  query: Q,
-  readDb: Pool
-) => Promise<QueryResult<R>>;
-
-class CQRSRouter extends EventEmitter {
-  private writePool: Pool;    // Primary DB - for writes
-  private readPool: Pool;     // Read Replica - for reads
-  private commandHandlers: Map<string, CommandHandler>;
-  private queryHandlers: Map<string, QueryHandler>;
-  private eventOutbox: DomainEvent[] = [];
-
-  constructor(writeDsn: string, readDsn: string) {
-    super();
-    
-    this.writePool = new Pool({
-      connectionString: writeDsn,
-      max: 10,  // Write connections - ต้องการน้อยกว่า
-    });
-
-    this.readPool = new Pool({
-      connectionString: readDsn,
-      max: 50,  // Read connections - ต้องการมากกว่า
-    });
-
-    this.commandHandlers = new Map();
-    this.queryHandlers = new Map();
-
-    this.setupOutboxProcessor();
-  }
-
-  registerCommandHandler<C extends Command, R = any>(
-    commandType: string,
-    handler: CommandHandler<C, R>
-  ): void {
-    this.commandHandlers.set(commandType, handler as CommandHandler);
-  }
-
-  registerQueryHandler<Q extends Query, R = any>(
-    queryType: string,
-    handler: QueryHandler<Q, R>
-  ): void {
-    this.queryHandlers.set(queryType, handler as QueryHandler);
-  }
-
-  async executeCommand<R = any>(command: Command): Promise<CommandResult<R>> {
-    const handler = this.commandHandlers.get(command.type);
-    
-    if (!handler) {
-      throw new Error(`No handler registered for command: ${command.type}`);
-    }
-
-    const client = await this.writePool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      const result = await handler(command, this.writePool) as CommandResult<R>;
-      
-      // Commit transaction
-      await client.query('COMMIT');
-      
-      // Emit event for read-side update (eventual consistency)
-      this.emit('command.executed', {
-        command,
-        result,
-        timestamp: new Date(),
-      });
-
-      return result;
-    } catch (err: any) {
-      await client.query('ROLLBACK');
-      return {
-        success: false,
-        error: err.message,
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  async executeQuery<R = any>(query: Query): Promise<QueryResult<R>> {
-    const handler = this.queryHandlers.get(query.type);
-    
-    if (!handler) {
-      throw new Error(`No handler registered for query: ${query.type}`);
-    }
-
-    // Queries go to read replica
-    return handler(query, this.readPool) as Promise<QueryResult<R>>;
-  }
-
-  private setupOutboxProcessor(): void {
-    // Process outbox events every 100ms
-    setInterval(async () => {
-      if (this.eventOutbox.length === 0) return;
-      
-      const events = this.eventOutbox.splice(0, 100);
-      this.emit('events.batch', events);
-    }, 100);
-  }
-
-  async destroy(): Promise<void> {
-    await Promise.all([
-      this.writePool.end(),
-      this.readPool.end(),
-    ]);
-  }
-}
-
-// =================== ตัวอย่าง Order Service ===================
-
-interface CreateOrderCommand extends Command {
-  type: 'CreateOrder';
-  payload: {
-    customerId: string;
-    items: Array<{
-      productId: string;
-      quantity: number;
-      price: number;
-    }>;
-    shippingAddress: string;
-  };
-}
-
-interface GetOrdersQuery extends Query {
-  type: 'GetOrders';
-  params: {
-    customerId: string;
-    page: number;
-    pageSize: number;
-    status?: string;
-  };
-}
-
-// Command Handler - goes to Write DB
-const createOrderHandler: CommandHandler<CreateOrderCommand> = async (
-  command,
-  writeDb
-) => {
-  const { customerId, items, shippingAddress } = command.payload;
-  
-  const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-  
-  const result = await writeDb.query(
-    `INSERT INTO orders (customer_id, items, total, shipping_address, status, created_at)
-     VALUES ($1, $2, $3, $4, 'pending', NOW())
-     RETURNING id`,
-    [customerId, JSON.stringify(items), total, shippingAddress]
-  );
-
-  const orderId = result.rows[0].id;
-
-  // Insert order items
-  for (const item of items) {
-    await writeDb.query(
-      `INSERT INTO order_items (order_id, product_id, quantity, price)
-       VALUES ($1, $2, $3, $4)`,
-      [orderId, item.productId, item.quantity, item.price]
-    );
-  }
-
-  return {
-    success: true,
-    aggregateId: orderId,
-    data: { orderId, total },
-  };
+    disadvantages: [
+      'Lagging indicator',
+      'Not suitable for I/O-bound workloads',
+    ],
+  },
+  customMetricBased: {
+    advantages: [
+      'Business-relevant metrics',
+      'Request queue depth',
+      'More predictive scaling',
+    ],
+    examples: [
+      'kafka_consumer_lag',
+      'http_requests_per_second',
+      'active_connections',
+      'queue_depth',
+    ],
+  },
 };
-
-// Query Handler - goes to Read Replica
-const getOrdersQueryHandler: QueryHandler<GetOrdersQuery> = async (
-  query,
-  readDb
-) => {
-  const { customerId, page, pageSize, status } = query.params;
-  const offset = (page - 1) * pageSize;
-
-  const whereClause = status
-    ? 'WHERE o.customer_id = $1 AND o.status = $4'
-    : 'WHERE o.customer_id = $1';
-
-  const params = status
-    ? [customerId, pageSize, offset, status]
-    : [customerId, pageSize, offset];
-
-  const [ordersResult, countResult] = await Promise.all([
-    readDb.query(
-      `SELECT o.id, o.total, o.status, o.created_at,
-              json_agg(oi.*) as items
-       FROM orders o
-       LEFT JOIN order_items oi ON oi.order_id = o.id
-       ${whereClause}
-       GROUP BY o.id
-       ORDER BY o.created_at DESC
-       LIMIT $2 OFFSET $3`,
-      params
-    ),
-    readDb.query(
-      `SELECT COUNT(*) as total FROM orders o ${whereClause}`,
-      status ? [customerId, status] : [customerId]
-    ),
-  ]);
-
-  return {
-    data: ordersResult.rows,
-    total: parseInt(countResult.rows[0].total),
-    page,
-    pageSize,
-  };
-};
-
-// Setup CQRS Router
-function setupOrderCQRS(): CQRSRouter {
-  const router = new CQRSRouter(
-    process.env.WRITE_DB_URL!,
-    process.env.READ_DB_URL!
-  );
-
-  router.registerCommandHandler('CreateOrder', createOrderHandler);
-  router.registerQueryHandler('GetOrders', getOrdersQueryHandler);
-
-  return router;
-}
-
-export { CQRSRouter, setupOrderCQRS };
 ```
-
----
-
-## 79.4 Stateless JWT vs Stateful Sessions
-
-### TypeScript JWT Middleware
-
-```typescript
-// jwt-middleware.ts
-import * as jwt from 'jsonwebtoken';
-import { Request, Response, NextFunction } from 'express';
-import { createClient } from 'redis';
-
-interface JWTPayload {
-  sub: string;          // User ID
-  email: string;
-  roles: string[];
-  iss: string;          // Issuer
-  aud: string[];        // Audience
-  iat: number;          // Issued at
-  exp: number;          // Expiry
-  jti: string;          // JWT ID (for revocation)
-}
-
-interface TokenPair {
-  accessToken: string;
-  refreshToken: string;
-  expiresIn: number;
-}
-
-interface JWTConfig {
-  accessTokenSecret: string;
-  refreshTokenSecret: string;
-  accessTokenTtlSeconds: number;
-  refreshTokenTtlSeconds: number;
-  issuer: string;
-  audience: string[];
-  redisUrl: string;     // สำหรับ token revocation list
-}
-
-class JWTService {
-  private config: JWTConfig;
-  private redisClient: ReturnType<typeof createClient>;
-  private revokedTokenPrefix = 'revoked_token:';
-
-  constructor(config: JWTConfig) {
-    this.config = config;
-    this.redisClient = createClient({ url: config.redisUrl });
-    this.redisClient.connect().catch(console.error);
-  }
-
-  async generateTokenPair(
-    userId: string,
-    email: string,
-    roles: string[]
-  ): Promise<TokenPair> {
-    const jti = `${userId}-${Date.now()}-${Math.random().toString(36).substr(2)}`;
-    
-    const accessTokenPayload: Omit<JWTPayload, 'iat' | 'exp'> = {
-      sub: userId,
-      email,
-      roles,
-      iss: this.config.issuer,
-      aud: this.config.audience,
-      jti,
-    };
-
-    const accessToken = jwt.sign(
-      accessTokenPayload,
-      this.config.accessTokenSecret,
-      { expiresIn: this.config.accessTokenTtlSeconds }
-    );
-
-    const refreshToken = jwt.sign(
-      {
-        sub: userId,
-        type: 'refresh',
-        jti: `refresh-${jti}`,
-        iss: this.config.issuer,
-      },
-      this.config.refreshTokenSecret,
-      { expiresIn: this.config.refreshTokenTtlSeconds }
-    );
-
-    return {
-      accessToken,
-      refreshToken,
-      expiresIn: this.config.accessTokenTtlSeconds,
-    };
-  }
-
-  verifyAccessToken(token: string): JWTPayload {
-    const decoded = jwt.verify(token, this.config.accessTokenSecret, {
-      issuer: this.config.issuer,
-      audience: this.config.audience,
-    }) as JWTPayload;
-
-    return decoded;
-  }
-
-  verifyRefreshToken(token: string): any {
-    return jwt.verify(token, this.config.refreshTokenSecret, {
-      issuer: this.config.issuer,
-    });
-  }
-
-  async revokeToken(jti: string, expiresIn: number): Promise<void> {
-    await this.redisClient.set(
-      `${this.revokedTokenPrefix}${jti}`,
-      '1',
-      { EX: expiresIn }
-    );
-  }
-
-  async isTokenRevoked(jti: string): Promise<boolean> {
-    const result = await this.redisClient.exists(
-      `${this.revokedTokenPrefix}${jti}`
-    );
-    return result === 1;
-  }
-
-  async revokeAllUserTokens(userId: string): Promise<void> {
-    // Store a timestamp - any token issued before this time is revoked
-    await this.redisClient.set(
-      `user_revoked_before:${userId}`,
-      Date.now().toString(),
-      { EX: this.config.refreshTokenTtlSeconds }
-    );
-  }
-
-  async refreshTokenPair(refreshToken: string): Promise<TokenPair | null> {
-    try {
-      const decoded = this.verifyRefreshToken(refreshToken) as any;
-      
-      if (await this.isTokenRevoked(decoded.jti)) {
-        return null;
-      }
-
-      // Revoke old refresh token (rotation)
-      const remainingTtl = decoded.exp - Math.floor(Date.now() / 1000);
-      await this.revokeToken(decoded.jti, Math.max(remainingTtl, 60));
-
-      // Issue new token pair
-      // ดึง user info จาก database
-      // (simplified - ในกรณีจริงต้อง query จาก DB)
-      const userId = decoded.sub;
-      
-      return this.generateTokenPair(userId, '', []);
-    } catch {
-      return null;
-    }
-  }
-}
-
-// Express Middleware Factory
-function createJWTMiddleware(jwtService: JWTService) {
-  return {
-    authenticate: async (req: Request, res: Response, next: NextFunction) => {
-      const authHeader = req.headers.authorization;
-      
-      if (!authHeader?.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Missing or invalid authorization header' });
-      }
-
-      const token = authHeader.substring(7);
-
-      try {
-        const payload = jwtService.verifyAccessToken(token);
-
-        // Check token revocation
-        if (await jwtService.isTokenRevoked(payload.jti)) {
-          return res.status(401).json({ error: 'Token has been revoked' });
-        }
-
-        (req as any).user = payload;
-        next();
-      } catch (err: any) {
-        if (err.name === 'TokenExpiredError') {
-          return res.status(401).json({ error: 'Token expired', code: 'TOKEN_EXPIRED' });
-        }
-        return res.status(401).json({ error: 'Invalid token' });
-      }
-    },
-
-    requireRole: (...roles: string[]) => {
-      return (req: Request, res: Response, next: NextFunction) => {
-        const user = (req as any).user as JWTPayload;
-        
-        if (!user) {
-          return res.status(401).json({ error: 'Not authenticated' });
-        }
-
-        const hasRole = roles.some(role => user.roles.includes(role));
-        
-        if (!hasRole) {
-          return res.status(403).json({ 
-            error: 'Insufficient permissions',
-            required: roles,
-            actual: user.roles,
-          });
-        }
-
-        next();
-      };
-    },
-  };
-}
-
-export { JWTService, createJWTMiddleware, type TokenPair, type JWTPayload };
-```
-
----
-
-## 79.5 Message Queue Scaling: Kafka Partition Calculation
-
-### การคำนวณจำนวน Partition ที่เหมาะสม
-
-```typescript
-// kafka-partition-calculator.ts
-
-interface KafkaScalingConfig {
-  targetRps: number;             // target requests per second
-  averageMessageSizeBytes: number;
-  processingTimeMs: number;      // เวลาที่ consumer ใช้ต่อ message
-  consumerGroupCount: number;    // จำนวน consumer groups
-  replicationFactor: number;     // Kafka replication factor
-  brokerCount: number;
-  retentionHours: number;
-  diskPerBrokerGB: number;
-}
-
-interface KafkaScalingRecommendation {
-  partitionCount: number;
-  consumerCount: number;
-  brokerCount: number;
-  estimatedDiskUsageGB: number;
-  estimatedThroughputMBs: number;
-  reasoning: string[];
-}
-
-class KafkaPartitionCalculator {
-  calculate(config: KafkaScalingConfig): KafkaScalingRecommendation {
-    const reasoning: string[] = [];
-
-    // 1. คำนวณ throughput ที่ต้องการ
-    const throughputBytesPerSec = config.targetRps * config.averageMessageSizeBytes;
-    const throughputMBs = throughputBytesPerSec / (1024 * 1024);
-    reasoning.push(
-      `Target throughput: ${config.targetRps} msg/s × ${config.averageMessageSizeBytes} bytes = ` +
-      `${throughputMBs.toFixed(2)} MB/s`
-    );
-
-    // 2. คำนวณ consumer throughput ต่อ partition
-    // consumer สามารถ process ได้ 1000ms / processingTimeMs messages ต่อวินาที
-    const consumerThroughputPerSec = Math.floor(1000 / config.processingTimeMs);
-    const throughputPerConsumer = consumerThroughputPerSec * config.averageMessageSizeBytes;
-    reasoning.push(
-      `Consumer throughput: ${consumerThroughputPerSec} msg/s per consumer ` +
-      `(${config.processingTimeMs}ms per message)`
-    );
-
-    // 3. คำนวณจำนวน consumer ที่ต้องการ
-    const requiredConsumers = Math.ceil(config.targetRps / consumerThroughputPerSec);
-    reasoning.push(`Required consumers: ${requiredConsumers}`);
-
-    // 4. Partition count = max(consumers, brokers × 2)
-    // Kafka best practice: partitions >= consumer count, และ divisible by broker count
-    let partitionCount = Math.max(
-      requiredConsumers * config.consumerGroupCount,
-      config.brokerCount * 2
-    );
-
-    // Round up to nearest multiple of broker count
-    partitionCount = Math.ceil(partitionCount / config.brokerCount) * config.brokerCount;
-    
-    // Minimum 6 partitions, maximum 200 per topic (Kafka recommendation)
-    partitionCount = Math.max(6, Math.min(200, partitionCount));
-    
-    reasoning.push(
-      `Partition count: max(${requiredConsumers * config.consumerGroupCount}, ${config.brokerCount * 2}) ` +
-      `rounded to multiple of ${config.brokerCount} = ${partitionCount}`
-    );
-
-    // 5. คำนวณ disk usage
-    const bytesPerSecond = throughputBytesPerSec;
-    const retentionSeconds = config.retentionHours * 3600;
-    const totalDataGB = (bytesPerSecond * retentionSeconds * config.replicationFactor) / (1024 ** 3);
-    const diskPerBrokerGB = totalDataGB / config.brokerCount;
-    
-    reasoning.push(
-      `Estimated disk: ${totalDataGB.toFixed(1)} GB total, ` +
-      `${diskPerBrokerGB.toFixed(1)} GB per broker ` +
-      `(${config.diskPerBrokerGB} GB available)`
-    );
-
-    if (diskPerBrokerGB > config.diskPerBrokerGB * 0.8) {
-      reasoning.push(
-        `WARNING: Disk usage (${diskPerBrokerGB.toFixed(1)} GB) ` +
-        `exceeds 80% of available (${config.diskPerBrokerGB} GB). Consider reducing retention or adding brokers.`
-      );
-    }
-
-    return {
-      partitionCount,
-      consumerCount: requiredConsumers,
-      brokerCount: Math.max(config.brokerCount, config.replicationFactor),
-      estimatedDiskUsageGB: diskPerBrokerGB,
-      estimatedThroughputMBs: throughputMBs,
-      reasoning,
-    };
-  }
-
-  printReport(config: KafkaScalingConfig): void {
-    const rec = this.calculate(config);
-    
-    console.log('\n=== Kafka Partition Scaling Calculator ===\n');
-    console.log('Input:');
-    console.log(`  Target RPS: ${config.targetRps.toLocaleString()}`);
-    console.log(`  Message Size: ${config.averageMessageSizeBytes} bytes`);
-    console.log(`  Processing Time: ${config.processingTimeMs}ms`);
-    console.log(`  Consumer Groups: ${config.consumerGroupCount}`);
-    console.log(`  Brokers: ${config.brokerCount}`);
-    console.log(`  Replication Factor: ${config.replicationFactor}`);
-    console.log('');
-    console.log('Recommendation:');
-    console.log(`  Partition Count: ${rec.partitionCount}`);
-    console.log(`  Consumer Count per Group: ${rec.consumerCount}`);
-    console.log(`  Min Brokers: ${rec.brokerCount}`);
-    console.log(`  Throughput: ${rec.estimatedThroughputMBs.toFixed(2)} MB/s`);
-    console.log(`  Disk per Broker: ${rec.estimatedDiskUsageGB.toFixed(1)} GB`);
-    console.log('');
-    console.log('Reasoning:');
-    rec.reasoning.forEach(r => console.log(`  - ${r}`));
-  }
-}
-
-// Consumer Group Rebalancing Monitor
-interface ConsumerGroupMember {
-  memberId: string;
-  clientId: string;
-  partitions: number[];
-}
-
-interface ConsumerGroupStatus {
-  groupId: string;
-  state: 'Stable' | 'PreparingRebalance' | 'CompletingRebalance' | 'Empty' | 'Dead';
-  members: ConsumerGroupMember[];
-  lag: number;
-  isRebalancing: boolean;
-}
-
-// Example usage
-const calculator = new KafkaPartitionCalculator();
-calculator.printReport({
-  targetRps: 100000,
-  averageMessageSizeBytes: 1024,
-  processingTimeMs: 10,
-  consumerGroupCount: 3,
-  replicationFactor: 3,
-  brokerCount: 9,
-  retentionHours: 24,
-  diskPerBrokerGB: 500,
-});
-```
-
-### Kafka Consumer Group YAML
 
 ```yaml
-# kafka-consumer-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: order-event-consumer
-  namespace: production
-spec:
-  replicas: 12   # Equal to partition count (or factor of it)
-  selector:
-    matchLabels:
-      app: order-event-consumer
-  template:
-    metadata:
-      labels:
-        app: order-event-consumer
-    spec:
-      containers:
-        - name: consumer
-          image: myregistry/order-consumer:latest
-          env:
-            - name: KAFKA_BROKERS
-              value: "kafka-0:9092,kafka-1:9092,kafka-2:9092"
-            - name: KAFKA_GROUP_ID
-              value: "order-processor-v1"
-            - name: KAFKA_TOPIC
-              value: "order-events"
-            - name: KAFKA_AUTO_OFFSET_RESET
-              value: "latest"
-            - name: KAFKA_SESSION_TIMEOUT_MS
-              value: "30000"
-            - name: KAFKA_HEARTBEAT_INTERVAL_MS
-              value: "3000"
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "256Mi"
-            limits:
-              cpu: "1000m"
-              memory: "512Mi"
-```
+# hpa-advanced.yaml
+# Advanced HPA with custom metrics
 
----
-
-## 79.6 Auto-scaling Triggers: Custom Prometheus Metrics → HPA, KEDA ScaledObject
-
-### Custom Metrics HPA
-
-```yaml
-# custom-metrics-hpa.yaml
-# ต้องมี Prometheus Adapter ก่อน
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: order-service-custom-hpa
-  namespace: production
+  name: order-service-hpa
+  namespace: microservices
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: order-service
-  minReplicas: 3
-  maxReplicas: 30
+  
+  minReplicas: 2
+  maxReplicas: 50
+  
   metrics:
-    # CPU (standard metric)
+    # CPU-based scaling
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
+          averageUtilization: 60
+    
+    # Memory-based scaling
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
           averageUtilization: 70
-    # Custom: orders per second per pod
+    
+    # Custom metric: RPS per pod
     - type: Pods
       pods:
         metric:
           name: http_requests_per_second
         target:
           type: AverageValue
-          averageValue: "100"   # 100 req/s per pod
-    # External: Kafka consumer lag
+          averageValue: 100
+    
+    # External metric: Kafka consumer lag
     - type: External
       external:
         metric:
-          name: kafka_consumer_lag
+          name: kafka_consumer_lag_sum
           selector:
             matchLabels:
               topic: order-events
-              group: order-processor
+              consumer_group: order-processor
         target:
           type: AverageValue
-          averageValue: "1000"  # Scale when lag > 1000 per replica
-```
-
-### KEDA ScaledObject สำหรับ Kafka
-
-```yaml
-# keda-kafka-scaler.yaml
+          averageValue: 1000
+  
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 5
+          periodSeconds: 60
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+    
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min
+---
+# KEDA ScaledObject for Kafka-based scaling
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: order-consumer-scaler
-  namespace: production
+  name: order-service-keda
+  namespace: microservices
 spec:
   scaleTargetRef:
-    name: order-event-consumer
-  pollingInterval: 15        # ตรวจทุก 15 วินาที
-  cooldownPeriod: 60         # รอ 60 วินาทีก่อน scale down
+    name: order-service
   minReplicaCount: 2
-  maxReplicaCount: 24        # = partition count * 2
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleUp:
-          stabilizationWindowSeconds: 30
-          policies:
-            - type: Percent
-              value: 100
-              periodSeconds: 30
-        scaleDown:
-          stabilizationWindowSeconds: 120
-          policies:
-            - type: Pods
-              value: 2
-              periodSeconds: 60
+  maxReplicaCount: 50
+  pollingInterval: 15
+  cooldownPeriod: 60
+  
   triggers:
     - type: kafka
       metadata:
-        bootstrapServers: "kafka-0.kafka:9092,kafka-1.kafka:9092,kafka-2.kafka:9092"
-        consumerGroup: "order-processor-v1"
-        topic: "order-events"
-        lagThreshold: "500"       # Scale up when lag > 500 per replica
-        activationLagThreshold: "10"  # Start from 0 when lag > 10
-      authenticationRef:
-        name: kafka-trigger-auth
----
-# TriggerAuthentication สำหรับ KEDA
-apiVersion: keda.sh/v1alpha1
-kind: TriggerAuthentication
-metadata:
-  name: kafka-trigger-auth
-  namespace: production
-spec:
-  secretTargetRef:
-    - parameter: sasl.username
-      name: kafka-credentials
-      key: username
-    - parameter: sasl.password
-      name: kafka-credentials
-      key: password
----
-# KEDA ScaledObject สำหรับ HTTP request rate
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: api-gateway-http-scaler
-  namespace: production
-spec:
-  scaleTargetRef:
-    name: api-gateway
-  pollingInterval: 10
-  cooldownPeriod: 120
-  minReplicaCount: 3
-  maxReplicaCount: 50
-  triggers:
+        bootstrapServers: kafka:9092
+        consumerGroup: order-processor
+        topic: order-events
+        lagThreshold: "100"
+        offsetResetPolicy: latest
+    
     - type: prometheus
       metadata:
-        serverAddress: http://prometheus.monitoring.svc:9090
-        metricName: http_requests_total
-        query: |
-          sum(rate(http_requests_total{
-            namespace="production",
-            service="api-gateway"
-          }[2m]))
-        threshold: "500"         # Scale when > 500 req/s total
-        activationThreshold: "10"
+        serverAddress: http://prometheus:9090
+        metricName: http_requests_per_second
+        threshold: "100"
+        query: sum(rate(http_requests_total{app="order-service"}[2m]))
 ```
 
 ---
 
-## 79.7 Load Testing กับ k6
-
-### Ramp-up, Stress, และ Soak Tests
-
-```javascript
-// k6-load-tests.js
-
-import http from 'k6/http';
-import { check, sleep, group } from 'k6';
-import { Rate, Trend, Counter } from 'k6/metrics';
-
-// Custom metrics
-const errorRate = new Rate('error_rate');
-const orderCreationDuration = new Trend('order_creation_duration', true);
-const orderQueryDuration = new Trend('order_query_duration', true);
-const totalOrders = new Counter('total_orders_created');
-
-const BASE_URL = __ENV.BASE_URL || 'http://api-gateway.production.svc';
-const USERS_COUNT = parseInt(__ENV.USERS_COUNT || '100');
-
-// =================== Ramp-up Test ===================
-export const rampUpOptions = {
-  scenarios: {
-    ramp_up: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '2m', target: 10 },     // Ramp up ช้าๆ
-        { duration: '5m', target: 50 },     // เพิ่มขึ้น
-        { duration: '5m', target: 100 },    // เพิ่มอีก
-        { duration: '3m', target: 0 },      // Ramp down
-      ],
-      gracefulRampDown: '30s',
-    },
-  },
-  thresholds: {
-    http_req_duration: ['p(95)<500', 'p(99)<1000'],
-    error_rate: ['rate<0.01'],
-    http_req_failed: ['rate<0.01'],
-  },
-};
-
-// =================== Stress Test ===================
-export const stressOptions = {
-  scenarios: {
-    stress: {
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: [
-        { duration: '1m', target: 100 },
-        { duration: '2m', target: 200 },
-        { duration: '2m', target: 300 },
-        { duration: '2m', target: 400 },
-        { duration: '2m', target: 500 },    // ผลักไปถึง breaking point
-        { duration: '5m', target: 500 },    // ทดสอบที่ peak
-        { duration: '3m', target: 0 },      // Recovery
-      ],
-    },
-  },
-  thresholds: {
-    http_req_duration: ['p(99)<2000'],
-    error_rate: ['rate<0.05'],
-  },
-};
-
-// =================== Soak Test ===================
-export const soakOptions = {
-  scenarios: {
-    soak: {
-      executor: 'constant-vus',
-      vus: 100,
-      duration: '4h',    // ทดสอบ 4 ชั่วโมง
-    },
-  },
-  thresholds: {
-    http_req_duration: ['p(95)<500'],
-    error_rate: ['rate<0.01'],
-    // Memory leak detection: latency ไม่ควรเพิ่มขึ้นตาม time
-  },
-};
-
-// Export สำหรับ default test (ramp-up)
-export const options = rampUpOptions;
-
-// Test data
-const TEST_USERS = Array.from({ length: USERS_COUNT }, (_, i) => ({
-  id: `user-${i + 1}`,
-  email: `user${i + 1}@test.com`,
-  token: `test-token-${i + 1}`,
-}));
-
-function getRandomUser() {
-  return TEST_USERS[Math.floor(Math.random() * TEST_USERS.length)];
-}
-
-function getRandomProduct() {
-  const products = [
-    { id: 'prod-1', name: 'Widget A', price: 29.99 },
-    { id: 'prod-2', name: 'Widget B', price: 49.99 },
-    { id: 'prod-3', name: 'Widget C', price: 19.99 },
-  ];
-  return products[Math.floor(Math.random() * products.length)];
-}
-
-// Main test function
-export default function () {
-  const user = getRandomUser();
-  const headers = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${user.token}`,
-  };
-
-  group('User Journey', () => {
-    // 1. Create Order
-    group('Create Order', () => {
-      const product = getRandomProduct();
-      const payload = JSON.stringify({
-        customerId: user.id,
-        items: [
-          {
-            productId: product.id,
-            quantity: Math.floor(Math.random() * 3) + 1,
-            price: product.price,
-          },
-        ],
-        shippingAddress: '123 Test Street, Bangkok 10100',
-      });
-
-      const startTime = Date.now();
-      const response = http.post(
-        `${BASE_URL}/api/orders`,
-        payload,
-        { headers, timeout: '10s' }
-      );
-      orderCreationDuration.add(Date.now() - startTime);
-
-      const success = check(response, {
-        'order created': (r) => r.status === 201,
-        'has order id': (r) => {
-          try {
-            return JSON.parse(r.body as string).orderId !== undefined;
-          } catch {
-            return false;
-          }
-        },
-      });
-
-      errorRate.add(!success);
-      if (success) totalOrders.add(1);
-    });
-
-    sleep(Math.random() * 2 + 0.5);
-
-    // 2. List Orders
-    group('List Orders', () => {
-      const startTime = Date.now();
-      const response = http.get(
-        `${BASE_URL}/api/orders?customerId=${user.id}&page=1&pageSize=10`,
-        { headers, timeout: '5s' }
-      );
-      orderQueryDuration.add(Date.now() - startTime);
-
-      const success = check(response, {
-        'orders listed': (r) => r.status === 200,
-        'has data': (r) => {
-          try {
-            const body = JSON.parse(r.body as string);
-            return Array.isArray(body.data);
-          } catch {
-            return false;
-          }
-        },
-        'response time < 500ms': (r) => r.timings.duration < 500,
-      });
-
-      errorRate.add(!success);
-    });
-
-    sleep(Math.random() * 1 + 0.2);
-
-    // 3. Health check
-    group('Health Check', () => {
-      const response = http.get(`${BASE_URL}/health`, { timeout: '2s' });
-      check(response, {
-        'healthy': (r) => r.status === 200,
-      });
-    });
-  });
-
-  sleep(1);
-}
-
-// Teardown
-export function teardown() {
-  console.log('Load test completed');
-}
-```
-
----
-
-## 79.8 Capacity Modeling: TypeScript CapacityCalculator
+## 2. Database Read Replicas and Connection Pooling
 
 ```typescript
-// capacity-calculator.ts
+// db-scaling.ts
+// Database read replicas และ connection pooling
 
-interface ServiceProfile {
-  name: string;
-  peakRps: number;                // Peak requests per second
-  avgResponseTimeMs: number;      // Average response time
-  cpuPerRequestMs: number;        // CPU ms consumed per request
-  memoryPerPodMB: number;         // Memory needed per pod
-  networkInKBPerRequest: number;  // Inbound bytes per request
-  networkOutKBPerRequest: number; // Outbound bytes per request
-  dbQueryCount: number;           // DB queries per request
-  dbQueryTimeMs: number;          // Average DB query time
-}
+import { Pool, PoolConfig } from 'pg';
+import PGBouncer from 'pg-bouncer'; // conceptual
 
-interface ResourceRequirements {
-  cpu: {
-    requested: string;
-    limit: string;
-    totalCores: number;
+interface DatabaseConfig {
+  primary: {
+    host: string;
+    port: number;
+    database: string;
+    user: string;
+    password: string;
+    maxConnections: number;
   };
-  memory: {
-    requested: string;
-    limit: string;
-    totalGB: number;
-  };
-  replicas: {
-    minimum: number;
-    maximum: number;
-    recommended: number;
-  };
-  network: {
-    inboundMBps: number;
-    outboundMBps: number;
-  };
-  database: {
-    queriesPerSecond: number;
-    connectionsNeeded: number;
+  replicas: Array<{
+    host: string;
+    port: number;
+    weight: number;
+  }>;
+  poolerConfig: {
+    poolMode: 'transaction' | 'session' | 'statement';
+    maxClientConn: number;
+    defaultPoolSize: number;
   };
 }
 
-interface ClusterCapacity {
-  totalCPUCores: number;
-  totalMemoryGB: number;
-  nodeCount: number;
-  nodeType: string;
-}
+class DatabaseCluster {
+  private primaryPool: Pool;
+  private replicaPools: Pool[];
+  private currentReplicaIndex = 0;
 
-class CapacityCalculator {
-  private readonly cpuOverheadFactor = 1.3;    // 30% overhead สำหรับ JVM, sidecar ฯลฯ
-  private readonly memoryOverheadFactor = 1.5;  // 50% overhead
-  private readonly safetyMargin = 1.25;         // 25% safety margin
-  private readonly replicaOverhead = 1.2;       // Extra 20% for rolling updates
-
-  calculateServiceRequirements(profile: ServiceProfile): ResourceRequirements {
-    // คำนวณ CPU ที่ต้องการ
-    // CPU = (RPS × CPU_per_request_ms) / 1000ms × overhead
-    const cpuCoresNeeded = 
-      (profile.peakRps * profile.cpuPerRequestMs / 1000) * 
-      this.cpuOverheadFactor * 
-      this.safetyMargin;
-
-    // คำนวณ replicas ที่ต้องการ
-    // ให้แต่ละ pod ใช้ CPU ไม่เกิน 80%
-    const cpuPerPod = 0.5;  // 0.5 core per pod (for medium-sized services)
-    const cpuUtilizationTarget = 0.70;
-    
-    const replicasForCPU = Math.ceil(
-      cpuCoresNeeded / (cpuPerPod * cpuUtilizationTarget)
-    );
-
-    // คำนวณ replicas สำหรับ concurrency
-    // Little's Law: N = λ × W (N = concurrency, λ = arrival rate, W = service time)
-    const avgConcurrency = 
-      profile.peakRps * (profile.avgResponseTimeMs / 1000);
-    
-    const maxConcurrencyPerPod = 100; // typical for Node.js/Go
-    const replicasForConcurrency = Math.ceil(
-      avgConcurrency / (maxConcurrencyPerPod * cpuUtilizationTarget)
-    );
-
-    const recommendedReplicas = Math.max(
-      3,  // minimum for HA
-      Math.max(replicasForCPU, replicasForConcurrency)
-    );
-
-    const finalReplicas = Math.ceil(recommendedReplicas * this.replicaOverhead);
-    
-    // Memory calculation
-    const totalMemoryGB = 
-      (profile.memoryPerPodMB * finalReplicas * this.memoryOverheadFactor) / 1024;
-
-    // Network bandwidth
-    const inboundMBps = 
-      (profile.peakRps * profile.networkInKBPerRequest) / 1024;
-    const outboundMBps = 
-      (profile.peakRps * profile.networkOutKBPerRequest) / 1024;
-
-    // Database connections
-    // Each pod maintains a connection pool
-    const connectionsPerPod = 10;
-    const totalDbConnections = finalReplicas * connectionsPerPod;
-
-    return {
-      cpu: {
-        requested: `${Math.ceil(cpuCoresNeeded / finalReplicas * 1000)}m`,
-        limit: `${Math.ceil(cpuCoresNeeded / finalReplicas * 1000 * 2)}m`,
-        totalCores: cpuCoresNeeded,
-      },
-      memory: {
-        requested: `${profile.memoryPerPodMB}Mi`,
-        limit: `${Math.ceil(profile.memoryPerPodMB * 1.5)}Mi`,
-        totalGB: totalMemoryGB,
-      },
-      replicas: {
-        minimum: 3,
-        maximum: finalReplicas * 3,
-        recommended: finalReplicas,
-      },
-      network: {
-        inboundMBps,
-        outboundMBps,
-      },
-      database: {
-        queriesPerSecond: profile.peakRps * profile.dbQueryCount,
-        connectionsNeeded: totalDbConnections,
-      },
-    };
-  }
-
-  checkClusterFit(
-    requirements: ResourceRequirements[],
-    cluster: ClusterCapacity
-  ): { fits: boolean; utilizationCPU: number; utilizationMemory: number; warnings: string[] } {
-    const totalCPU = requirements.reduce((sum, r) => sum + r.cpu.totalCores, 0);
-    const totalMemory = requirements.reduce((sum, r) => sum + r.memory.totalGB, 0);
-    
-    const utilizationCPU = (totalCPU / cluster.totalCPUCores) * 100;
-    const utilizationMemory = (totalMemory / cluster.totalMemoryGB) * 100;
-    
-    const warnings: string[] = [];
-    
-    if (utilizationCPU > 80) {
-      warnings.push(`CPU utilization ${utilizationCPU.toFixed(1)}% exceeds 80% target`);
-    }
-    if (utilizationMemory > 80) {
-      warnings.push(`Memory utilization ${utilizationMemory.toFixed(1)}% exceeds 80% target`);
-    }
-    
-    return {
-      fits: utilizationCPU <= 80 && utilizationMemory <= 80,
-      utilizationCPU,
-      utilizationMemory,
-      warnings,
-    };
-  }
-
-  generateReport(
-    profiles: ServiceProfile[],
-    cluster: ClusterCapacity
-  ): void {
-    console.log('\n=== Capacity Planning Report ===\n');
-    
-    const allRequirements: ResourceRequirements[] = [];
-    
-    profiles.forEach(profile => {
-      const req = this.calculateServiceRequirements(profile);
-      allRequirements.push(req);
-      
-      console.log(`Service: ${profile.name}`);
-      console.log(`  Peak RPS: ${profile.peakRps.toLocaleString()}`);
-      console.log(`  Recommended Replicas: ${req.replicas.recommended} (max: ${req.replicas.maximum})`);
-      console.log(`  CPU per pod: ${req.cpu.requested} (limit: ${req.cpu.limit})`);
-      console.log(`  Memory per pod: ${req.memory.requested} (limit: ${req.memory.limit})`);
-      console.log(`  Total CPU needed: ${req.cpu.totalCores.toFixed(2)} cores`);
-      console.log(`  Total Memory needed: ${req.memory.totalGB.toFixed(1)} GB`);
-      console.log(`  Network: ${req.network.inboundMBps.toFixed(1)} MB/s in, ${req.network.outboundMBps.toFixed(1)} MB/s out`);
-      console.log(`  DB connections needed: ${req.database.connectionsNeeded}`);
-      console.log('');
+  constructor(config: DatabaseConfig) {
+    // Primary pool - lower connection limit, high priority
+    this.primaryPool = new Pool({
+      host: config.primary.host,
+      port: config.primary.port,
+      database: config.primary.database,
+      user: config.primary.user,
+      password: config.primary.password,
+      max: config.primary.maxConnections,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
     });
-    
-    const { fits, utilizationCPU, utilizationMemory, warnings } = 
-      this.checkClusterFit(allRequirements, cluster);
-    
-    console.log(`Cluster: ${cluster.nodeCount}x ${cluster.nodeType}`);
-    console.log(`  Total CPU: ${cluster.totalCPUCores} cores`);
-    console.log(`  Total Memory: ${cluster.totalMemoryGB} GB`);
-    console.log(`  CPU Utilization: ${utilizationCPU.toFixed(1)}%`);
-    console.log(`  Memory Utilization: ${utilizationMemory.toFixed(1)}%`);
-    console.log(`  Fits: ${fits ? 'YES' : 'NO - NEED MORE CAPACITY'}`);
-    
-    if (warnings.length > 0) {
-      console.log('\nWarnings:');
-      warnings.forEach(w => console.log(`  ⚠️  ${w}`));
+
+    // Replica pools - higher connection limit, read only
+    this.replicaPools = config.replicas.map(replica =>
+      new Pool({
+        host: replica.host,
+        port: replica.port,
+        database: config.primary.database,
+        user: config.primary.user,
+        password: config.primary.password,
+        max: config.primary.maxConnections * 2,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 2000,
+      })
+    );
+
+    this.setupHealthMonitoring();
+  }
+
+  // Write to primary
+  async write<T>(
+    query: string,
+    params?: unknown[]
+  ): Promise<{ rows: T[]; rowCount: number }> {
+    return this.primaryPool.query(query, params);
+  }
+
+  // Read from replica (round-robin)
+  async read<T>(
+    query: string,
+    params?: unknown[]
+  ): Promise<{ rows: T[]; rowCount: number }> {
+    if (this.replicaPools.length === 0) {
+      // Fallback to primary if no replicas
+      return this.primaryPool.query(query, params);
     }
+
+    const replica = this.getNextReplica();
+    
+    try {
+      return await replica.query(query, params);
+    } catch (error) {
+      // Fallback to primary on replica failure
+      console.warn('Replica read failed, falling back to primary:', error);
+      return this.primaryPool.query(query, params);
+    }
+  }
+
+  // Consistent read (must read from primary)
+  async consistentRead<T>(
+    query: string,
+    params?: unknown[]
+  ): Promise<{ rows: T[]; rowCount: number }> {
+    return this.primaryPool.query(query, params);
+  }
+
+  private getNextReplica(): Pool {
+    const replica = this.replicaPools[this.currentReplicaIndex];
+    this.currentReplicaIndex = (this.currentReplicaIndex + 1) % this.replicaPools.length;
+    return replica;
+  }
+
+  private setupHealthMonitoring(): void {
+    setInterval(async () => {
+      // Monitor primary lag
+      try {
+        const result = await this.primaryPool.query<{ lag: string }>(
+          `SELECT CASE 
+             WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() - pg_last_wal_replay_lsn()
+             ELSE 0
+           END as lag`
+        );
+        const lagBytes = parseInt(result.rows[0].lag);
+        if (lagBytes > 1024 * 1024) { // 1MB lag
+          console.warn(`Replica lag: ${lagBytes} bytes`);
+        }
+      } catch (error) {
+        console.error('Health check failed:', error);
+      }
+    }, 10000);
+  }
+
+  async getPoolStats(): Promise<{
+    primary: { total: number; idle: number; waiting: number };
+    replicas: Array<{ total: number; idle: number; waiting: number }>;
+  }> {
+    return {
+      primary: {
+        total: this.primaryPool.totalCount,
+        idle: this.primaryPool.idleCount,
+        waiting: this.primaryPool.waitingCount,
+      },
+      replicas: this.replicaPools.map(pool => ({
+        total: pool.totalCount,
+        idle: pool.idleCount,
+        waiting: pool.waitingCount,
+      })),
+    };
   }
 }
 
-// ตัวอย่างการใช้งาน
-const calculator = new CapacityCalculator();
-calculator.generateReport(
-  [
-    {
-      name: 'api-gateway',
-      peakRps: 10000,
-      avgResponseTimeMs: 50,
-      cpuPerRequestMs: 2,
-      memoryPerPodMB: 512,
-      networkInKBPerRequest: 2,
-      networkOutKBPerRequest: 5,
-      dbQueryCount: 0,
-      dbQueryTimeMs: 0,
-    },
-    {
-      name: 'order-service',
-      peakRps: 2000,
-      avgResponseTimeMs: 200,
-      cpuPerRequestMs: 15,
-      memoryPerPodMB: 256,
-      networkInKBPerRequest: 5,
-      networkOutKBPerRequest: 3,
-      dbQueryCount: 5,
-      dbQueryTimeMs: 20,
-    },
-    {
-      name: 'user-service',
-      peakRps: 5000,
-      avgResponseTimeMs: 30,
-      cpuPerRequestMs: 3,
-      memoryPerPodMB: 256,
-      networkInKBPerRequest: 1,
-      networkOutKBPerRequest: 2,
-      dbQueryCount: 2,
-      dbQueryTimeMs: 5,
-    },
-  ],
-  {
-    totalCPUCores: 96,
-    totalMemoryGB: 384,
-    nodeCount: 12,
-    nodeType: 'm5.2xlarge (8 CPU, 32 GB)',
-  }
-);
-```
-
----
-
-## 79.9 Connection Pooling at Scale: PgBouncer
-
-### PgBouncer Configuration
-
-```ini
-# pgbouncer.ini
-
+// PgBouncer configuration
+const pgBouncerConfig = `
 [databases]
-# production database
-production = host=postgres-primary.production.svc port=5432 dbname=production
-production_read = host=postgres-replica.production.svc port=5432 dbname=production
+order_db = host=postgres-primary port=5432 dbname=order_db
+order_db_replica = host=postgres-replica port=5432 dbname=order_db
 
 [pgbouncer]
-# Listening
 listen_addr = 0.0.0.0
 listen_port = 5432
-
-# Authentication
 auth_type = md5
 auth_file = /etc/pgbouncer/userlist.txt
-
-# Connection pooling mode
-# transaction: สำหรับ microservices (default สำหรับ scalability)
-# session: สำหรับ applications ที่ใช้ SET, LISTEN, prepared statements
-# statement: สำหรับ simple query workloads
 pool_mode = transaction
-
-# Connection limits
-# Maximum connections to PostgreSQL backend
-max_client_conn = 10000      # Maximum client connections
-default_pool_size = 25       # Server connections per database/user combination
-min_pool_size = 5            # Minimum connections kept in pool
-reserve_pool_size = 5        # Extra connections available during peak
-reserve_pool_timeout = 3     # Seconds to wait before using reserve pool
-
-# Connection timeouts
-server_connect_timeout = 15  # Seconds to wait for new server connection
-server_idle_timeout = 600    # Seconds before idle server connection removed
-client_idle_timeout = 0      # Disable (managed by application)
-query_timeout = 0            # Disable query timeout (managed by application)
-query_wait_timeout = 120     # Seconds client waits for server connection
-
-# Keep-alive
-tcp_keepalive = 1
-tcp_keepcnt = 3
-tcp_keepidle = 300
-tcp_keepintvl = 5
-
-# Logging
-log_connections = 1
-log_disconnections = 1
-log_pooler_errors = 1
-stats_period = 60
-
-# Admin access
-admin_users = pgbouncer
-stats_users = pgbouncer, monitoring
-
-# TLS (for encryption in transit)
-server_tls_sslmode = require
-server_tls_ca_file = /etc/pgbouncer/ca.crt
-client_tls_sslmode = prefer
-client_tls_cert_file = /etc/pgbouncer/server.crt
-client_tls_key_file = /etc/pgbouncer/server.key
-```
-
-### Kubernetes Deployment สำหรับ PgBouncer
-
-```yaml
-# pgbouncer-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: pgbouncer
-  namespace: production
-spec:
-  replicas: 3    # Multiple PgBouncer instances for HA
-  selector:
-    matchLabels:
-      app: pgbouncer
-  template:
-    metadata:
-      labels:
-        app: pgbouncer
-    spec:
-      containers:
-        - name: pgbouncer
-          image: bitnami/pgbouncer:1.21.0
-          ports:
-            - containerPort: 5432
-              name: postgres
-          env:
-            - name: PGBOUNCER_DATABASE
-              value: "production"
-            - name: POSTGRESQL_HOST
-              value: "postgres-primary.production.svc"
-            - name: POSTGRESQL_PORT
-              value: "5432"
-            - name: POSTGRESQL_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-credentials
-                  key: username
-            - name: POSTGRESQL_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-credentials
-                  key: password
-            - name: PGBOUNCER_POOL_MODE
-              value: "transaction"
-            - name: PGBOUNCER_MAX_CLIENT_CONN
-              value: "10000"
-            - name: PGBOUNCER_DEFAULT_POOL_SIZE
-              value: "25"
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "64Mi"
-            limits:
-              cpu: "500m"
-              memory: "256Mi"
-          readinessProbe:
-            tcpSocket:
-              port: 5432
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            tcpSocket:
-              port: 5432
-            initialDelaySeconds: 15
-            periodSeconds: 20
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: pgbouncer
-  namespace: production
-spec:
-  selector:
-    app: pgbouncer
-  ports:
-    - port: 5432
-      targetPort: 5432
-  type: ClusterIP
+max_client_conn = 10000
+default_pool_size = 25
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+server_idle_timeout = 600
+server_connect_timeout = 5
+server_login_retry = 3
+query_timeout = 30
+client_idle_timeout = 60
+`;
 ```
 
 ---
 
-## 79.10 Global Load Balancing: AWS Route53 Latency Routing, GeoDNS
-
-### AWS Route53 Latency-Based Routing
+## 3. CQRS for Scalability
 
 ```typescript
-// route53-latency-routing.ts
-import {
-  Route53Client,
-  ChangeResourceRecordSetsCommand,
-  CreateHealthCheckCommand,
-  ListHealthChecksCommand,
-  Change,
-  ResourceRecord,
-} from '@aws-sdk/client-route-53';
+// cqrs-pattern.ts
+// Command Query Responsibility Segregation
 
-interface RegionalEndpoint {
-  region: string;
-  endpoint: string;
-  ipAddress: string;
-  healthCheckId?: string;
+// Commands (Write Side)
+interface CreateOrderCommand {
+  type: 'CREATE_ORDER';
+  userId: string;
+  items: OrderItem[];
+  correlationId: string;
 }
 
-interface LatencyRoutingConfig {
-  hostedZoneId: string;
-  recordName: string;
-  recordType: 'A' | 'CNAME' | 'AAAA';
-  ttl: number;
-  endpoints: RegionalEndpoint[];
+interface UpdateOrderStatusCommand {
+  type: 'UPDATE_ORDER_STATUS';
+  orderId: string;
+  newStatus: OrderStatus;
+  correlationId: string;
 }
 
-class Route53LatencyRoutingManager {
-  private client: Route53Client;
+type Command = CreateOrderCommand | UpdateOrderStatusCommand;
 
-  constructor(region: string = 'us-east-1') {
-    this.client = new Route53Client({ region });
+// Queries (Read Side)
+interface GetOrderQuery {
+  type: 'GET_ORDER';
+  orderId: string;
+}
+
+interface GetOrdersByUserQuery {
+  type: 'GET_ORDERS_BY_USER';
+  userId: string;
+  page: number;
+  pageSize: number;
+  status?: OrderStatus;
+}
+
+interface GetOrderSummaryQuery {
+  type: 'GET_ORDER_SUMMARY';
+  userId: string;
+  dateFrom: Date;
+  dateTo: Date;
+}
+
+type Query = GetOrderQuery | GetOrdersByUserQuery | GetOrderSummaryQuery;
+
+// Write Model
+class OrderCommandHandler {
+  private writeDb: Pool;
+  private eventBus: EventEmitter;
+
+  constructor(writeDb: Pool, eventBus: EventEmitter) {
+    this.writeDb = writeDb;
+    this.eventBus = eventBus;
   }
 
-  async createHealthCheck(endpoint: RegionalEndpoint): Promise<string> {
-    const command = new CreateHealthCheckCommand({
-      CallerReference: `${endpoint.region}-${Date.now()}`,
-      HealthCheckConfig: {
-        Type: 'HTTP',
-        IPAddress: endpoint.ipAddress,
-        Port: 80,
-        ResourcePath: '/health',
-        FullyQualifiedDomainName: endpoint.endpoint,
-        RequestInterval: 30,
-        FailureThreshold: 3,
-        MeasureLatency: true,
-        EnableSNI: true,
-        Regions: ['us-east-1', 'us-west-2', 'eu-west-1'],
-      },
-    });
-
-    const response = await this.client.send(command);
-    return response.HealthCheck!.Id!;
-  }
-
-  async setupLatencyRouting(config: LatencyRoutingConfig): Promise<void> {
-    const changes: Change[] = [];
-
-    for (const endpoint of config.endpoints) {
-      let healthCheckId = endpoint.healthCheckId;
-      
-      if (!healthCheckId) {
-        console.log(`Creating health check for ${endpoint.region}...`);
-        healthCheckId = await this.createHealthCheck(endpoint);
-        endpoint.healthCheckId = healthCheckId;
-      }
-
-      const record: ResourceRecord = config.recordType === 'CNAME'
-        ? { Value: endpoint.endpoint }
-        : { Value: endpoint.ipAddress };
-
-      changes.push({
-        Action: 'UPSERT',
-        ResourceRecordSet: {
-          Name: config.recordName,
-          Type: config.recordType,
-          Region: endpoint.region as any,
-          SetIdentifier: `latency-${endpoint.region}`,
-          TTL: config.ttl,
-          HealthCheckId: healthCheckId,
-          ResourceRecords: [record],
-        },
-      });
+  async handle(command: Command): Promise<string> {
+    switch (command.type) {
+      case 'CREATE_ORDER':
+        return this.handleCreateOrder(command);
+      case 'UPDATE_ORDER_STATUS':
+        return this.handleUpdateStatus(command);
+      default:
+        throw new Error(`Unknown command type`);
     }
-
-    const command = new ChangeResourceRecordSetsCommand({
-      HostedZoneId: config.hostedZoneId,
-      ChangeBatch: {
-        Comment: `Latency routing for ${config.recordName}`,
-        Changes: changes,
-      },
-    });
-
-    await this.client.send(command);
-    console.log(`Latency routing configured for ${config.recordName}`);
   }
 
-  async setupGeoDNS(
-    hostedZoneId: string,
-    recordName: string,
-    geoRoutes: Array<{
-      continentCode?: string;
-      countryCode?: string;
-      endpoint: string;
-      setIdentifier: string;
-    }>
-  ): Promise<void> {
-    const changes: Change[] = geoRoutes.map(route => ({
-      Action: 'UPSERT' as const,
-      ResourceRecordSet: {
-        Name: recordName,
-        Type: 'CNAME' as const,
-        GeoLocation: route.continentCode
-          ? { ContinentCode: route.continentCode }
-          : { CountryCode: route.countryCode },
-        SetIdentifier: route.setIdentifier,
-        TTL: 60,
-        ResourceRecords: [{ Value: route.endpoint }],
-      },
-    }));
+  private async handleCreateOrder(command: CreateOrderCommand): Promise<string> {
+    const orderId = crypto.randomUUID();
+    const totalAmount = command.items.reduce(
+      (sum, item) => sum + item.price * item.quantity,
+      0
+    );
 
-    const command = new ChangeResourceRecordSetsCommand({
-      HostedZoneId: hostedZoneId,
-      ChangeBatch: {
-        Comment: `GeoDNS routing for ${recordName}`,
-        Changes: changes,
-      },
+    await this.writeDb.query(
+      `INSERT INTO orders (id, user_id, items, total_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, 'PENDING', NOW())`,
+      [orderId, command.userId, JSON.stringify(command.items), totalAmount]
+    );
+
+    // Publish event for read model projection
+    this.eventBus.emit('OrderCreated', {
+      orderId,
+      userId: command.userId,
+      items: command.items,
+      totalAmount,
+      status: 'PENDING',
+      createdAt: new Date(),
     });
 
-    await this.client.send(command);
-    console.log(`GeoDNS configured for ${recordName}`);
+    return orderId;
+  }
+
+  private async handleUpdateStatus(command: UpdateOrderStatusCommand): Promise<string> {
+    await this.writeDb.query(
+      'UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2',
+      [command.newStatus, command.orderId]
+    );
+
+    this.eventBus.emit('OrderStatusUpdated', {
+      orderId: command.orderId,
+      newStatus: command.newStatus,
+      updatedAt: new Date(),
+    });
+
+    return command.orderId;
   }
 }
 
-// ตัวอย่างการใช้งาน
-async function setupGlobalLoadBalancing() {
-  const manager = new Route53LatencyRoutingManager();
-  
-  // Latency-based routing - ส่ง traffic ไป region ที่ latency ต่ำสุด
-  await manager.setupLatencyRouting({
-    hostedZoneId: process.env.HOSTED_ZONE_ID!,
-    recordName: 'api.example.com',
-    recordType: 'CNAME',
-    ttl: 60,
-    endpoints: [
-      {
-        region: 'us-east-1',
-        endpoint: 'alb-us-east.example.com',
-        ipAddress: '52.1.2.3',
-      },
-      {
-        region: 'ap-southeast-1',
-        endpoint: 'alb-ap-se.example.com',
-        ipAddress: '54.1.2.3',
-      },
-      {
-        region: 'eu-west-1',
-        endpoint: 'alb-eu-west.example.com',
-        ipAddress: '34.1.2.3',
-      },
-    ],
-  });
+// Read Model (Denormalized, optimized for queries)
+class OrderQueryHandler {
+  private readDb: Pool;
 
-  // GeoDNS - routing ตาม geography
-  await manager.setupGeoDNS(
-    process.env.HOSTED_ZONE_ID!,
-    'static.example.com',
-    [
-      {
-        continentCode: 'NA',
-        endpoint: 'cdn-us.example.com',
-        setIdentifier: 'north-america',
-      },
-      {
-        continentCode: 'EU',
-        endpoint: 'cdn-eu.example.com',
-        setIdentifier: 'europe',
-      },
-      {
-        continentCode: 'AS',
-        endpoint: 'cdn-ap.example.com',
-        setIdentifier: 'asia',
-      },
-    ]
-  );
+  constructor(readDb: Pool) {
+    this.readDb = readDb;
+  }
+
+  async handle(query: Query): Promise<unknown> {
+    switch (query.type) {
+      case 'GET_ORDER':
+        return this.getOrder(query);
+      case 'GET_ORDERS_BY_USER':
+        return this.getOrdersByUser(query);
+      case 'GET_ORDER_SUMMARY':
+        return this.getOrderSummary(query);
+    }
+  }
+
+  private async getOrder(query: GetOrderQuery): Promise<Order | null> {
+    // Read from optimized read model (denormalized)
+    const result = await this.readDb.query<Order>(
+      `SELECT * FROM order_read_model WHERE id = $1`,
+      [query.orderId]
+    );
+    return result.rows[0] || null;
+  }
+
+  private async getOrdersByUser(query: GetOrdersByUserQuery): Promise<{
+    orders: Order[];
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
+    const offset = (query.page - 1) * query.pageSize;
+    
+    const [ordersResult, countResult] = await Promise.all([
+      this.readDb.query<Order>(
+        `SELECT * FROM order_read_model 
+         WHERE user_id = $1 
+         ${query.status ? 'AND status = $3' : ''}
+         ORDER BY created_at DESC 
+         LIMIT $2 OFFSET ${query.status ? '$4' : '$3'}`,
+        query.status
+          ? [query.userId, query.pageSize, query.status, offset]
+          : [query.userId, query.pageSize, offset]
+      ),
+      this.readDb.query<{ count: string }>(
+        `SELECT COUNT(*) FROM order_read_model WHERE user_id = $1`,
+        [query.userId]
+      ),
+    ]);
+
+    return {
+      orders: ordersResult.rows,
+      total: parseInt(countResult.rows[0].count),
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  private async getOrderSummary(query: GetOrderSummaryQuery): Promise<{
+    totalOrders: number;
+    totalSpend: number;
+    avgOrderValue: number;
+    statusBreakdown: Record<string, number>;
+  }> {
+    // Use pre-aggregated materialized view for performance
+    const result = await this.readDb.query<{
+      total_orders: string;
+      total_spend: string;
+      avg_order_value: string;
+    }>(
+      `SELECT 
+         COUNT(*) as total_orders,
+         SUM(total_amount) as total_spend,
+         AVG(total_amount) as avg_order_value
+       FROM order_read_model
+       WHERE user_id = $1 AND created_at BETWEEN $2 AND $3`,
+      [query.userId, query.dateFrom, query.dateTo]
+    );
+
+    const statusResult = await this.readDb.query<{
+      status: string;
+      count: string;
+    }>(
+      `SELECT status, COUNT(*) as count 
+       FROM order_read_model
+       WHERE user_id = $1 AND created_at BETWEEN $2 AND $3
+       GROUP BY status`,
+      [query.userId, query.dateFrom, query.dateTo]
+    );
+
+    const row = result.rows[0];
+    return {
+      totalOrders: parseInt(row.total_orders),
+      totalSpend: parseFloat(row.total_spend || '0'),
+      avgOrderValue: parseFloat(row.avg_order_value || '0'),
+      statusBreakdown: Object.fromEntries(
+        statusResult.rows.map(r => [r.status, parseInt(r.count)])
+      ),
+    };
+  }
 }
 
-setupGlobalLoadBalancing().catch(console.error);
+// Read Model Projector
+class OrderProjector {
+  private readDb: Pool;
+
+  constructor(readDb: Pool) {
+    this.readDb = readDb;
+  }
+
+  async handleOrderCreated(event: {
+    orderId: string;
+    userId: string;
+    items: OrderItem[];
+    totalAmount: number;
+    status: string;
+    createdAt: Date;
+  }): Promise<void> {
+    // Upsert to read model
+    await this.readDb.query(
+      `INSERT INTO order_read_model 
+         (id, user_id, items, total_amount, status, item_count, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+       ON CONFLICT (id) DO UPDATE
+       SET status = excluded.status, updated_at = excluded.updated_at`,
+      [
+        event.orderId,
+        event.userId,
+        JSON.stringify(event.items),
+        event.totalAmount,
+        event.status,
+        event.items.length,
+        event.createdAt,
+      ]
+    );
+  }
+}
+
+type OrderStatus = 'PENDING' | 'CONFIRMED' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED';
+interface OrderItem {
+  productId: string;
+  quantity: number;
+  price: number;
+}
+interface Order {
+  id: string;
+  userId: string;
+  status: OrderStatus;
+  totalAmount: number;
+  createdAt: Date;
+}
+import { Pool } from 'pg';
+import { EventEmitter } from 'events';
 ```
 
 ---
 
-## สรุปบทที่ 79
+## 4. Event Sourcing for Audit and Scalability
 
-| Pattern | เมื่อใช้ | ประโยชน์ |
-|---------|----------|----------|
-| Stateless Service + Redis Session | ทุก microservice ที่ scale out | Scale ได้ไม่จำกัด, ทน fault |
-| Read Replicas | DB read-heavy workloads | ลด load บน primary, เพิ่ม read throughput |
-| CQRS | Complex domain, read/write ratio ต่าง | Optimize แต่ละ side แยกกัน |
-| JWT (Stateless Auth) | Distributed systems | ไม่ต้องแชร์ state, scale ได้ |
-| Kafka Partitioning | Event streaming at scale | Parallelism, ordering guarantees |
-| KEDA ScaledObject | Event-driven scaling | Scale to zero, scale by external metrics |
-| k6 Load Testing | ก่อน production deployment | ค้นหา bottleneck, ทดสอบ capacity |
-| CapacityCalculator | Capacity planning | ป้องกัน over/under-provisioning |
-| PgBouncer | DB connection pooling | ลด DB connection overhead |
-| Route53 Latency | Multi-region deployment | ลด latency สำหรับ users ทั่วโลก |
+```typescript
+// event-sourcing.ts
 
-### Key Takeaways
+interface DomainEvent {
+  eventId: string;
+  eventType: string;
+  aggregateId: string;
+  aggregateType: string;
+  version: number;
+  payload: Record<string, unknown>;
+  metadata: {
+    correlationId: string;
+    causationId: string;
+    userId: string;
+    timestamp: Date;
+  };
+}
 
-1. **Stateless first**: ออกแบบ service ให้ stateless ก่อนเสมอ ใช้ Redis สำหรับ session
-2. **แยก Read/Write**: ใช้ read replicas + CQRS เพื่อ scale read workloads แยกจาก write
-3. **JWT สำหรับ auth**: ลดการ query DB ทุก request
-4. **Kafka partitions = max consumers**: ออกแบบ partitions ให้พอกับ consumer groups
-5. **KEDA สำหรับ event-driven**: Scale by business metrics ไม่ใช่แค่ CPU/memory
-6. **Test before production**: k6 load test ทุก deployment สำคัญ
-7. **Capacity planning**: คำนวณ resource ล่วงหน้าก่อน go-live
+class EventStore {
+  private db: Pool;
+
+  constructor(db: Pool) {
+    this.db = db;
+  }
+
+  async append(
+    aggregateId: string,
+    events: Omit<DomainEvent, 'eventId' | 'version'>[],
+    expectedVersion: number
+  ): Promise<void> {
+    const client = await this.db.connect();
+    
+    try {
+      await client.query('BEGIN');
+
+      // Optimistic locking check
+      const currentVersion = await this.getCurrentVersion(aggregateId, client);
+      
+      if (currentVersion !== expectedVersion) {
+        throw new Error(
+          `Concurrency conflict: expected version ${expectedVersion}, got ${currentVersion}`
+        );
+      }
+
+      // Append events
+      for (let i = 0; i < events.length; i++) {
+        const event = events[i];
+        const version = expectedVersion + i + 1;
+
+        await client.query(
+          `INSERT INTO event_store 
+           (event_id, event_type, aggregate_id, aggregate_type, version, payload, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            crypto.randomUUID(),
+            event.eventType,
+            aggregateId,
+            event.aggregateType,
+            version,
+            JSON.stringify(event.payload),
+            JSON.stringify(event.metadata),
+          ]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async load(
+    aggregateId: string,
+    fromVersion?: number
+  ): Promise<DomainEvent[]> {
+    const result = await this.db.query<{
+      event_id: string;
+      event_type: string;
+      aggregate_id: string;
+      aggregate_type: string;
+      version: number;
+      payload: Record<string, unknown>;
+      metadata: Record<string, unknown>;
+      created_at: Date;
+    }>(
+      `SELECT * FROM event_store 
+       WHERE aggregate_id = $1 
+       ${fromVersion ? 'AND version > $2' : ''}
+       ORDER BY version ASC`,
+      fromVersion ? [aggregateId, fromVersion] : [aggregateId]
+    );
+
+    return result.rows.map(row => ({
+      eventId: row.event_id,
+      eventType: row.event_type,
+      aggregateId: row.aggregate_id,
+      aggregateType: row.aggregate_type,
+      version: row.version,
+      payload: row.payload,
+      metadata: {
+        correlationId: (row.metadata as any).correlationId,
+        causationId: (row.metadata as any).causationId,
+        userId: (row.metadata as any).userId,
+        timestamp: row.created_at,
+      },
+    }));
+  }
+
+  private async getCurrentVersion(
+    aggregateId: string,
+    client: any
+  ): Promise<number> {
+    const result = await client.query(
+      'SELECT MAX(version) as version FROM event_store WHERE aggregate_id = $1',
+      [aggregateId]
+    );
+    return result.rows[0].version || 0;
+  }
+}
+
+// Aggregate with Event Sourcing
+class OrderAggregate {
+  private id: string;
+  private userId: string;
+  private status: OrderStatus = 'PENDING';
+  private items: OrderItem[] = [];
+  private totalAmount: number = 0;
+  private version: number = 0;
+  private uncommittedEvents: DomainEvent[] = [];
+
+  constructor(id: string) {
+    this.id = id;
+  }
+
+  static fromEvents(events: DomainEvent[]): OrderAggregate {
+    const aggregate = new OrderAggregate(events[0].aggregateId);
+    
+    for (const event of events) {
+      aggregate.apply(event);
+    }
+    
+    return aggregate;
+  }
+
+  create(userId: string, items: OrderItem[]): void {
+    const totalAmount = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+    
+    this.raise({
+      eventType: 'OrderCreated',
+      payload: { userId, items, totalAmount },
+    });
+  }
+
+  cancel(reason: string): void {
+    if (this.status !== 'PENDING' && this.status !== 'CONFIRMED') {
+      throw new Error(`Cannot cancel order in ${this.status} status`);
+    }
+    
+    this.raise({
+      eventType: 'OrderCancelled',
+      payload: { reason },
+    });
+  }
+
+  private raise(event: { eventType: string; payload: Record<string, unknown> }): void {
+    const domainEvent: DomainEvent = {
+      eventId: crypto.randomUUID(),
+      eventType: event.eventType,
+      aggregateId: this.id,
+      aggregateType: 'Order',
+      version: this.version + 1,
+      payload: event.payload,
+      metadata: {
+        correlationId: crypto.randomUUID(),
+        causationId: crypto.randomUUID(),
+        userId: this.userId,
+        timestamp: new Date(),
+      },
+    };
+
+    this.apply(domainEvent);
+    this.uncommittedEvents.push(domainEvent);
+  }
+
+  private apply(event: DomainEvent): void {
+    switch (event.eventType) {
+      case 'OrderCreated':
+        this.userId = event.payload.userId as string;
+        this.items = event.payload.items as OrderItem[];
+        this.totalAmount = event.payload.totalAmount as number;
+        this.status = 'PENDING';
+        break;
+      case 'OrderCancelled':
+        this.status = 'CANCELLED';
+        break;
+    }
+    this.version = event.version;
+  }
+
+  getUncommittedEvents(): DomainEvent[] {
+    return this.uncommittedEvents;
+  }
+
+  clearUncommittedEvents(): void {
+    this.uncommittedEvents = [];
+  }
+
+  getVersion(): number {
+    return this.version;
+  }
+}
+```
 
 ---
 
-*Part 79 จบแล้ว - ต่อไปบทที่ 80: Kubernetes Advanced Patterns*
+## 5. Stateless Services Design
+
+```typescript
+// stateless-services.ts
+// Design principles สำหรับ stateless services
+
+// Bad: Stateful service (ทำให้ scale ยาก)
+class StatefulOrderService {
+  private sessionCache = new Map<string, any>(); // State ใน memory!
+  private userSessions = new Map<string, string>();
+
+  async processOrder(sessionId: string, items: OrderItem[]): Promise<string> {
+    // ปัญหา: ถ้า restart หรือ scale out -> state หาย
+    const session = this.sessionCache.get(sessionId);
+    if (!session) throw new Error('Session not found');
+    
+    return 'order-id'; // State ผูกกับ instance นี้
+  }
+}
+
+// Good: Stateless service (scale ได้ง่าย)
+class StatelessOrderService {
+  constructor(
+    private redis: Redis,      // External state
+    private db: Pool,          // External persistence
+    private tokenService: TokenService // Stateless token validation
+  ) {}
+
+  async processOrder(
+    userId: string,
+    items: OrderItem[],
+    idempotencyKey: string  // ป้องกัน duplicate processing
+  ): Promise<string> {
+    // Idempotency check in Redis (shared state)
+    const existing = await this.redis.get(`idempotency:${idempotencyKey}`);
+    if (existing) return existing;
+
+    // Process order
+    const orderId = await this.createOrder(userId, items);
+
+    // Store idempotency key (expires after 24 hours)
+    await this.redis.setex(`idempotency:${idempotencyKey}`, 86400, orderId);
+
+    return orderId;
+  }
+
+  private async createOrder(userId: string, items: OrderItem[]): Promise<string> {
+    const result = await this.db.query<{ id: string }>(
+      'INSERT INTO orders (user_id, items, status) VALUES ($1, $2, $3) RETURNING id',
+      [userId, JSON.stringify(items), 'PENDING']
+    );
+    return result.rows[0].id;
+  }
+}
+
+// JWT-based stateless authentication
+class TokenService {
+  private readonly secret: string;
+
+  constructor(secret: string) {
+    this.secret = secret;
+  }
+
+  generateToken(userId: string, roles: string[]): string {
+    const jwt = require('jsonwebtoken');
+    return jwt.sign(
+      { sub: userId, roles, jti: crypto.randomUUID() },
+      this.secret,
+      { expiresIn: '15m' }
+    );
+  }
+
+  validateToken(token: string): {
+    valid: boolean;
+    userId?: string;
+    roles?: string[];
+  } {
+    const jwt = require('jsonwebtoken');
+    try {
+      const payload = jwt.verify(token, this.secret);
+      return {
+        valid: true,
+        userId: payload.sub,
+        roles: payload.roles,
+      };
+    } catch {
+      return { valid: false };
+    }
+  }
+}
+
+import { Redis } from 'ioredis';
+```
+
+---
+
+## 6. Session Management at Scale
+
+```typescript
+// session-management.ts
+// Distributed session management
+
+interface Session {
+  id: string;
+  userId: string;
+  data: Record<string, unknown>;
+  createdAt: number;
+  lastAccessedAt: number;
+  expiresAt: number;
+}
+
+class DistributedSessionManager {
+  private redis: Redis;
+  private readonly SESSION_TTL = 3600; // 1 hour
+  private readonly SESSION_PREFIX = 'session:';
+
+  constructor(redis: Redis) {
+    this.redis = redis;
+  }
+
+  async create(userId: string, data: Record<string, unknown> = {}): Promise<string> {
+    const sessionId = crypto.randomUUID();
+    const now = Date.now();
+    
+    const session: Session = {
+      id: sessionId,
+      userId,
+      data,
+      createdAt: now,
+      lastAccessedAt: now,
+      expiresAt: now + this.SESSION_TTL * 1000,
+    };
+
+    await this.redis.setex(
+      `${this.SESSION_PREFIX}${sessionId}`,
+      this.SESSION_TTL,
+      JSON.stringify(session)
+    );
+
+    // Track user sessions for revocation
+    await this.redis.sadd(`user-sessions:${userId}`, sessionId);
+    await this.redis.expire(`user-sessions:${userId}`, this.SESSION_TTL * 2);
+
+    return sessionId;
+  }
+
+  async get(sessionId: string): Promise<Session | null> {
+    const data = await this.redis.get(`${this.SESSION_PREFIX}${sessionId}`);
+    
+    if (!data) return null;
+
+    const session = JSON.parse(data) as Session;
+    
+    // Check expiration
+    if (session.expiresAt < Date.now()) {
+      await this.delete(sessionId);
+      return null;
+    }
+
+    // Sliding expiration - renew on access
+    session.lastAccessedAt = Date.now();
+    session.expiresAt = Date.now() + this.SESSION_TTL * 1000;
+    
+    await this.redis.setex(
+      `${this.SESSION_PREFIX}${sessionId}`,
+      this.SESSION_TTL,
+      JSON.stringify(session)
+    );
+
+    return session;
+  }
+
+  async update(
+    sessionId: string,
+    updates: Partial<Session['data']>
+  ): Promise<void> {
+    const session = await this.get(sessionId);
+    if (!session) throw new Error('Session not found');
+
+    session.data = { ...session.data, ...updates };
+    session.lastAccessedAt = Date.now();
+
+    await this.redis.setex(
+      `${this.SESSION_PREFIX}${sessionId}`,
+      this.SESSION_TTL,
+      JSON.stringify(session)
+    );
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    const session = await this.get(sessionId);
+    if (session) {
+      await this.redis.srem(`user-sessions:${session.userId}`, sessionId);
+    }
+    await this.redis.del(`${this.SESSION_PREFIX}${sessionId}`);
+  }
+
+  async revokeAllUserSessions(userId: string): Promise<void> {
+    const sessionIds = await this.redis.smembers(`user-sessions:${userId}`);
+    
+    const pipeline = this.redis.pipeline();
+    sessionIds.forEach(id => pipeline.del(`${this.SESSION_PREFIX}${id}`));
+    pipeline.del(`user-sessions:${userId}`);
+    
+    await pipeline.exec();
+  }
+}
+```
+
+---
+
+## 7. Caching Strategies for Scale
+
+```typescript
+// caching-strategies.ts
+// Multi-level caching
+
+interface CacheConfig {
+  l1: {
+    type: 'memory';
+    maxSize: number;
+    ttl: number;
+  };
+  l2: {
+    type: 'redis';
+    ttl: number;
+    cluster?: boolean;
+  };
+  l3: {
+    type: 'cdn';
+    ttl: number;
+    regions: string[];
+  };
+}
+
+class MultiLevelCache<T> {
+  private l1Cache: Map<string, { value: T; expiresAt: number }>;
+  private redis: Redis;
+  private readonly maxL1Size: number;
+  private readonly l1TTL: number;
+  private readonly l2TTL: number;
+
+  constructor(config: CacheConfig, redis: Redis) {
+    this.l1Cache = new Map();
+    this.redis = redis;
+    this.maxL1Size = config.l1.maxSize;
+    this.l1TTL = config.l1.ttl;
+    this.l2TTL = config.l2.ttl;
+  }
+
+  async get(key: string): Promise<T | null> {
+    // L1: In-memory (fastest)
+    const l1Value = this.getFromL1(key);
+    if (l1Value !== null) {
+      return l1Value;
+    }
+
+    // L2: Redis (distributed)
+    const l2Value = await this.getFromL2(key);
+    if (l2Value !== null) {
+      // Populate L1
+      this.setInL1(key, l2Value);
+      return l2Value;
+    }
+
+    return null;
+  }
+
+  async set(key: string, value: T): Promise<void> {
+    // Set in all layers
+    this.setInL1(key, value);
+    await this.setInL2(key, value);
+  }
+
+  async invalidate(key: string): Promise<void> {
+    this.l1Cache.delete(key);
+    await this.redis.del(key);
+  }
+
+  async invalidatePattern(pattern: string): Promise<void> {
+    // Clear L1 matching pattern
+    for (const key of this.l1Cache.keys()) {
+      if (this.matchesPattern(key, pattern)) {
+        this.l1Cache.delete(key);
+      }
+    }
+
+    // Clear L2 using SCAN (avoid KEYS in production)
+    let cursor = '0';
+    do {
+      const result = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+      cursor = result[0];
+      const keys = result[1];
+      
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
+    } while (cursor !== '0');
+  }
+
+  private getFromL1(key: string): T | null {
+    const entry = this.l1Cache.get(key);
+    if (!entry) return null;
+    
+    if (entry.expiresAt < Date.now()) {
+      this.l1Cache.delete(key);
+      return null;
+    }
+    
+    return entry.value;
+  }
+
+  private setInL1(key: string, value: T): void {
+    // Evict if at capacity (simple LRU approximation)
+    if (this.l1Cache.size >= this.maxL1Size) {
+      const oldestKey = this.l1Cache.keys().next().value;
+      if (oldestKey) this.l1Cache.delete(oldestKey);
+    }
+
+    this.l1Cache.set(key, {
+      value,
+      expiresAt: Date.now() + this.l1TTL * 1000,
+    });
+  }
+
+  private async getFromL2(key: string): Promise<T | null> {
+    const data = await this.redis.get(key);
+    if (!data) return null;
+    return JSON.parse(data) as T;
+  }
+
+  private async setInL2(key: string, value: T): Promise<void> {
+    await this.redis.setex(key, this.l2TTL, JSON.stringify(value));
+  }
+
+  private matchesPattern(key: string, pattern: string): boolean {
+    const regex = new RegExp(pattern.replace(/\*/g, '.*'));
+    return regex.test(key);
+  }
+}
+
+// Read-Through cache
+class ReadThroughCache<T> {
+  private cache: MultiLevelCache<T>;
+
+  constructor(cache: MultiLevelCache<T>) {
+    this.cache = cache;
+  }
+
+  async get(
+    key: string,
+    loader: () => Promise<T>,
+    ttlOverride?: number
+  ): Promise<T> {
+    const cached = await this.cache.get(key);
+    if (cached !== null) return cached;
+
+    const fresh = await loader();
+    await this.cache.set(key, fresh);
+    return fresh;
+  }
+}
+
+// Write-Through cache
+class WriteThroughCache<T> {
+  private cache: MultiLevelCache<T>;
+
+  constructor(cache: MultiLevelCache<T>) {
+    this.cache = cache;
+  }
+
+  async set(
+    key: string,
+    value: T,
+    writer: (value: T) => Promise<void>
+  ): Promise<void> {
+    await writer(value);
+    await this.cache.set(key, value);
+  }
+}
+```
+
+---
+
+## 8. Message Queue Scaling (Kafka Partition Scaling)
+
+```typescript
+// kafka-scaling.ts
+// Kafka partition management สำหรับ scaling
+
+import { Kafka, Admin, Consumer, Producer } from 'kafkajs';
+
+class KafkaScalingManager {
+  private kafka: Kafka;
+  private admin: Admin;
+
+  constructor(brokers: string[]) {
+    this.kafka = new Kafka({
+      brokers,
+      retry: {
+        maxRetryTime: 30000,
+        initialRetryTime: 300,
+        retries: 10,
+      },
+    });
+    this.admin = this.kafka.admin();
+  }
+
+  async scalePartitions(
+    topic: string,
+    newPartitionCount: number
+  ): Promise<void> {
+    await this.admin.connect();
+
+    try {
+      const topics = await this.admin.fetchTopicMetadata({ topics: [topic] });
+      const currentPartitions = topics.topics[0].partitions.length;
+
+      if (newPartitionCount <= currentPartitions) {
+        throw new Error(
+          `Cannot decrease partitions. Current: ${currentPartitions}, Requested: ${newPartitionCount}`
+        );
+      }
+
+      console.log(`Scaling ${topic}: ${currentPartitions} -> ${newPartitionCount} partitions`);
+
+      await this.admin.createPartitions({
+        validateOnly: false,
+        timeout: 30000,
+        topicPartitions: [
+          {
+            topic,
+            count: newPartitionCount,
+          },
+        ],
+      });
+
+      console.log(`Successfully scaled ${topic} to ${newPartitionCount} partitions`);
+    } finally {
+      await this.admin.disconnect();
+    }
+  }
+
+  async getConsumerGroupLag(
+    groupId: string
+  ): Promise<Record<string, { partition: number; lag: bigint }[]>> {
+    await this.admin.connect();
+
+    try {
+      const offsets = await this.admin.fetchOffsets({
+        groupId,
+        topics: [],
+        resolveOffsets: false,
+      });
+
+      const topicLag: Record<string, { partition: number; lag: bigint }[]> = {};
+
+      for (const topicOffset of offsets) {
+        topicLag[topicOffset.topic] = topicOffset.partitions.map(p => ({
+          partition: p.partition,
+          lag: BigInt(0), // Simplified
+        }));
+      }
+
+      return topicLag;
+    } finally {
+      await this.admin.disconnect();
+    }
+  }
+
+  async rebalanceConsumerGroup(groupId: string): Promise<void> {
+    // Trigger rebalance by deleting group offsets for empty partitions
+    console.log(`Triggering rebalance for consumer group: ${groupId}`);
+  }
+}
+
+// High-performance Kafka consumer
+class ScalableKafkaConsumer {
+  private kafka: Kafka;
+  private consumers: Consumer[] = [];
+
+  constructor(brokers: string[]) {
+    this.kafka = new Kafka({ brokers });
+  }
+
+  async startConsumerPool(
+    groupId: string,
+    topics: string[],
+    concurrency: number,
+    handler: (message: any) => Promise<void>
+  ): Promise<void> {
+    // Create multiple consumer instances for parallelism
+    for (let i = 0; i < concurrency; i++) {
+      const consumer = this.kafka.consumer({
+        groupId: `${groupId}-${i}`,
+        maxInFlightRequests: 10,
+        sessionTimeout: 30000,
+        heartbeatInterval: 3000,
+        maxBytesPerPartition: 1048576, // 1MB
+        retry: {
+          maxRetryTime: 30000,
+          initialRetryTime: 300,
+          retries: 10,
+        },
+      });
+
+      await consumer.connect();
+      await consumer.subscribe({ topics, fromBeginning: false });
+
+      await consumer.run({
+        partitionsConsumedConcurrently: 4,
+        eachMessage: async ({ topic, partition, message }) => {
+          if (!message.value) return;
+
+          await handler({
+            topic,
+            partition,
+            key: message.key?.toString(),
+            value: JSON.parse(message.value.toString()),
+            timestamp: message.timestamp,
+            headers: message.headers,
+          });
+        },
+      });
+
+      this.consumers.push(consumer);
+    }
+
+    console.log(`Started ${concurrency} consumers for groups ${groupId}-*`);
+  }
+
+  async stop(): Promise<void> {
+    await Promise.all(this.consumers.map(c => c.disconnect()));
+  }
+}
+```
+
+---
+
+## 9. Auto-scaling Triggers and Policies
+
+```yaml
+# vpa-config.yaml
+# Vertical Pod Autoscaler
+
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: order-service-vpa
+  namespace: microservices
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  
+  updatePolicy:
+    updateMode: Auto  # จะ restart pods เพื่อ apply
+  
+  resourcePolicy:
+    containerPolicies:
+      - containerName: order-service
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: 4000m
+          memory: 4Gi
+        controlledResources: ["cpu", "memory"]
+        controlledValues: RequestsAndLimits
+---
+# Cluster Autoscaler
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    balance-similar-node-groups: true
+    skip-nodes-with-system-pods: false
+    skip-nodes-with-local-storage: false
+    scale-down-utilization-threshold: 0.5
+    scale-down-delay-after-add: 10m
+    scale-down-delay-after-delete: 1m
+    scale-down-delay-after-failure: 3m
+    scale-down-unneeded-time: 10m
+    max-graceful-termination-sec: 600
+    node-group-auto-discovery: |
+      asg:tag=k8s.io/cluster-autoscaler/enabled,
+           k8s.io/cluster-autoscaler/production-cluster
+```
+
+```typescript
+// custom-autoscaler.ts
+// Custom autoscaling logic
+
+interface AutoScalerPolicy {
+  name: string;
+  namespace: string;
+  deployment: string;
+  metrics: ScalingMetric[];
+  minReplicas: number;
+  maxReplicas: number;
+  cooldownSeconds: number;
+}
+
+interface ScalingMetric {
+  name: string;
+  type: 'up' | 'down' | 'both';
+  source: 'prometheus' | 'kafka' | 'custom';
+  query: string;
+  targetValue: number;
+  weight: number;
+}
+
+class CustomAutoScaler {
+  private lastScaleTime: Map<string, number> = new Map();
+
+  async reconcile(policy: AutoScalerPolicy): Promise<void> {
+    const now = Date.now();
+    const lastScale = this.lastScaleTime.get(policy.name) || 0;
+
+    if (now - lastScale < policy.cooldownSeconds * 1000) {
+      console.log(`Cooldown active for ${policy.name}`);
+      return;
+    }
+
+    const currentReplicas = await this.getCurrentReplicas(
+      policy.deployment,
+      policy.namespace
+    );
+
+    const desiredReplicas = await this.calculateDesiredReplicas(
+      policy,
+      currentReplicas
+    );
+
+    if (desiredReplicas !== currentReplicas) {
+      console.log(
+        `Scaling ${policy.deployment}: ${currentReplicas} -> ${desiredReplicas}`
+      );
+      await this.scale(policy.deployment, policy.namespace, desiredReplicas);
+      this.lastScaleTime.set(policy.name, now);
+    }
+  }
+
+  private async calculateDesiredReplicas(
+    policy: AutoScalerPolicy,
+    currentReplicas: number
+  ): Promise<number> {
+    let totalScore = 0;
+    let totalWeight = 0;
+
+    for (const metric of policy.metrics) {
+      const value = await this.fetchMetric(metric);
+      const ratio = value / metric.targetValue;
+      totalScore += ratio * metric.weight;
+      totalWeight += metric.weight;
+    }
+
+    const overallRatio = totalScore / totalWeight;
+    
+    let desiredReplicas = Math.ceil(currentReplicas * overallRatio);
+    desiredReplicas = Math.max(policy.minReplicas, desiredReplicas);
+    desiredReplicas = Math.min(policy.maxReplicas, desiredReplicas);
+
+    return desiredReplicas;
+  }
+
+  private async fetchMetric(metric: ScalingMetric): Promise<number> {
+    if (metric.source === 'prometheus') {
+      const response = await fetch(
+        `http://prometheus:9090/api/v1/query?query=${encodeURIComponent(metric.query)}`
+      );
+      const data = await response.json() as {
+        data: { result: [{ value: [number, string] }] }
+      };
+      return parseFloat(data.data.result[0]?.value[1] || '0');
+    }
+    return 0;
+  }
+
+  private async getCurrentReplicas(deployment: string, namespace: string): Promise<number> {
+    return 3; // Would use Kubernetes API
+  }
+
+  private async scale(deployment: string, namespace: string, replicas: number): Promise<void> {
+    // Would use Kubernetes API: kubectl scale
+    console.log(`Scaled ${deployment} to ${replicas}`);
+  }
+}
+```
+
+---
+
+## 10. Load Testing and Capacity Modeling
+
+```typescript
+// capacity-modeling.ts
+// Load testing analysis และ capacity modeling
+
+interface LoadTestResult {
+  scenario: string;
+  duration: number;
+  virtualUsers: number;
+  totalRequests: number;
+  successRate: number;
+  throughput: number; // RPS
+  latencies: {
+    p50: number;
+    p75: number;
+    p90: number;
+    p95: number;
+    p99: number;
+    max: number;
+  };
+  errorRate: number;
+  resourceUsage: {
+    cpu: number;
+    memory: number;
+    networkIn: number;
+    networkOut: number;
+  };
+}
+
+class CapacityModel {
+  calculateMaxCapacity(
+    results: LoadTestResult[],
+    sloLatency: number,
+    sloErrorRate: number
+  ): {
+    maxThroughput: number;
+    maxVirtualUsers: number;
+    bottleneck: string;
+    recommendations: string[];
+  } {
+    // Find last point within SLO
+    const withinSLO = results.filter(
+      r => r.latencies.p95 <= sloLatency && r.errorRate <= sloErrorRate
+    );
+
+    if (withinSLO.length === 0) {
+      return {
+        maxThroughput: 0,
+        maxVirtualUsers: 0,
+        bottleneck: 'System cannot meet SLO at any load',
+        recommendations: ['Investigate baseline performance'],
+      };
+    }
+
+    const maxPoint = withinSLO[withinSLO.length - 1];
+    const bottleneckPoint = results.find(
+      r => r.latencies.p95 > sloLatency || r.errorRate > sloErrorRate
+    );
+
+    const bottleneck = this.identifyBottleneck(
+      maxPoint,
+      bottleneckPoint,
+      results
+    );
+
+    return {
+      maxThroughput: maxPoint.throughput,
+      maxVirtualUsers: maxPoint.virtualUsers,
+      bottleneck: bottleneck.area,
+      recommendations: bottleneck.recommendations,
+    };
+  }
+
+  private identifyBottleneck(
+    lastGoodPoint: LoadTestResult,
+    firstBadPoint: LoadTestResult | undefined,
+    allResults: LoadTestResult[]
+  ): { area: string; recommendations: string[] } {
+    if (!firstBadPoint) {
+      return {
+        area: 'No bottleneck identified',
+        recommendations: ['Continue increasing load to find limits'],
+      };
+    }
+
+    const cpuJump = firstBadPoint.resourceUsage.cpu - lastGoodPoint.resourceUsage.cpu;
+    const memJump = firstBadPoint.resourceUsage.memory - lastGoodPoint.resourceUsage.memory;
+    const latencyJump = firstBadPoint.latencies.p95 - lastGoodPoint.latencies.p95;
+
+    if (firstBadPoint.errorRate > 0.05 && cpuJump < 10) {
+      return {
+        area: 'Database/downstream service saturation',
+        recommendations: [
+          'Add database connection pool capacity',
+          'Scale database with read replicas',
+          'Implement caching layer',
+          'Check downstream service limits',
+        ],
+      };
+    }
+
+    if (firstBadPoint.resourceUsage.cpu > 80) {
+      return {
+        area: 'CPU saturation',
+        recommendations: [
+          'Scale horizontally (add replicas)',
+          'Profile CPU-intensive code paths',
+          'Implement caching to reduce computation',
+          'Consider vertical scaling (larger instances)',
+        ],
+      };
+    }
+
+    if (firstBadPoint.resourceUsage.memory > 85) {
+      return {
+        area: 'Memory pressure',
+        recommendations: [
+          'Investigate memory leaks',
+          'Increase memory limits',
+          'Implement memory-efficient data structures',
+          'Enable garbage collection optimization',
+        ],
+      };
+    }
+
+    if (latencyJump > 200) {
+      return {
+        area: 'Latency degradation',
+        recommendations: [
+          'Check database query performance',
+          'Review slow external API calls',
+          'Implement circuit breakers',
+          'Add caching for hot paths',
+        ],
+      };
+    }
+
+    return {
+      area: 'Unknown bottleneck',
+      recommendations: ['Perform detailed profiling', 'Check application logs'],
+    };
+  }
+
+  projectCapacityNeeds(
+    currentThroughput: number,
+    growthRatePerMonth: number,
+    maxCapacity: number,
+    safetyMargin: number = 0.7
+  ): {
+    monthsUntilCapacityNeeded: number;
+    projectedThroughputByMonth: Record<number, number>;
+    scalingRecommendation: string;
+  } {
+    const projections: Record<number, number> = {};
+    let monthsNeeded = 0;
+
+    for (let month = 1; month <= 24; month++) {
+      const projected = currentThroughput * Math.pow(1 + growthRatePerMonth, month);
+      projections[month] = Math.round(projected);
+
+      if (projected > maxCapacity * safetyMargin && monthsNeeded === 0) {
+        monthsNeeded = month;
+      }
+    }
+
+    const recommendation = monthsNeeded === 0
+      ? 'No scaling needed within 24 months'
+      : `Plan scaling capacity by month ${monthsNeeded} (${projections[monthsNeeded]} RPS)`;
+
+    return {
+      monthsUntilCapacityNeeded: monthsNeeded,
+      projectedThroughputByMonth: projections,
+      scalingRecommendation: recommendation,
+    };
+  }
+}
+```
+
+---
+
+## สรุปตาราง Scalability Patterns
+
+| Pattern | Scalability Type | Complexity | Use Case |
+|---------|-----------------|-----------|---------|
+| Horizontal Scaling | สูง | ต่ำ | Stateless services |
+| Read Replicas | Read สูง | ปานกลาง | Read-heavy workloads |
+| Connection Pooling | Connection สูง | ต่ำ | Database bottleneck |
+| CQRS | Read+Write แยก | สูง | Complex query requirements |
+| Event Sourcing | Audit + Scale | สูง | Compliance, scalable reads |
+| Caching (Multi-level) | สูงมาก | ปานกลาง | Read-heavy, repeated queries |
+| Kafka Partitioning | Message สูง | ปานกลาง | Event streaming |
+| HPA | Auto scaling | ต่ำ | Varying load |
+| KEDA | Event-driven scaling | ปานกลาง | Queue-based workloads |
+
+| Scaling Decision | When to Use | Expected Improvement |
+|-----------------|-------------|---------------------|
+| Scale out (more pods) | CPU/Memory > 70% | Linear with pods |
+| Add read replica | DB read load high | 2-3x read throughput |
+| Add cache layer | Same data queried repeatedly | 80-95% cache hit reduction |
+| Increase Kafka partitions | Consumer lag growing | Linear with partitions |
+| CQRS | Complex query patterns | 5-10x query performance |
+| Add PgBouncer | Too many DB connections | 10x connection capacity |
+
+---
+
+## สรุป
+
+Scalability Patterns ที่ครอบคลุม:
+
+1. **Horizontal Scaling** คือ default สำหรับ microservices - เพิ่ม replicas
+2. **Database Read Replicas** แยก read/write workload
+3. **Connection Pooling** ด้วย PgBouncer ลด connection overhead
+4. **CQRS** แยก read/write model สำหรับ complex queries
+5. **Event Sourcing** เป็น single source of truth ที่ scalable
+6. **Stateless Design** รับประกัน any instance สามารถ handle any request
+7. **Multi-level Caching** ลด latency และ database load
+8. **Kafka Partition Scaling** เพิ่ม throughput แบบ linear
+9. **Auto-scaling** ด้วย HPA และ KEDA ตาม business metrics
+10. **Load Testing + Capacity Modeling** วางแผน scaling ล่วงหน้า

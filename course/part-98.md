@@ -1,1459 +1,1663 @@
 # Part 98: Cost Optimization Strategies
 
-## กลยุทธ์การลดต้นทุน Cloud สำหรับ Microservices
+## บทนำ
 
-ในบทนี้เราจะเรียนรู้วิธีลดต้นทุน Cloud ในระบบ Microservices อย่างมีประสิทธิภาพ
-
----
-
-## 1. ภาพรวมต้นทุน Cloud สำหรับ Microservices
-
-```
-Cloud Cost Breakdown (ตัวอย่างระบบขนาดกลาง)
-═══════════════════════════════════════════
-
-Compute (Kubernetes Nodes): 45%
-├── On-demand Instances: 60%
-├── Spot/Preemptible: 30%
-└── Reserved Instances: 10%
-
-Storage: 20%
-├── Block Storage (PV): 40%
-├── Object Storage (S3): 35%
-└── Database Storage: 25%
-
-Database: 15%
-├── RDS/Cloud SQL: 60%
-├── ElastiCache/Memorystore: 30%
-└── Other: 10%
-
-Network: 12%
-├── Egress: 70%
-├── Load Balancer: 20%
-└── VPN/CDN: 10%
-
-Other Services: 8%
-```
+FinOps (Financial Operations) คือการนำ Financial Accountability มาใช้กับ Cloud Infrastructure Microservices สามารถ Scale ได้ง่าย แต่ถ้าไม่มีการ Monitor Cost อย่างระมัดระวัง ค่าใช้จ่ายอาจพุ่งสูงโดยไม่รู้ตัว บทนี้จะสอนการ Track, Analyze และ Optimize Cost ของ Microservices บน AWS
 
 ---
 
-## 2. Right-sizing Containers
-
-การ Right-sizing คือการกำหนด Resource Requests/Limits ให้เหมาะสม
-
-### VPA (Vertical Pod Autoscaler)
-
-```yaml
-# vpa/payment-service-vpa.yaml
-apiVersion: autoscaling.k8s.io/v1
-kind: VerticalPodAutoscaler
-metadata:
-  name: payment-service-vpa
-  namespace: production
-spec:
-  targetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: payment-service
-  updatePolicy:
-    updateMode: "Off"  # แนะนำค่า แต่ไม่ Update อัตโนมัติ
-  resourcePolicy:
-    containerPolicies:
-      - containerName: payment-service
-        minAllowed:
-          cpu: 50m
-          memory: 128Mi
-        maxAllowed:
-          cpu: 2000m
-          memory: 2Gi
-        controlledResources:
-          - cpu
-          - memory
-```
+## 1. TypeScript CostDashboard: AWS Cost Explorer
 
 ```typescript
-// cost-optimization/src/rightsizing.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { PrometheusService } from './prometheus.service';
+// services/finops/src/cost-dashboard.service.ts
+import {
+  CostExplorerClient,
+  GetCostAndUsageCommand,
+  GetCostForecastCommand,
+  GetDimensionValuesCommand,
+  Dimension,
+  Granularity,
+  GetRightsizingRecommendationCommand,
+  RightsizingType,
+} from '@aws-sdk/client-cost-explorer';
+import { Redis } from 'ioredis';
 
-export interface ResourceRecommendation {
-  serviceName: string;
-  namespace: string;
-  current: {
-    cpuRequest: string;
-    memoryRequest: string;
-    cpuLimit: string;
-    memoryLimit: string;
-  };
-  recommended: {
-    cpuRequest: string;
-    memoryRequest: string;
-    cpuLimit: string;
-    memoryLimit: string;
-  };
-  potentialSavings: {
-    cpu: number;
-    memory: number;
-    estimatedMonthlySaving: number;
+interface CostBreakdown {
+  service: string;
+  amount: number;
+  currency: string;
+  unit: string;
+  changePercent: number;
+}
+
+interface MonthlyCostReport {
+  month: string;
+  totalCost: number;
+  currency: string;
+  byService: CostBreakdown[];
+  byTag: Record<string, number>;
+  forecast: {
+    estimatedMonthEnd: number;
+    lowerBound: number;
+    upperBound: number;
   };
 }
 
-@Injectable()
-export class RightSizingService {
-  private readonly logger = new Logger(RightSizingService.name);
-  
-  // Cost per unit (USD/month)
-  private readonly CPU_COST_PER_CORE = 30;  // $30/core/month
-  private readonly MEMORY_COST_PER_GB = 5;  // $5/GB/month
+interface ServiceCostTrend {
+  dates: string[];
+  costs: number[];
+  avgDailyCost: number;
+  peakDay: string;
+  peakCost: number;
+}
 
-  constructor(private readonly prometheusService: PrometheusService) {}
+export class CostDashboardService {
+  private costExplorer: CostExplorerClient;
+  private redis: Redis;
+  private readonly CACHE_TTL = 3600; // 1 hour
 
-  async analyzeService(
-    serviceName: string,
-    namespace: string,
-    days: number = 14,
-  ): Promise<ResourceRecommendation> {
-    // ดึงข้อมูลการใช้งานจาก Prometheus
-    const [cpuUsage, memoryUsage, currentResources] = await Promise.all([
-      this.getCPUUsagePercentiles(serviceName, namespace, days),
-      this.getMemoryUsagePercentiles(serviceName, namespace, days),
-      this.getCurrentResources(serviceName, namespace),
-    ]);
-
-    // คำนวณ Recommendations
-    const recommendedCPURequest = this.calculateCPURequest(cpuUsage);
-    const recommendedCPULimit = this.calculateCPULimit(cpuUsage);
-    const recommendedMemRequest = this.calculateMemoryRequest(memoryUsage);
-    const recommendedMemLimit = this.calculateMemoryLimit(memoryUsage);
-
-    // คำนวณการประหยัด
-    const currentCPU = this.parseCPU(currentResources.cpuRequest);
-    const recommendedCPU = this.parseCPU(recommendedCPURequest);
-    const cpuSaving = Math.max(0, currentCPU - recommendedCPU);
-
-    const currentMem = this.parseMemory(currentResources.memoryRequest);
-    const recommendedMem = this.parseMemory(recommendedMemRequest);
-    const memSaving = Math.max(0, currentMem - recommendedMem);
-
-    const estimatedMonthlySaving = 
-      (cpuSaving * this.CPU_COST_PER_CORE) +
-      (memSaving / 1024 * this.MEMORY_COST_PER_GB);
-
-    return {
-      serviceName,
-      namespace,
-      current: currentResources,
-      recommended: {
-        cpuRequest: recommendedCPURequest,
-        memoryRequest: recommendedMemRequest,
-        cpuLimit: recommendedCPULimit,
-        memoryLimit: recommendedMemLimit,
-      },
-      potentialSavings: {
-        cpu: cpuSaving,
-        memory: memSaving,
-        estimatedMonthlySaving,
-      },
-    };
+  constructor() {
+    this.costExplorer = new CostExplorerClient({
+      region: 'us-east-1', // Cost Explorer is global, us-east-1
+    });
+    this.redis = new Redis({ host: process.env.REDIS_HOST });
   }
 
-  private async getCPUUsagePercentiles(
-    serviceName: string,
-    namespace: string,
-    days: number,
-  ): Promise<{ p50: number; p90: number; p99: number; max: number }> {
-    const range = `${days * 24}h`;
-    
-    const queries = {
-      p50: `quantile_over_time(0.50, rate(container_cpu_usage_seconds_total{namespace="${namespace}", pod=~"${serviceName}-.*"}[5m])[${range}:5m])`,
-      p90: `quantile_over_time(0.90, rate(container_cpu_usage_seconds_total{namespace="${namespace}", pod=~"${serviceName}-.*"}[5m])[${range}:5m])`,
-      p99: `quantile_over_time(0.99, rate(container_cpu_usage_seconds_total{namespace="${namespace}", pod=~"${serviceName}-.*"}[5m])[${range}:5m])`,
-      max: `max_over_time(rate(container_cpu_usage_seconds_total{namespace="${namespace}", pod=~"${serviceName}-.*"}[5m])[${range}:5m])`,
+  async getMonthlyCostReport(month?: string): Promise<MonthlyCostReport> {
+    const targetMonth = month || this.getCurrentMonth();
+    const cacheKey = `cost:monthly:${targetMonth}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const [startDate, endDate] = this.getMonthRange(targetMonth);
+
+    // Get cost by service
+    const costByServiceCmd = new GetCostAndUsageCommand({
+      TimePeriod: { Start: startDate, End: endDate },
+      Granularity: 'MONTHLY' as Granularity,
+      Metrics: ['BlendedCost', 'UnblendedCost', 'UsageQuantity'],
+      GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' as Dimension }],
+    });
+
+    const serviceResponse = await this.costExplorer.send(costByServiceCmd);
+    const resultByTime = serviceResponse.ResultsByTime?.[0];
+
+    const byService: CostBreakdown[] = (resultByTime?.Groups || []).map(group => ({
+      service: group.Keys?.[0] || 'Unknown',
+      amount: parseFloat(group.Metrics?.BlendedCost?.Amount || '0'),
+      currency: group.Metrics?.BlendedCost?.Unit || 'USD',
+      unit: group.Metrics?.UsageQuantity?.Unit || '',
+      changePercent: 0, // Calculate separately
+    }));
+
+    const totalCost = byService.reduce((sum, s) => sum + s.amount, 0);
+
+    // Get cost by tag (service name tag)
+    const costByTagCmd = new GetCostAndUsageCommand({
+      TimePeriod: { Start: startDate, End: endDate },
+      Granularity: 'MONTHLY' as Granularity,
+      Metrics: ['BlendedCost'],
+      GroupBy: [{ Type: 'TAG', Key: 'service' }],
+      Filter: {
+        Tags: {
+          Key: 'environment',
+          Values: ['production'],
+        },
+      },
+    });
+
+    const tagResponse = await this.costExplorer.send(costByTagCmd);
+    const byTag: Record<string, number> = {};
+    for (const group of tagResponse.ResultsByTime?.[0]?.Groups || []) {
+      const tagValue = group.Keys?.[0]?.split('$')[1] || 'untagged';
+      byTag[tagValue] = parseFloat(group.Metrics?.BlendedCost?.Amount || '0');
+    }
+
+    // Get forecast
+    const forecastCmd = new GetCostForecastCommand({
+      TimePeriod: {
+        Start: new Date().toISOString().split('T')[0],
+        End: this.getMonthEnd(targetMonth),
+      },
+      Metric: 'BLENDED_COST',
+      Granularity: 'MONTHLY' as Granularity,
+    });
+
+    let forecast = { estimatedMonthEnd: totalCost, lowerBound: totalCost * 0.9, upperBound: totalCost * 1.1 };
+    try {
+      const forecastResponse = await this.costExplorer.send(forecastCmd);
+      const total = forecastResponse.Total;
+      forecast = {
+        estimatedMonthEnd: parseFloat(total?.Amount || '0'),
+        lowerBound: parseFloat(forecastResponse.ForecastResultsByTime?.[0]?.PredictionIntervalLowerBound || '0'),
+        upperBound: parseFloat(forecastResponse.ForecastResultsByTime?.[0]?.PredictionIntervalUpperBound || '0'),
+      };
+    } catch (err) {
+      console.warn('Could not get forecast:', err);
+    }
+
+    const report: MonthlyCostReport = {
+      month: targetMonth,
+      totalCost: Math.round(totalCost * 100) / 100,
+      currency: 'USD',
+      byService: byService.sort((a, b) => b.amount - a.amount).slice(0, 20),
+      byTag,
+      forecast,
     };
 
-    const results = await Promise.all(
-      Object.entries(queries).map(([key, query]) =>
-        this.prometheusService.query(query).then(r => [key, r])
-      )
+    await this.redis.setex(cacheKey, this.CACHE_TTL, JSON.stringify(report));
+    return report;
+  }
+
+  async getServiceCostTrend(
+    serviceName: string,
+    days: number = 30
+  ): Promise<ServiceCostTrend> {
+    const endDate = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+
+    const command = new GetCostAndUsageCommand({
+      TimePeriod: { Start: startDate, End: endDate },
+      Granularity: 'DAILY' as Granularity,
+      Metrics: ['BlendedCost'],
+      Filter: {
+        Tags: {
+          Key: 'service',
+          Values: [serviceName],
+        },
+      },
+    });
+
+    const response = await this.costExplorer.send(command);
+    const results = response.ResultsByTime || [];
+
+    const dates = results.map(r => r.TimePeriod?.Start || '');
+    const costs = results.map(r =>
+      parseFloat(r.Total?.BlendedCost?.Amount || '0')
     );
 
-    return Object.fromEntries(results) as any;
-  }
+    const avgDailyCost = costs.reduce((a, b) => a + b, 0) / costs.length;
+    const peakIndex = costs.indexOf(Math.max(...costs));
 
-  private async getMemoryUsagePercentiles(
-    serviceName: string,
-    namespace: string,
-    days: number,
-  ): Promise<{ p50: number; p90: number; p99: number; max: number }> {
-    const range = `${days * 24}h`;
-    
-    const query = `quantile_over_time(0.99, container_memory_working_set_bytes{namespace="${namespace}", pod=~"${serviceName}-.*"}[${range}:5m])`;
-    const p99 = await this.prometheusService.query(query);
-    
-    return { p50: p99 * 0.7, p90: p99 * 0.9, p99, max: p99 * 1.1 };
-  }
-
-  private calculateCPURequest(usage: { p50: number; p90: number }): string {
-    // Request = P90 + 20% buffer
-    const recommended = usage.p90 * 1.2;
-    return `${Math.ceil(recommended * 1000)}m`;
-  }
-
-  private calculateCPULimit(usage: { max: number }): string {
-    // Limit = Max * 2
-    const recommended = usage.max * 2;
-    return `${Math.ceil(recommended * 1000)}m`;
-  }
-
-  private calculateMemoryRequest(usage: { p90: number }): string {
-    const recommended = usage.p90 * 1.25;
-    return `${Math.ceil(recommended / (1024 * 1024))}Mi`;
-  }
-
-  private calculateMemoryLimit(usage: { max: number }): string {
-    const recommended = usage.max * 1.5;
-    return `${Math.ceil(recommended / (1024 * 1024))}Mi`;
-  }
-
-  private async getCurrentResources(serviceName: string, namespace: string): Promise<any> {
-    // ดึงจาก Kubernetes API
     return {
-      cpuRequest: '500m',
-      memoryRequest: '512Mi',
-      cpuLimit: '1000m',
-      memoryLimit: '1Gi',
+      dates,
+      costs,
+      avgDailyCost: Math.round(avgDailyCost * 100) / 100,
+      peakDay: dates[peakIndex] || '',
+      peakCost: costs[peakIndex] || 0,
     };
+  }
+
+  async getRightsizingRecommendations(): Promise<Array<{
+    instanceId: string;
+    currentType: string;
+    recommendedType: string;
+    estimatedMonthlySavings: number;
+    cpuUtilization: number;
+    memoryUtilization: number;
+  }>> {
+    const command = new GetRightsizingRecommendationCommand({
+      Service: 'AmazonEC2',
+      Configuration: {
+        BenefitsConsidered: true,
+        RecommendationTarget: 'CROSS_INSTANCE_FAMILY' as RightsizingType,
+      },
+      PageSize: 100,
+    });
+
+    const response = await this.costExplorer.send(command);
+
+    return (response.RightsizingRecommendations || []).map(rec => ({
+      instanceId: rec.CurrentInstance?.ResourceId || '',
+      currentType: rec.CurrentInstance?.ResourceDetails?.EC2ResourceDetails?.InstanceType || '',
+      recommendedType: rec.ModifyRecommendationDetail?.TargetInstances?.[0]?.ResourceDetails?.EC2ResourceDetails?.InstanceType || '',
+      estimatedMonthlySavings: parseFloat(
+        rec.ModifyRecommendationDetail?.TargetInstances?.[0]?.EstimatedMonthlySavings?.Value || '0'
+      ),
+      cpuUtilization: parseFloat(
+        rec.CurrentInstance?.ResourceUtilization?.EC2ResourceUtilization?.MaxCpuUtilizationPercentage || '0'
+      ),
+      memoryUtilization: parseFloat(
+        rec.CurrentInstance?.ResourceUtilization?.EC2ResourceUtilization?.MaxMemoryUtilizationPercentage || '0'
+      ),
+    }));
+  }
+
+  private getCurrentMonth(): string {
+    return new Date().toISOString().substring(0, 7);
+  }
+
+  private getMonthRange(month: string): [string, string] {
+    const date = new Date(month + '-01');
+    const startDate = date.toISOString().split('T')[0];
+    const endDate = new Date(date.getFullYear(), date.getMonth() + 1, 1)
+      .toISOString()
+      .split('T')[0];
+    return [startDate, endDate];
+  }
+
+  private getMonthEnd(month: string): string {
+    const date = new Date(month + '-01');
+    return new Date(date.getFullYear(), date.getMonth() + 1, 1)
+      .toISOString()
+      .split('T')[0];
+  }
+}
+```
+
+---
+
+## 2. Container Right-Sizing Analyzer
+
+```typescript
+// services/finops/src/container-rightsizing.ts
+import {
+  CloudWatchClient,
+  GetMetricStatisticsCommand,
+  Statistic,
+} from '@aws-sdk/client-cloudwatch';
+import { KubeConfig, CoreV1Api } from '@kubernetes/client-node';
+
+interface ContainerMetrics {
+  podName: string;
+  containerName: string;
+  namespace: string;
+  requests: { cpu: string; memory: string };
+  limits: { cpu: string; memory: string };
+  actual: {
+    avgCpuPercent: number;
+    maxCpuPercent: number;
+    avgMemoryMB: number;
+    maxMemoryMB: number;
+  };
+  recommendations: {
+    cpuRequest: string;
+    memoryRequest: string;
+    wastedCpu: number;
+    wastedMemoryMB: number;
+    estimatedMonthlySavings: number;
+  };
+}
+
+export class ContainerRightsizingAnalyzer {
+  private k8sApi: CoreV1Api;
+  private cloudWatch: CloudWatchClient;
+
+  // Cost per vCPU-hour and GB-hour (EKS Fargate pricing)
+  private readonly CPU_COST_PER_VCPU_HOUR = 0.04048;
+  private readonly MEMORY_COST_PER_GB_HOUR = 0.004445;
+
+  constructor() {
+    const kc = new KubeConfig();
+    kc.loadFromDefault();
+    this.k8sApi = kc.makeApiClient(CoreV1Api);
+    this.cloudWatch = new CloudWatchClient({ region: process.env.AWS_REGION });
+  }
+
+  async analyzeNamespace(namespace: string): Promise<ContainerMetrics[]> {
+    const podsResponse = await this.k8sApi.listNamespacedPod(namespace);
+    const metrics: ContainerMetrics[] = [];
+
+    for (const pod of podsResponse.body.items) {
+      if (!pod.metadata?.name || !pod.spec?.containers) continue;
+
+      for (const container of pod.spec.containers) {
+        const containerMetrics = await this.analyzeContainer(
+          pod.metadata.name,
+          container.name,
+          namespace,
+          container.resources
+        );
+        if (containerMetrics) metrics.push(containerMetrics);
+      }
+    }
+
+    return metrics.sort((a, b) =>
+      b.recommendations.estimatedMonthlySavings - a.recommendations.estimatedMonthlySavings
+    );
+  }
+
+  private async analyzeContainer(
+    podName: string,
+    containerName: string,
+    namespace: string,
+    resources: any
+  ): Promise<ContainerMetrics | null> {
+    const requests = {
+      cpu: resources?.requests?.cpu || '100m',
+      memory: resources?.requests?.memory || '128Mi',
+    };
+    const limits = {
+      cpu: resources?.limits?.cpu || requests.cpu,
+      memory: resources?.limits?.memory || requests.memory,
+    };
+
+    // Get actual metrics from CloudWatch Container Insights
+    const endTime = new Date();
+    const startTime = new Date(endTime.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days
+
+    const [cpuMetrics, memoryMetrics] = await Promise.all([
+      this.getContainerMetric(namespace, podName, containerName, 'pod_cpu_utilized', startTime, endTime),
+      this.getContainerMetric(namespace, podName, containerName, 'pod_memory_utilized', startTime, endTime),
+    ]);
+
+    if (!cpuMetrics.length && !memoryMetrics.length) return null;
+
+    const requestedCpuMillis = this.parseCPU(requests.cpu);
+    const requestedMemoryMB = this.parseMemory(requests.memory);
+
+    const avgCpuMillis = cpuMetrics.reduce((a, b) => a + b, 0) / (cpuMetrics.length || 1);
+    const maxCpuMillis = Math.max(...cpuMetrics, 0);
+    const avgMemoryMB = memoryMetrics.reduce((a, b) => a + b, 0) / (memoryMetrics.length || 1);
+    const maxMemoryMB = Math.max(...memoryMetrics, 0);
+
+    // Recommend: 20% headroom above max usage
+    const recommendedCpuMillis = Math.ceil(maxCpuMillis * 1.2);
+    const recommendedMemoryMB = Math.ceil(maxMemoryMB * 1.2);
+
+    // Calculate wasted resources
+    const wastedCpuMillis = Math.max(0, requestedCpuMillis - recommendedCpuMillis);
+    const wastedMemoryMB = Math.max(0, requestedMemoryMB - recommendedMemoryMB);
+
+    // Estimate monthly savings (720 hours/month)
+    const hoursPerMonth = 720;
+    const savedCpuCost = (wastedCpuMillis / 1000) * this.CPU_COST_PER_VCPU_HOUR * hoursPerMonth;
+    const savedMemoryCost = (wastedMemoryMB / 1024) * this.MEMORY_COST_PER_GB_HOUR * hoursPerMonth;
+    const estimatedMonthlySavings = savedCpuCost + savedMemoryCost;
+
+    return {
+      podName,
+      containerName,
+      namespace,
+      requests,
+      limits,
+      actual: {
+        avgCpuPercent: Math.round((avgCpuMillis / requestedCpuMillis) * 100),
+        maxCpuPercent: Math.round((maxCpuMillis / requestedCpuMillis) * 100),
+        avgMemoryMB: Math.round(avgMemoryMB),
+        maxMemoryMB: Math.round(maxMemoryMB),
+      },
+      recommendations: {
+        cpuRequest: `${recommendedCpuMillis}m`,
+        memoryRequest: `${recommendedMemoryMB}Mi`,
+        wastedCpu: wastedCpuMillis,
+        wastedMemoryMB,
+        estimatedMonthlySavings: Math.round(estimatedMonthlySavings * 100) / 100,
+      },
+    };
+  }
+
+  private async getContainerMetric(
+    namespace: string,
+    podName: string,
+    containerName: string,
+    metricName: string,
+    startTime: Date,
+    endTime: Date
+  ): Promise<number[]> {
+    try {
+      const response = await this.cloudWatch.send(
+        new GetMetricStatisticsCommand({
+          Namespace: 'ContainerInsights',
+          MetricName: metricName,
+          Dimensions: [
+            { Name: 'Namespace', Value: namespace },
+            { Name: 'PodName', Value: podName },
+            { Name: 'ContainerName', Value: containerName },
+            { Name: 'ClusterName', Value: process.env.CLUSTER_NAME || 'my-cluster' },
+          ],
+          StartTime: startTime,
+          EndTime: endTime,
+          Period: 3600, // 1 hour intervals
+          Statistics: ['Average', 'Maximum'] as Statistic[],
+        })
+      );
+
+      return (response.Datapoints || []).map(dp => dp.Average || 0);
+    } catch {
+      return [];
+    }
   }
 
   private parseCPU(cpu: string): number {
-    if (cpu.endsWith('m')) return parseInt(cpu) / 1000;
-    return parseFloat(cpu);
+    if (cpu.endsWith('m')) return parseInt(cpu);
+    return parseFloat(cpu) * 1000;
   }
 
-  private parseMemory(mem: string): number {
-    if (mem.endsWith('Gi')) return parseFloat(mem) * 1024;
-    if (mem.endsWith('Mi')) return parseFloat(mem);
-    return parseFloat(mem) / (1024 * 1024);
+  private parseMemory(memory: string): number {
+    if (memory.endsWith('Mi')) return parseInt(memory);
+    if (memory.endsWith('Gi')) return parseInt(memory) * 1024;
+    if (memory.endsWith('Ki')) return parseInt(memory) / 1024;
+    return parseInt(memory) / (1024 * 1024);
+  }
+
+  generatePatchManifest(metrics: ContainerMetrics[]): string {
+    const patches = metrics
+      .filter(m => m.recommendations.estimatedMonthlySavings > 1)
+      .map(m => ({
+        op: 'replace',
+        path: `/spec/containers/${m.containerName}/resources/requests`,
+        value: {
+          cpu: m.recommendations.cpuRequest,
+          memory: m.recommendations.memoryRequest,
+        },
+      }));
+
+    return JSON.stringify(patches, null, 2);
   }
 }
 ```
 
 ---
 
-## 3. Spot/Preemptible Instance Strategies
-
-```yaml
-# k8s/spot-node-pool.yaml
-# AWS EKS Managed Node Group ด้วย Spot Instances
-apiVersion: eks.aws.crossplane.io/v1beta1
-kind: NodeGroup
-metadata:
-  name: spot-workers
-spec:
-  forProvider:
-    region: ap-southeast-1
-    clusterName: production-cluster
-    nodeGroupName: spot-workers
-    scalingConfig:
-      minSize: 3
-      desiredSize: 10
-      maxSize: 50
-    instanceTypes:
-      - m5.xlarge
-      - m5.2xlarge
-      - m4.xlarge
-      - m4.2xlarge
-      - r5.xlarge
-    capacityType: SPOT  # ใช้ Spot Instances
-    labels:
-      node-type: spot
-      workload: batch
-    taints:
-      - key: spot
-        value: "true"
-        effect: NoSchedule
----
-# workload-tolerations.yaml
-# Workloads ที่รองรับ Spot Instances
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: analytics-worker
-  namespace: production
-spec:
-  replicas: 5
-  selector:
-    matchLabels:
-      app: analytics-worker
-  template:
-    spec:
-      # รองรับ Spot Instance
-      tolerations:
-        - key: spot
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
-      nodeSelector:
-        node-type: spot
-      
-      # Graceful Termination สำหรับ Spot Interruption
-      terminationGracePeriodSeconds: 120
-      
-      containers:
-        - name: analytics-worker
-          image: your-registry/analytics-worker:1.0.0
-          resources:
-            requests:
-              cpu: 500m
-              memory: 1Gi
-          # Checkpoint สำหรับ Resume หลัง Interruption
-          env:
-            - name: CHECKPOINT_ENABLED
-              value: "true"
-            - name: CHECKPOINT_INTERVAL
-              value: "30"
----
-# spot-interruption-handler.yaml
-# ตรวจจับและ Handle Spot Interruption
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: spot-interruption-handler
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels:
-      app: spot-interruption-handler
-  template:
-    spec:
-      tolerations:
-        - key: node.kubernetes.io/unschedulable
-          effect: NoSchedule
-      containers:
-        - name: handler
-          image: pmoricz/aws-spot-termination-handler:latest
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-```
+## 3. Spot Instance Handler
 
 ```typescript
-// spot-handler/src/spot-termination.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
+// services/infra/src/spot-termination-handler.ts
+import axios from 'axios';
+import { createServer } from 'http';
 
-@Injectable()
-export class SpotTerminationHandlerService {
-  private readonly logger = new Logger(SpotTerminationHandlerService.name);
-  private readonly IMDS_ENDPOINT = 'http://169.254.169.254/latest';
+interface TerminationNotice {
+  action: string;
+  time: string;
+}
+
+type ShutdownCallback = () => Promise<void>;
+
+export class SpotTerminationHandler {
+  private callbacks: ShutdownCallback[] = [];
   private isTerminating = false;
+  private readonly METADATA_URL = 'http://169.254.169.254/latest/meta-data';
+  private readonly CHECK_INTERVAL_MS = 5000;
+  private checkTimer: NodeJS.Timeout | null = null;
 
-  async checkForTermination(): Promise<boolean> {
+  register(callback: ShutdownCallback): void {
+    this.callbacks.push(callback);
+  }
+
+  start(): void {
+    console.log('Spot termination handler started');
+
+    // Poll EC2 instance metadata for termination notice
+    this.checkTimer = setInterval(
+      () => this.checkForTerminationNotice(),
+      this.CHECK_INTERVAL_MS
+    );
+
+    // Handle Unix signals
+    process.on('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
+
+    // Handle uncaught exceptions
+    process.on('uncaughtException', async (err) => {
+      console.error('Uncaught exception:', err);
+      await this.gracefulShutdown('uncaughtException');
+    });
+
+    process.on('unhandledRejection', async (reason) => {
+      console.error('Unhandled rejection:', reason);
+      // Don't shut down for unhandled rejections unless critical
+    });
+  }
+
+  private async checkForTerminationNotice(): Promise<void> {
+    if (this.isTerminating) return;
+
     try {
-      const response = await firstValueFrom(
-        this.httpService.get(
-          `${this.IMDS_ENDPOINT}/meta-data/spot/termination-time`,
-        ),
+      const response = await axios.get(
+        `${this.METADATA_URL}/spot/termination-time`,
+        { timeout: 1000 }
       );
-      
+
       if (response.status === 200) {
-        this.logger.warn(`Spot termination scheduled at: ${response.data}`);
-        return true;
+        console.warn('Spot instance termination notice received!', response.data);
+        await this.gracefulShutdown('spot-termination');
       }
-      
-      return false;
-    } catch {
-      return false;
+    } catch (err: any) {
+      // 404 means no termination notice (normal)
+      if (err.response?.status !== 404) {
+        // Silently ignore connection errors (metadata not available in non-AWS envs)
+      }
     }
   }
 
-  async startMonitoring(): Promise<void> {
-    this.logger.log('Starting Spot termination monitoring');
-    
-    setInterval(async () => {
-      if (this.isTerminating) return;
-      
-      const isTerminating = await this.checkForTermination();
-      
-      if (isTerminating) {
-        this.isTerminating = true;
-        await this.handleTermination();
-      }
-    }, 5000); // ตรวจสอบทุก 5 วินาที
-  }
+  private async gracefulShutdown(reason: string): Promise<void> {
+    if (this.isTerminating) return;
+    this.isTerminating = true;
 
-  private async handleTermination(): Promise<void> {
-    this.logger.warn('Spot instance termination detected! Starting graceful shutdown...');
-    
-    // 1. หยุดรับ Request ใหม่
-    process.env.ACCEPTING_REQUESTS = 'false';
-    
-    // 2. รอ In-flight Requests ให้เสร็จ (สูงสุด 90 วินาที)
-    await this.waitForInflightRequests(90000);
-    
-    // 3. Save State/Checkpoint
-    await this.saveCheckpoint();
-    
-    // 4. ส่ง Signal ให้ Kubernetes Drain Node
-    process.kill(process.pid, 'SIGTERM');
-    
-    this.logger.log('Graceful shutdown completed');
-  }
+    console.log(`Graceful shutdown initiated. Reason: ${reason}`);
 
-  private async waitForInflightRequests(timeoutMs: number): Promise<void> {
-    const startTime = Date.now();
-    
-    while (Date.now() - startTime < timeoutMs) {
-      const inflightCount = parseInt(process.env.INFLIGHT_REQUESTS || '0');
-      if (inflightCount === 0) {
-        this.logger.log('All in-flight requests completed');
-        return;
-      }
-      
-      this.logger.log(`Waiting for ${inflightCount} in-flight requests...`);
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    if (this.checkTimer) {
+      clearInterval(this.checkTimer);
+      this.checkTimer = null;
     }
-    
-    this.logger.warn('Timeout waiting for in-flight requests');
+
+    // Execute all registered shutdown callbacks in sequence
+    for (const callback of this.callbacks) {
+      try {
+        console.log('Executing shutdown callback...');
+        await Promise.race([
+          callback(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Callback timeout')), 25000)
+          ),
+        ]);
+      } catch (err) {
+        console.error('Shutdown callback error:', err);
+      }
+    }
+
+    console.log('Graceful shutdown complete');
+    process.exit(0);
   }
 
-  private async saveCheckpoint(): Promise<void> {
-    // บันทึก State ไปยัง Redis หรือ S3
-    this.logger.log('Saving checkpoint...');
+  stop(): void {
+    if (this.checkTimer) {
+      clearInterval(this.checkTimer);
+    }
   }
+}
+
+// Example usage in a service
+export function setupGracefulShutdown(
+  server: ReturnType<typeof createServer>,
+  kafkaConsumer?: { disconnect: () => Promise<void> },
+  dbClient?: { $disconnect: () => Promise<void> }
+): SpotTerminationHandler {
+  const handler = new SpotTerminationHandler();
+
+  // Stop accepting new connections
+  handler.register(async () => {
+    console.log('Stopping HTTP server...');
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => err ? reject(err) : resolve());
+    });
+    console.log('HTTP server stopped');
+  });
+
+  // Flush Kafka messages
+  if (kafkaConsumer) {
+    handler.register(async () => {
+      console.log('Disconnecting Kafka consumer...');
+      await kafkaConsumer.disconnect();
+      console.log('Kafka consumer disconnected');
+    });
+  }
+
+  // Close database connections
+  if (dbClient) {
+    handler.register(async () => {
+      console.log('Closing database connections...');
+      await dbClient.$disconnect();
+      console.log('Database connections closed');
+    });
+  }
+
+  handler.start();
+  return handler;
 }
 ```
 
 ---
 
-## 4. Reserved Capacity Planning
+## 4. Reserved Capacity Calculator
 
 ```typescript
-// capacity-planning/src/capacity.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
+// services/finops/src/reserved-capacity-calculator.ts
 
-export interface CapacityRecommendation {
-  service: string;
-  currentCost: number;
-  onDemandCost: number;
-  reservedCost: number;
-  spotCost: number;
-  recommendedMix: {
-    onDemandPercent: number;
-    reservedPercent: number;
-    spotPercent: number;
-  };
-  estimatedSavings: number;
+interface InstanceOption {
+  instanceType: string;
+  region: string;
+  odPriceHourly: number;
+  ri1YearNoUpfrontHourly: number;
+  ri3YearNoUpfrontHourly: number;
+  ri1YearAllUpfront: number;
+  ri3YearAllUpfront: number;
 }
 
-@Injectable()
-export class CapacityPlanningService {
-  private readonly logger = new Logger(CapacityPlanningService.name);
+interface ROICalculation {
+  instanceType: string;
+  currentMonthlyCost: number;
+  ri1YearMonthlyCost: number;
+  ri3YearMonthlyCost: number;
+  savings1Year: { monthly: number; annual: number; percent: number };
+  savings3Year: { monthly: number; total: number; percent: number };
+  breakeven1Year: { months: number; date: string };
+  recommendation: 'on-demand' | 'ri-1-year' | 'ri-3-year';
+  paybackPeriod: number;
+}
 
-  // ราคา AWS ap-southeast-1 (USD/hour)
-  private readonly PRICES = {
-    'm5.xlarge': {
-      onDemand: 0.214,
-      reserved1yr: 0.136,  // Saving ~36%
-      reserved3yr: 0.086,  // Saving ~60%
-      spot: 0.064,          // Saving ~70%
-    },
-    'm5.2xlarge': {
-      onDemand: 0.428,
-      reserved1yr: 0.272,
-      reserved3yr: 0.172,
-      spot: 0.128,
-    },
-  };
+// Real AWS pricing for ap-southeast-1 (Singapore)
+const EC2_PRICING: Record<string, InstanceOption> = {
+  't3.micro': {
+    instanceType: 't3.micro',
+    region: 'ap-southeast-1',
+    odPriceHourly: 0.0116,
+    ri1YearNoUpfrontHourly: 0.007,
+    ri3YearNoUpfrontHourly: 0.0044,
+    ri1YearAllUpfront: 51,
+    ri3YearAllUpfront: 116,
+  },
+  't3.medium': {
+    instanceType: 't3.medium',
+    region: 'ap-southeast-1',
+    odPriceHourly: 0.0464,
+    ri1YearNoUpfrontHourly: 0.028,
+    ri3YearNoUpfrontHourly: 0.0176,
+    ri1YearAllUpfront: 204,
+    ri3YearAllUpfront: 463,
+  },
+  'm5.large': {
+    instanceType: 'm5.large',
+    region: 'ap-southeast-1',
+    odPriceHourly: 0.107,
+    ri1YearNoUpfrontHourly: 0.0642,
+    ri3YearNoUpfrontHourly: 0.0404,
+    ri1YearAllUpfront: 473,
+    ri3YearAllUpfront: 1064,
+  },
+  'm5.xlarge': {
+    instanceType: 'm5.xlarge',
+    region: 'ap-southeast-1',
+    odPriceHourly: 0.214,
+    ri1YearNoUpfrontHourly: 0.1284,
+    ri3YearNoUpfrontHourly: 0.0808,
+    ri1YearAllUpfront: 945,
+    ri3YearAllUpfront: 2127,
+  },
+  'r5.large': {
+    instanceType: 'r5.large',
+    region: 'ap-southeast-1',
+    odPriceHourly: 0.138,
+    ri1YearNoUpfrontHourly: 0.0828,
+    ri3YearNoUpfrontHourly: 0.0522,
+    ri1YearAllUpfront: 610,
+    ri3YearAllUpfront: 1371,
+  },
+};
 
-  @Cron('0 9 1 * *') // วันที่ 1 ของทุกเดือน 09:00
-  async generateCapacityReport(): Promise<void> {
-    this.logger.log('Generating monthly capacity planning report...');
-    
-    const recommendations = await this.analyzeWorkloads();
-    await this.sendReport(recommendations);
-  }
+export class ReservedCapacityCalculator {
+  calculateROI(
+    instanceType: string,
+    instanceCount: number = 1,
+    utilizationPercent: number = 100
+  ): ROICalculation {
+    const pricing = EC2_PRICING[instanceType];
+    if (!pricing) throw new Error(`Unknown instance type: ${instanceType}`);
 
-  async analyzeWorkloads(): Promise<CapacityRecommendation[]> {
-    const workloads = await this.getWorkloadProfiles();
-    const recommendations: CapacityRecommendation[] = [];
+    const hoursPerMonth = 720;
+    const adjustedHoursPerMonth = hoursPerMonth * (utilizationPercent / 100);
 
-    for (const workload of workloads) {
-      const recommendation = this.calculateOptimalMix(workload);
-      recommendations.push(recommendation);
+    // Current on-demand cost
+    const odMonthlyCost = pricing.odPriceHourly * adjustedHoursPerMonth * instanceCount;
+
+    // RI costs
+    const ri1YearMonthlyCost = pricing.ri1YearNoUpfrontHourly * adjustedHoursPerMonth * instanceCount;
+    const ri3YearMonthlyCost = pricing.ri3YearNoUpfrontHourly * adjustedHoursPerMonth * instanceCount;
+
+    // Savings
+    const savings1Year = {
+      monthly: odMonthlyCost - ri1YearMonthlyCost,
+      annual: (odMonthlyCost - ri1YearMonthlyCost) * 12,
+      percent: ((odMonthlyCost - ri1YearMonthlyCost) / odMonthlyCost) * 100,
+    };
+
+    const savings3Year = {
+      monthly: odMonthlyCost - ri3YearMonthlyCost,
+      total: (odMonthlyCost - ri3YearMonthlyCost) * 36,
+      percent: ((odMonthlyCost - ri3YearMonthlyCost) / odMonthlyCost) * 100,
+    };
+
+    // Breakeven for all-upfront 1-year RI
+    const upfrontCost1Year = pricing.ri1YearAllUpfront * instanceCount;
+    const monthlyODCost = pricing.odPriceHourly * hoursPerMonth * instanceCount;
+    const monthlyRI1Year = (pricing.ri1YearAllUpfront / 12) * instanceCount;
+    const monthlySavingsWithUpfront = monthlyODCost - monthlyRI1Year;
+    const breakevenMonths = upfrontCost1Year / monthlySavingsWithUpfront;
+
+    const breakevenDate = new Date();
+    breakevenDate.setMonth(breakevenDate.getMonth() + Math.ceil(breakevenMonths));
+
+    // Recommendation
+    let recommendation: ROICalculation['recommendation'] = 'on-demand';
+    if (utilizationPercent >= 60) {
+      if (savings3Year.percent >= 40) {
+        recommendation = 'ri-3-year';
+      } else {
+        recommendation = 'ri-1-year';
+      }
     }
-
-    return recommendations;
-  }
-
-  private calculateOptimalMix(workload: any): CapacityRecommendation {
-    const baselineInstances = workload.averageInstances;
-    const peakInstances = workload.peakInstances;
-    const instanceType = workload.instanceType;
-    const prices = this.PRICES[instanceType as keyof typeof this.PRICES];
-
-    // Strategy:
-    // - Baseline (สม่ำเสมอ): Reserved Instances
-    // - Peak (เป็นครั้งคราว): On-demand
-    // - Batch/Dev: Spot Instances
-
-    const reservedCount = Math.floor(baselineInstances * 0.7);
-    const onDemandCount = peakInstances - reservedCount;
-    const spotCount = Math.floor(workload.batchInstances * 0.8);
-
-    const monthlyHours = 730;
-
-    const currentCost = workload.totalInstances * prices.onDemand * monthlyHours;
-    const optimizedCost =
-      (reservedCount * prices.reserved1yr * monthlyHours) +
-      (onDemandCount * prices.onDemand * monthlyHours) +
-      (spotCount * prices.spot * monthlyHours);
-
-    const savings = currentCost - optimizedCost;
-    const savingsPercent = (savings / currentCost) * 100;
 
     return {
-      service: workload.name,
-      currentCost,
-      onDemandCost: currentCost,
-      reservedCost: reservedCount * prices.reserved1yr * monthlyHours,
-      spotCost: spotCount * prices.spot * monthlyHours,
-      recommendedMix: {
-        onDemandPercent: Math.round((onDemandCount / workload.totalInstances) * 100),
-        reservedPercent: Math.round((reservedCount / workload.totalInstances) * 100),
-        spotPercent: Math.round((spotCount / workload.totalInstances) * 100),
+      instanceType,
+      currentMonthlyCost: Math.round(odMonthlyCost * 100) / 100,
+      ri1YearMonthlyCost: Math.round(ri1YearMonthlyCost * 100) / 100,
+      ri3YearMonthlyCost: Math.round(ri3YearMonthlyCost * 100) / 100,
+      savings1Year: {
+        monthly: Math.round(savings1Year.monthly * 100) / 100,
+        annual: Math.round(savings1Year.annual * 100) / 100,
+        percent: Math.round(savings1Year.percent * 10) / 10,
       },
-      estimatedSavings: savings,
+      savings3Year: {
+        monthly: Math.round(savings3Year.monthly * 100) / 100,
+        total: Math.round(savings3Year.total * 100) / 100,
+        percent: Math.round(savings3Year.percent * 10) / 10,
+      },
+      breakeven1Year: {
+        months: Math.ceil(breakevenMonths),
+        date: breakevenDate.toISOString().split('T')[0],
+      },
+      recommendation,
+      paybackPeriod: Math.ceil(breakevenMonths),
     };
   }
 
-  private async getWorkloadProfiles(): Promise<any[]> {
-    return [
-      {
-        name: 'payment-service',
-        instanceType: 'm5.xlarge',
-        averageInstances: 5,
-        peakInstances: 10,
-        batchInstances: 0,
-        totalInstances: 10,
-      },
-      {
-        name: 'analytics-worker',
-        instanceType: 'm5.2xlarge',
-        averageInstances: 2,
-        peakInstances: 4,
-        batchInstances: 6,
-        totalInstances: 8,
-      },
-    ];
-  }
+  analyzeFleet(fleet: Array<{ instanceType: string; count: number; utilization: number }>): {
+    totalCurrentCost: number;
+    totalOptimizedCost: number;
+    totalSavings: number;
+    recommendations: ROICalculation[];
+  } {
+    const recommendations = fleet.map(({ instanceType, count, utilization }) =>
+      this.calculateROI(instanceType, count, utilization)
+    );
 
-  private async sendReport(recommendations: CapacityRecommendation[]): Promise<void> {
-    const totalCurrentCost = recommendations.reduce((sum, r) => sum + r.currentCost, 0);
-    const totalSavings = recommendations.reduce((sum, r) => sum + r.estimatedSavings, 0);
-    
-    this.logger.log(`
-Capacity Planning Report
-========================
-Total Current Monthly Cost: $${totalCurrentCost.toFixed(2)}
-Total Potential Savings: $${totalSavings.toFixed(2)} (${((totalSavings/totalCurrentCost)*100).toFixed(1)}%)
+    const totalCurrentCost = recommendations.reduce((sum, r) => sum + r.currentMonthlyCost, 0);
+    const totalOptimizedCost = recommendations.reduce((sum, r) => {
+      if (r.recommendation === 'ri-3-year') return sum + r.ri3YearMonthlyCost;
+      if (r.recommendation === 'ri-1-year') return sum + r.ri1YearMonthlyCost;
+      return sum + r.currentMonthlyCost;
+    }, 0);
 
-Recommendations:
-${recommendations.map(r => `
-  ${r.service}:
-    - Current: $${r.currentCost.toFixed(2)}/month
-    - Savings: $${r.estimatedSavings.toFixed(2)}/month
-    - Mix: ${r.recommendedMix.reservedPercent}% Reserved, ${r.recommendedMix.onDemandPercent}% On-demand, ${r.recommendedMix.spotPercent}% Spot
-`).join('')}
-`);
+    return {
+      totalCurrentCost: Math.round(totalCurrentCost * 100) / 100,
+      totalOptimizedCost: Math.round(totalOptimizedCost * 100) / 100,
+      totalSavings: Math.round((totalCurrentCost - totalOptimizedCost) * 100) / 100,
+      recommendations,
+    };
   }
 }
 ```
 
 ---
 
-## 5. Cost Attribution and Chargeback
-
-```yaml
-# cost-attribution/namespace-labels.yaml
-# Label Namespaces เพื่อ Track ต้นทุนตาม Team
-
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: team-payments
-  labels:
-    team: payments
-    cost-center: CC-001
-    environment: production
-    project: core-platform
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: team-logistics
-  labels:
-    team: logistics
-    cost-center: CC-002
-    environment: production
-    project: delivery-platform
-```
+## 5. Cost Attribution: Kubernetes Label-Based Cost Allocator
 
 ```typescript
-// cost-attribution/src/kubecost.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
-import { Cron } from '@nestjs/schedule';
+// services/finops/src/cost-allocator.ts
+import { KubeConfig, CoreV1Api, AppsV1Api } from '@kubernetes/client-node';
+import { CostExplorerClient, GetCostAndUsageCommand } from '@aws-sdk/client-cost-explorer';
 
-export interface TeamCostReport {
+interface ServiceCostAllocation {
   team: string;
-  costCenter: string;
-  period: string;
-  costs: {
+  service: string;
+  environment: string;
+  namespace: string;
+  allocatedCostUSD: number;
+  breakdown: {
     compute: number;
     memory: number;
     storage: number;
     network: number;
-    total: number;
   };
-  efficiency: {
-    cpuUtilization: number;
-    memoryUtilization: number;
-    idleCost: number;
+  podCount: number;
+  cpuRequested: number;
+  memoryRequestedGB: number;
+}
+
+export class KubernetesCostAllocator {
+  private k8sCore: CoreV1Api;
+  private k8sApps: AppsV1Api;
+  private costExplorer: CostExplorerClient;
+
+  // Cost per resource unit per hour (EKS Fargate)
+  private readonly COST_RATES = {
+    vcpuPerHour: 0.04048,
+    gbMemoryPerHour: 0.004445,
+    gbStoragePerMonth: 0.10,
+    gbNetworkPerMonth: 0.114,
   };
-  recommendations: string[];
-}
 
-@Injectable()
-export class KubecostService {
-  private readonly logger = new Logger(KubecostService.name);
-  private readonly kubecostUrl = process.env.KUBECOST_URL || 'http://kubecost:9090';
-
-  constructor(private readonly httpService: HttpService) {}
-
-  async getTeamCosts(team: string, window: string = '7d'): Promise<TeamCostReport> {
-    // เรียก Kubecost API
-    const response = await firstValueFrom(
-      this.httpService.get(`${this.kubecostUrl}/model/allocation`, {
-        params: {
-          window,
-          aggregate: 'label:team',
-          filter: `label[team]="${team}"`,
-          includeIdle: true,
-        },
-      }),
-    );
-
-    const data = response.data.data[0]?.[team];
-    if (!data) {
-      throw new Error(`No cost data found for team ${team}`);
-    }
-
-    const efficiency = await this.getEfficiencyMetrics(team, window);
-
-    return {
-      team,
-      costCenter: this.getCostCenter(team),
-      period: window,
-      costs: {
-        compute: data.cpuCost + data.ramCost,
-        memory: data.ramCost,
-        storage: data.pvCost + data.sharedCost,
-        network: data.networkCost,
-        total: data.totalCost,
-      },
-      efficiency: {
-        cpuUtilization: efficiency.cpuUtilization,
-        memoryUtilization: efficiency.memoryUtilization,
-        idleCost: data.idleCost || 0,
-      },
-      recommendations: this.generateRecommendations(data, efficiency),
-    };
+  constructor() {
+    const kc = new KubeConfig();
+    kc.loadFromDefault();
+    this.k8sCore = kc.makeApiClient(CoreV1Api);
+    this.k8sApps = kc.makeApiClient(AppsV1Api);
+    this.costExplorer = new CostExplorerClient({ region: 'us-east-1' });
   }
 
-  @Cron('0 8 * * 1') // ทุกวันจันทร์ 08:00
-  async generateWeeklyChargebackReport(): Promise<void> {
-    const teams = ['payments', 'logistics', 'analytics', 'platform'];
-    const reports: TeamCostReport[] = [];
+  async allocateCosts(namespace?: string): Promise<ServiceCostAllocation[]> {
+    // Get all pods
+    const podsResponse = namespace
+      ? await this.k8sCore.listNamespacedPod(namespace)
+      : await this.k8sCore.listPodForAllNamespaces();
 
-    for (const team of teams) {
-      const report = await this.getTeamCosts(team, '7d');
-      reports.push(report);
-      await this.sendChargebackEmail(report);
-    }
+    const pods = podsResponse.body.items;
+    const allocations = new Map<string, ServiceCostAllocation>();
 
-    // บันทึกรายงาน
-    await this.saveReport(reports);
+    for (const pod of pods) {
+      if (pod.status?.phase !== 'Running') continue;
 
-    const totalCost = reports.reduce((sum, r) => sum + r.costs.total, 0);
-    this.logger.log(`Weekly chargeback complete. Total: $${totalCost.toFixed(2)}`);
-  }
+      const labels = pod.metadata?.labels || {};
+      const team = labels['team'] || labels['app.kubernetes.io/part-of'] || 'unknown';
+      const service = labels['app'] || labels['app.kubernetes.io/name'] || 'unknown';
+      const environment = labels['environment'] || labels['env'] || 'unknown';
+      const podNamespace = pod.metadata?.namespace || 'default';
 
-  private async getEfficiencyMetrics(team: string, window: string): Promise<{
-    cpuUtilization: number;
-    memoryUtilization: number;
-  }> {
-    const response = await firstValueFrom(
-      this.httpService.get(`${this.kubecostUrl}/model/savings/requestSizingV2`, {
-        params: {
-          filter: `label[team]="${team}"`,
-          window,
-        },
-      }),
-    );
+      const allocationKey = `${team}:${service}:${environment}`;
 
-    const data = response.data;
-    return {
-      cpuUtilization: data?.recommendations?.[0]?.cpuUtilization || 0,
-      memoryUtilization: data?.recommendations?.[0]?.memoryUtilization || 0,
-    };
-  }
+      if (!allocations.has(allocationKey)) {
+        allocations.set(allocationKey, {
+          team,
+          service,
+          environment,
+          namespace: podNamespace,
+          allocatedCostUSD: 0,
+          breakdown: { compute: 0, memory: 0, storage: 0, network: 0 },
+          podCount: 0,
+          cpuRequested: 0,
+          memoryRequestedGB: 0,
+        });
+      }
 
-  private generateRecommendations(data: any, efficiency: any): string[] {
-    const recommendations: string[] = [];
+      const allocation = allocations.get(allocationKey)!;
+      allocation.podCount++;
 
-    if (efficiency.cpuUtilization < 30) {
-      recommendations.push(
-        `CPU utilization is only ${efficiency.cpuUtilization.toFixed(1)}%. ` +
-        `Consider reducing CPU requests to save $${(data.cpuCost * 0.4).toFixed(2)}/week.`
-      );
-    }
+      // Sum up resource requests
+      for (const container of pod.spec?.containers || []) {
+        const cpuRequest = this.parseCPU(container.resources?.requests?.cpu || '100m');
+        const memRequest = this.parseMemoryGB(container.resources?.requests?.memory || '128Mi');
 
-    if (efficiency.memoryUtilization < 40) {
-      recommendations.push(
-        `Memory utilization is only ${efficiency.memoryUtilization.toFixed(1)}%. ` +
-        `Reduce memory requests to save $${(data.ramCost * 0.3).toFixed(2)}/week.`
-      );
-    }
+        allocation.cpuRequested += cpuRequest;
+        allocation.memoryRequestedGB += memRequest;
 
-    if (data.idleCost > data.totalCost * 0.2) {
-      recommendations.push(
-        `High idle cost: $${data.idleCost.toFixed(2)}/week. ` +
-        `Consider scaling down during off-peak hours.`
-      );
-    }
+        // Calculate hourly cost
+        const hourlyComputeCost = (cpuRequest / 1000) * this.COST_RATES.vcpuPerHour;
+        const hourlyMemoryCost = memRequest * this.COST_RATES.gbMemoryPerHour;
 
-    return recommendations;
-  }
-
-  private getCostCenter(team: string): string {
-    const costCenters: Record<string, string> = {
-      payments: 'CC-001',
-      logistics: 'CC-002',
-      analytics: 'CC-003',
-      platform: 'CC-004',
-    };
-    return costCenters[team] || 'CC-000';
-  }
-
-  private async sendChargebackEmail(report: TeamCostReport): Promise<void> {
-    this.logger.log(`Sending chargeback report to team ${report.team}: $${report.costs.total.toFixed(2)}`);
-  }
-
-  private async saveReport(reports: TeamCostReport[]): Promise<void> {
-    this.logger.log(`Saving ${reports.length} team cost reports`);
-  }
-}
-```
-
----
-
-## 6. Database Cost Optimization
-
-```typescript
-// db-optimization/src/database-cost.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
-
-export interface DatabaseOptimizationReport {
-  unusedIndexes: string[];
-  largeTablesWithLowUsage: { table: string; sizeGb: number; readCount: number }[];
-  connectionPoolRecommendations: string[];
-  archiveSuggestions: { table: string; rowsOlderThan: string; estimatedSizeGb: number }[];
-}
-
-@Injectable()
-export class DatabaseCostOptimizationService {
-  private readonly logger = new Logger(DatabaseCostOptimizationService.name);
-
-  constructor(
-    @InjectDataSource() private readonly dataSource: DataSource,
-  ) {}
-
-  async analyzeDatabase(): Promise<DatabaseOptimizationReport> {
-    const [unusedIndexes, largeTables, archiveSuggestions] = await Promise.all([
-      this.findUnusedIndexes(),
-      this.findLargeUnderusedTables(),
-      this.findArchiveCandidates(),
-    ]);
-
-    return {
-      unusedIndexes,
-      largeTablesWithLowUsage: largeTables,
-      connectionPoolRecommendations: await this.analyzeConnectionPool(),
-      archiveSuggestions,
-    };
-  }
-
-  private async findUnusedIndexes(): Promise<string[]> {
-    const result = await this.dataSource.query(`
-      SELECT
-        schemaname || '.' || tablename || '.' || indexname AS index_name,
-        pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
-      FROM pg_stat_user_indexes
-      WHERE idx_scan = 0
-        AND indexrelname NOT LIKE 'pk_%'
-        AND indexrelname NOT LIKE '%_pkey'
-      ORDER BY pg_relation_size(indexrelid) DESC
-      LIMIT 20;
-    `);
-
-    return result.map((r: any) => `${r.index_name} (${r.index_size})`);
-  }
-
-  private async findLargeUnderusedTables(): Promise<
-    { table: string; sizeGb: number; readCount: number }[]
-  > {
-    const result = await this.dataSource.query(`
-      SELECT
-        schemaname || '.' || tablename AS table_name,
-        pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
-        ROUND(pg_total_relation_size(relid) / 1073741824.0, 2) AS size_gb,
-        seq_scan + idx_scan AS total_reads
-      FROM pg_stat_user_tables
-      WHERE pg_total_relation_size(relid) > 1073741824  -- > 1GB
-        AND seq_scan + idx_scan < 1000  -- น้อยกว่า 1000 reads
-      ORDER BY pg_total_relation_size(relid) DESC;
-    `);
-
-    return result.map((r: any) => ({
-      table: r.table_name,
-      sizeGb: r.size_gb,
-      readCount: r.total_reads,
-    }));
-  }
-
-  private async findArchiveCandidates(): Promise<
-    { table: string; rowsOlderThan: string; estimatedSizeGb: number }[]
-  > {
-    // ตรวจสอบตารางที่มีข้อมูลเก่าๆ ที่สามารถ Archive ได้
-    const tables = ['transactions', 'audit_logs', 'notifications', 'analytics_events'];
-    const candidates = [];
-
-    for (const table of tables) {
-      try {
-        const result = await this.dataSource.query(`
-          SELECT 
-            COUNT(*) as old_rows,
-            pg_size_pretty(COUNT(*) * (SELECT avg_width FROM pg_stats WHERE tablename = $1 LIMIT 1)) as estimated_size
-          FROM ${table}
-          WHERE created_at < NOW() - INTERVAL '1 year'
-        `, [table]);
-
-        if (parseInt(result[0]?.old_rows || '0') > 100000) {
-          candidates.push({
-            table,
-            rowsOlderThan: '1 year',
-            estimatedSizeGb: 0,
-          });
-        }
-      } catch {
-        // ตารางอาจไม่มี created_at column
+        // Monthly estimate (720 hours)
+        allocation.breakdown.compute += hourlyComputeCost * 720;
+        allocation.breakdown.memory += hourlyMemoryCost * 720;
       }
     }
 
-    return candidates;
+    // Calculate totals and add storage/network estimates
+    return Array.from(allocations.values()).map(allocation => {
+      // Add estimated storage (20GB per service average)
+      allocation.breakdown.storage = 20 * this.COST_RATES.gbStoragePerMonth;
+
+      // Add estimated network (10GB outbound per service average)
+      allocation.breakdown.network = 10 * this.COST_RATES.gbNetworkPerMonth;
+
+      allocation.allocatedCostUSD = Object.values(allocation.breakdown)
+        .reduce((a, b) => a + b, 0);
+
+      // Round values
+      allocation.allocatedCostUSD = Math.round(allocation.allocatedCostUSD * 100) / 100;
+      allocation.cpuRequested = Math.round(allocation.cpuRequested);
+      allocation.memoryRequestedGB = Math.round(allocation.memoryRequestedGB * 100) / 100;
+
+      return allocation;
+    }).sort((a, b) => b.allocatedCostUSD - a.allocatedCostUSD);
   }
 
-  private async analyzeConnectionPool(): Promise<string[]> {
-    const result = await this.dataSource.query(`
-      SELECT
-        max_conn,
-        used,
-        res_for_super,
-        max_conn - used - res_for_super AS free
-      FROM
-        (SELECT COUNT(*) used FROM pg_stat_activity) t1,
-        (SELECT setting::int res_for_super FROM pg_settings WHERE name=$$superuser_reserved_connections$$) t2,
-        (SELECT setting::int max_conn FROM pg_settings WHERE name=$$max_connections$$) t3;
-    `);
+  generateCostReport(allocations: ServiceCostAllocation[]): string {
+    const totalCost = allocations.reduce((sum, a) => sum + a.allocatedCostUSD, 0);
+    const byTeam = allocations.reduce((acc, a) => {
+      acc[a.team] = (acc[a.team] || 0) + a.allocatedCostUSD;
+      return acc;
+    }, {} as Record<string, number>);
 
-    const recommendations = [];
-    const { max_conn, used, free } = result[0];
-    const usagePercent = (used / max_conn) * 100;
+    let report = `# Cost Allocation Report\n`;
+    report += `Generated: ${new Date().toISOString()}\n\n`;
+    report += `## Total Monthly Cost: $${totalCost.toFixed(2)}\n\n`;
+    report += `## By Team\n`;
 
-    if (usagePercent > 80) {
-      recommendations.push(`High connection usage: ${usagePercent.toFixed(1)}%. Consider PgBouncer for connection pooling.`);
-    }
+    Object.entries(byTeam)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([team, cost]) => {
+        const percent = ((cost / totalCost) * 100).toFixed(1);
+        report += `- **${team}**: $${cost.toFixed(2)} (${percent}%)\n`;
+      });
 
-    if (max_conn > 200 && usagePercent < 30) {
-      recommendations.push(`max_connections=${max_conn} but only ${usagePercent.toFixed(1)}% used. Reduce max_connections to lower memory usage.`);
-    }
+    report += `\n## By Service\n`;
+    report += `| Team | Service | Environment | Monthly Cost | Pods | CPU (cores) | Memory (GB) |\n`;
+    report += `|------|---------|-------------|-------------|------|-------------|-------------|\n`;
 
-    return recommendations;
+    allocations.forEach(a => {
+      report += `| ${a.team} | ${a.service} | ${a.environment} | $${a.allocatedCostUSD} | ${a.podCount} | ${(a.cpuRequested / 1000).toFixed(2)} | ${a.memoryRequestedGB} |\n`;
+    });
+
+    return report;
   }
 
-  // Data Archiving Strategy
-  async archiveOldData(
-    table: string,
-    olderThanDays: number,
-    archiveBucket: string,
-  ): Promise<{ archivedRows: number; freedSpaceGb: number }> {
-    this.logger.log(`Starting archive of ${table} (older than ${olderThanDays} days)`);
-
-    const batchSize = 10000;
-    let totalArchived = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      // ดึงข้อมูลเก่า
-      const rows = await this.dataSource.query(`
-        SELECT * FROM ${table}
-        WHERE created_at < NOW() - INTERVAL '${olderThanDays} days'
-        ORDER BY created_at
-        LIMIT ${batchSize}
-      `);
-
-      if (rows.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      // บันทึกไปยัง S3
-      await this.uploadToS3(archiveBucket, `${table}/archive-${Date.now()}.json`, rows);
-
-      // ลบออกจาก Database
-      const ids = rows.map((r: any) => r.id);
-      await this.dataSource.query(
-        `DELETE FROM ${table} WHERE id = ANY($1)`,
-        [ids],
-      );
-
-      totalArchived += rows.length;
-      this.logger.log(`Archived ${totalArchived} rows from ${table}`);
-
-      if (rows.length < batchSize) {
-        hasMore = false;
-      }
-    }
-
-    // VACUUM เพื่อคืนพื้นที่
-    await this.dataSource.query(`VACUUM ANALYZE ${table}`);
-
-    this.logger.log(`Archive complete: ${totalArchived} rows archived from ${table}`);
-
-    return {
-      archivedRows: totalArchived,
-      freedSpaceGb: (totalArchived * 0.001) / 1024, // Estimate
-    };
+  private parseCPU(cpu: string): number {
+    if (cpu.endsWith('m')) return parseInt(cpu);
+    return parseFloat(cpu) * 1000;
   }
 
-  private async uploadToS3(bucket: string, key: string, data: any[]): Promise<void> {
-    // อัปโหลดไปยัง S3 สำหรับ Cold Storage
-    this.logger.debug(`Uploading ${data.length} records to s3://${bucket}/${key}`);
+  private parseMemoryGB(memory: string): number {
+    if (memory.endsWith('Gi')) return parseFloat(memory);
+    if (memory.endsWith('Mi')) return parseFloat(memory) / 1024;
+    if (memory.endsWith('Ki')) return parseFloat(memory) / (1024 * 1024);
+    return parseFloat(memory) / (1024 * 1024 * 1024);
   }
 }
 ```
 
 ---
 
-## 7. Network Cost Reduction
+## 6. Database Cost Analyzer
 
 ```typescript
-// network-optimization/src/network-cost.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+// services/finops/src/database-cost-analyzer.ts
 
-export interface NetworkCostReport {
-  egressByRegion: { region: string; gbTransferred: number; cost: number }[];
-  intraClusterTraffic: number;
-  crossAZTraffic: number;
-  cdnSavings: number;
-  recommendations: string[];
+interface DatabaseOption {
+  name: string;
+  type: 'rds' | 'aurora-serverless-v2';
+  instanceClass?: string;
+  minACU?: number;
+  maxACU?: number;
+  hourlyCost: number;
+  storageGBMonth: number;
+  ioPerMillion?: number;
 }
 
-@Injectable()
-export class NetworkCostOptimizationService {
-  private readonly logger = new Logger(NetworkCostOptimizationService.name);
+interface CostAnalysis {
+  scenario: string;
+  monthlyCost: number;
+  workload: string;
+  recommendation: string;
+  breakevenRPU: number; // Requests Per Unit (Aurora Serverless v2)
+}
 
-  // AWS Egress Pricing (USD/GB)
-  private readonly EGRESS_PRICING = {
-    intraRegion: 0.02,    // ภายใน Region เดียวกัน
-    crossRegion: 0.09,    // ข้าม Region
-    internet: 0.085,      // ออก Internet
-  };
+// ap-southeast-1 pricing
+const DB_OPTIONS: DatabaseOption[] = [
+  {
+    name: 'RDS db.t3.medium',
+    type: 'rds',
+    instanceClass: 'db.t3.medium',
+    hourlyCost: 0.068,
+    storageGBMonth: 0.138,
+  },
+  {
+    name: 'RDS db.t3.large',
+    type: 'rds',
+    instanceClass: 'db.t3.large',
+    hourlyCost: 0.136,
+    storageGBMonth: 0.138,
+  },
+  {
+    name: 'RDS db.m5.large',
+    type: 'rds',
+    instanceClass: 'db.m5.large',
+    hourlyCost: 0.214,
+    storageGBMonth: 0.138,
+  },
+  {
+    name: 'Aurora Serverless v2 (0.5-2 ACU)',
+    type: 'aurora-serverless-v2',
+    minACU: 0.5,
+    maxACU: 2,
+    hourlyCost: 0.12, // per ACU
+    storageGBMonth: 0.12,
+    ioPerMillion: 0.25,
+  },
+  {
+    name: 'Aurora Serverless v2 (0.5-8 ACU)',
+    type: 'aurora-serverless-v2',
+    minACU: 0.5,
+    maxACU: 8,
+    hourlyCost: 0.12,
+    storageGBMonth: 0.12,
+    ioPerMillion: 0.25,
+  },
+];
 
-  async analyzeNetworkCosts(): Promise<NetworkCostReport> {
-    const recommendations: string[] = [];
+export class DatabaseCostAnalyzer {
+  analyzeBreakeven(
+    workload: {
+      peakHoursPerDay: number;
+      avgConnectionsPerHour: number;
+      storageGB: number;
+      ioRequestsPerDay: number;
+    }
+  ): CostAnalysis[] {
+    const analyses: CostAnalysis[] = [];
 
-    // 1. ตรวจสอบ Cross-AZ Traffic
-    const crossAZReduction = this.analyzeCrossAZTraffic();
-    if (crossAZReduction > 0) {
-      recommendations.push(
-        `Topology-aware routing could save $${crossAZReduction.toFixed(2)}/month in cross-AZ traffic`
-      );
+    for (const dbOption of DB_OPTIONS) {
+      let monthlyCost = 0;
+
+      if (dbOption.type === 'rds') {
+        // RDS: fixed cost
+        monthlyCost = dbOption.hourlyCost * 720;
+        monthlyCost += workload.storageGB * dbOption.storageGBMonth;
+      } else if (dbOption.type === 'aurora-serverless-v2') {
+        // Aurora Serverless v2: cost based on actual ACU usage
+        const peakHours = workload.peakHoursPerDay * 30;
+        const offPeakHours = 720 - peakHours;
+
+        // During peak: use maxACU
+        const peakCost = peakHours * (dbOption.maxACU || 2) * dbOption.hourlyCost;
+
+        // During off-peak: use minACU (0.5 ACU minimum)
+        const offPeakCost = offPeakHours * (dbOption.minACU || 0.5) * dbOption.hourlyCost;
+
+        // Storage + IO
+        const storageCost = workload.storageGB * dbOption.storageGBMonth;
+        const ioCost = (workload.ioRequestsPerDay * 30 / 1_000_000) * (dbOption.ioPerMillion || 0);
+
+        monthlyCost = peakCost + offPeakCost + storageCost + ioCost;
+      }
+
+      const isHighUtilization = workload.peakHoursPerDay >= 18;
+      let recommendation = '';
+
+      if (dbOption.type === 'rds') {
+        recommendation = isHighUtilization
+          ? 'Good for predictable high-traffic workloads'
+          : 'Consider Serverless for variable traffic';
+      } else {
+        recommendation = isHighUtilization
+          ? 'More expensive than RDS at sustained high load'
+          : 'Cost-effective for variable traffic patterns';
+      }
+
+      analyses.push({
+        scenario: dbOption.name,
+        monthlyCost: Math.round(monthlyCost * 100) / 100,
+        workload: `${workload.peakHoursPerDay}h peak/day, ${workload.storageGB}GB storage`,
+        recommendation,
+        breakevenRPU: this.calculateBreakevenRPU(dbOption, workload),
+      });
     }
 
-    // 2. ตรวจสอบ Unnecessary External Calls
-    recommendations.push(
-      'Enable Topology Aware Routing to prefer same-AZ endpoints'
-    );
-
-    recommendations.push(
-      'Use VPC Endpoints for AWS services to avoid internet egress'
-    );
-
-    recommendations.push(
-      'Enable CloudFront for static assets to reduce origin traffic'
-    );
-
-    return {
-      egressByRegion: [],
-      intraClusterTraffic: 0,
-      crossAZTraffic: 0,
-      cdnSavings: 0,
-      recommendations,
-    };
+    return analyses.sort((a, b) => a.monthlyCost - b.monthlyCost);
   }
 
-  private analyzeCrossAZTraffic(): number {
-    return 100; // Mock: $100/month potential savings
+  private calculateBreakevenRPU(
+    option: DatabaseOption,
+    workload: { peakHoursPerDay: number; storageGB: number }
+  ): number {
+    // Hours per month where Aurora Serverless == RDS cost
+    if (option.type !== 'aurora-serverless-v2') return 0;
+
+    const rdsBaseline = DB_OPTIONS.find(o => o.name === 'RDS db.t3.medium');
+    if (!rdsBaseline) return 0;
+
+    const rdsMonthlyCost = rdsBaseline.hourlyCost * 720;
+    const auroraFixedCost = workload.storageGB * option.storageGBMonth;
+    const costPerACUHour = option.hourlyCost;
+
+    // Aurora breaks even with RDS when: auroraFixed + ACU * hours = rdsCost
+    const breakEvenACUHours = (rdsMonthlyCost - auroraFixedCost) / costPerACUHour;
+    return Math.round(breakEvenACUHours / 720 * 100) / 100; // avg ACU
   }
 }
 ```
 
-```yaml
-# k8s/topology-aware-routing.yaml
-# Topology Aware Routing - ลด Cross-AZ Traffic
-apiVersion: v1
-kind: Service
-metadata:
-  name: payment-service
-  namespace: production
-  annotations:
-    service.kubernetes.io/topology-mode: Auto  # Kubernetes 1.27+
-spec:
-  selector:
-    app: payment-service
-  ports:
-    - port: 80
-      targetPort: 3000
----
-# สำหรับ Kubernetes รุ่นเก่า
-apiVersion: v1
-kind: Service
-metadata:
-  name: payment-service-legacy
-  namespace: production
-  annotations:
-    service.kubernetes.io/topology-aware-hints: Auto
-```
-
 ---
 
-## 8. Storage Tier Optimization
-
-```yaml
-# storage/storage-classes.yaml
-# Tiered Storage Classes
----
-# Fast SSD สำหรับ Database
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: fast-ssd
-provisioner: kubernetes.io/aws-ebs
-parameters:
-  type: io2
-  iopsPerGB: "50"
-  fsType: ext4
-  encrypted: "true"
-reclaimPolicy: Retain
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
----
-# Standard SSD สำหรับ General Use
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: standard-ssd
-provisioner: kubernetes.io/aws-ebs
-parameters:
-  type: gp3
-  throughput: "125"
-  iops: "3000"
-  fsType: ext4
-  encrypted: "true"
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
----
-# HDD สำหรับ Log Storage (ราคาถูก)
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: cheap-hdd
-provisioner: kubernetes.io/aws-ebs
-parameters:
-  type: st1  # Throughput Optimized HDD
-  fsType: ext4
-  encrypted: "true"
-reclaimPolicy: Delete
-```
+## 7. Storage Tiering: S3 Lifecycle Policy Generator
 
 ```typescript
-// storage-lifecycle/src/s3-lifecycle.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+// services/finops/src/s3-lifecycle-generator.ts
 import {
   S3Client,
   PutBucketLifecycleConfigurationCommand,
+  GetBucketLifecycleConfigurationCommand,
+  LifecycleRule,
+  TransitionStorageClass,
 } from '@aws-sdk/client-s3';
 
-@Injectable()
-export class S3LifecycleService {
-  private readonly logger = new Logger(S3LifecycleService.name);
-  private readonly s3Client: S3Client;
+interface StorageTierConfig {
+  bucketName: string;
+  prefix?: string;
+  rules: Array<{
+    id: string;
+    description: string;
+    daysToInfrequentAccess?: number;
+    daysToGlacierInstantRetrieval?: number;
+    daysToGlacierFlexible?: number;
+    daysToDeepArchive?: number;
+    daysToExpire?: number;
+    applyToNonCurrentVersions?: boolean;
+    abortIncompleteMultipartUploadDays?: number;
+  }>;
+}
+
+export class S3LifecyclePolicyGenerator {
+  private s3Client: S3Client;
+
+  // Storage class pricing (ap-southeast-1, per GB/month)
+  private readonly PRICING = {
+    STANDARD: 0.025,
+    STANDARD_IA: 0.0138,
+    INTELLIGENT_TIERING: 0.025,
+    ONEZONE_IA: 0.011,
+    GLACIER_IR: 0.005,
+    GLACIER: 0.004,
+    DEEP_ARCHIVE: 0.00099,
+  };
 
   constructor() {
     this.s3Client = new S3Client({ region: process.env.AWS_REGION });
   }
 
-  async setLifecyclePolicy(bucket: string): Promise<void> {
-    const command = new PutBucketLifecycleConfigurationCommand({
-      Bucket: bucket,
-      LifecycleConfiguration: {
-        Rules: [
-          {
-            ID: 'transition-to-ia',
-            Status: 'Enabled',
-            Filter: { Prefix: 'logs/' },
-            Transitions: [
-              {
-                Days: 30,
-                StorageClass: 'STANDARD_IA', // ลด 40% ค่าใช้จ่าย
-              },
-              {
-                Days: 90,
-                StorageClass: 'GLACIER_IR', // ลด 60% ค่าใช้จ่าย
-              },
-              {
-                Days: 365,
-                StorageClass: 'DEEP_ARCHIVE', // ลด 90% ค่าใช้จ่าย
-              },
-            ],
-            Expiration: {
-              Days: 2555, // ลบหลัง 7 ปี
-            },
-          },
-          {
-            ID: 'delete-incomplete-uploads',
-            Status: 'Enabled',
-            Filter: { Prefix: '' },
-            AbortIncompleteMultipartUpload: {
-              DaysAfterInitiation: 7,
-            },
-          },
-          {
-            ID: 'delete-old-versions',
-            Status: 'Enabled',
-            Filter: { Prefix: '' },
-            NoncurrentVersionExpiration: {
-              NoncurrentDays: 30,
-            },
-          },
-        ],
+  generateVideoStoragePolicy(): StorageTierConfig {
+    return {
+      bucketName: process.env.S3_OUTPUT_BUCKET!,
+      rules: [
+        {
+          id: 'hls-popular-content',
+          description: 'Keep popular HLS content in Standard for 30 days, then IA',
+          daysToInfrequentAccess: 30,
+          daysToGlacierInstantRetrieval: 90,
+          daysToExpire: 365,
+          abortIncompleteMultipartUploadDays: 7,
+        },
+        {
+          id: 'raw-video-archive',
+          description: 'Archive raw uploaded videos quickly',
+          daysToInfrequentAccess: 7,
+          daysToGlacierFlexible: 30,
+          daysToDeepArchive: 180,
+          applyToNonCurrentVersions: true,
+        },
+        {
+          id: 'thumbnails-tier',
+          description: 'Move thumbnails to IA after 60 days',
+          daysToInfrequentAccess: 60,
+          daysToGlacierInstantRetrieval: 180,
+        },
+      ],
+    };
+  }
+
+  async applyLifecyclePolicy(config: StorageTierConfig): Promise<void> {
+    const rules: LifecycleRule[] = config.rules.map(rule => {
+      const lifecycleRule: LifecycleRule = {
+        ID: rule.id,
+        Status: 'Enabled',
+        Filter: config.prefix ? { Prefix: config.prefix } : {},
+        Transitions: [],
+        NoncurrentVersionTransitions: [],
+      };
+
+      // Add transitions
+      if (rule.daysToInfrequentAccess) {
+        lifecycleRule.Transitions!.push({
+          Days: rule.daysToInfrequentAccess,
+          StorageClass: 'STANDARD_IA' as TransitionStorageClass,
+        });
+      }
+      if (rule.daysToGlacierInstantRetrieval) {
+        lifecycleRule.Transitions!.push({
+          Days: rule.daysToGlacierInstantRetrieval,
+          StorageClass: 'GLACIER_IR' as TransitionStorageClass,
+        });
+      }
+      if (rule.daysToGlacierFlexible) {
+        lifecycleRule.Transitions!.push({
+          Days: rule.daysToGlacierFlexible,
+          StorageClass: 'GLACIER' as TransitionStorageClass,
+        });
+      }
+      if (rule.daysToDeepArchive) {
+        lifecycleRule.Transitions!.push({
+          Days: rule.daysToDeepArchive,
+          StorageClass: 'DEEP_ARCHIVE' as TransitionStorageClass,
+        });
+      }
+      if (rule.daysToExpire) {
+        lifecycleRule.Expiration = { Days: rule.daysToExpire };
+      }
+      if (rule.abortIncompleteMultipartUploadDays) {
+        lifecycleRule.AbortIncompleteMultipartUpload = {
+          DaysAfterInitiation: rule.abortIncompleteMultipartUploadDays,
+        };
+      }
+      if (rule.applyToNonCurrentVersions) {
+        lifecycleRule.NoncurrentVersionTransitions = [
+          { NoncurrentDays: 1, StorageClass: 'GLACIER' as TransitionStorageClass },
+        ];
+        lifecycleRule.NoncurrentVersionExpiration = { NoncurrentDays: 90 };
+      }
+
+      return lifecycleRule;
+    });
+
+    await this.s3Client.send(
+      new PutBucketLifecycleConfigurationCommand({
+        Bucket: config.bucketName,
+        LifecycleConfiguration: { Rules: rules },
+      })
+    );
+
+    console.log(`Applied lifecycle policy to ${config.bucketName}: ${rules.length} rules`);
+  }
+
+  estimateMonthlySavings(
+    storageGB: number,
+    accessPattern: {
+      hotPercent: number;   // % accessed in first 30 days
+      warmPercent: number;  // % accessed 30-90 days
+      coldPercent: number;  // % accessed 90+ days
+    }
+  ): { currentCost: number; optimizedCost: number; savings: number; savingsPercent: number } {
+    const hotGB = storageGB * (accessPattern.hotPercent / 100);
+    const warmGB = storageGB * (accessPattern.warmPercent / 100);
+    const coldGB = storageGB * (accessPattern.coldPercent / 100);
+
+    // Current: all in Standard
+    const currentCost = storageGB * this.PRICING.STANDARD;
+
+    // Optimized: tiered storage
+    const optimizedCost =
+      hotGB * this.PRICING.STANDARD +
+      warmGB * this.PRICING.STANDARD_IA +
+      coldGB * this.PRICING.GLACIER;
+
+    const savings = currentCost - optimizedCost;
+    const savingsPercent = (savings / currentCost) * 100;
+
+    return {
+      currentCost: Math.round(currentCost * 100) / 100,
+      optimizedCost: Math.round(optimizedCost * 100) / 100,
+      savings: Math.round(savings * 100) / 100,
+      savingsPercent: Math.round(savingsPercent * 10) / 10,
+    };
+  }
+}
+```
+
+---
+
+## 8. Kubecost Integration: TypeScript API Client
+
+```typescript
+// services/finops/src/kubecost.client.ts
+import axios, { AxiosInstance } from 'axios';
+
+interface KubecostAllocation {
+  name: string;
+  properties: {
+    cluster: string;
+    node: string;
+    namespace: string;
+    controller: string;
+    controllerKind: string;
+    pod: string;
+    container: string;
+    providerID: string;
+    labels: Record<string, string>;
+  };
+  window: { start: string; end: string };
+  start: string;
+  end: string;
+  minutes: number;
+  cpuCores: number;
+  cpuCoreRequestAverage: number;
+  cpuCoreUsageAverage: number;
+  cpuCost: number;
+  gpuCount: number;
+  gpuCost: number;
+  networkIngressBytes: number;
+  networkEgressBytes: number;
+  networkCost: number;
+  loadBalancerCost: number;
+  pvBytes: number;
+  pvCost: number;
+  ramBytes: number;
+  ramByteRequestAverage: number;
+  ramByteUsageAverage: number;
+  ramCost: number;
+  sharedCost: number;
+  externalCost: number;
+  totalCost: number;
+  totalEfficiency: number;
+}
+
+export class KubecostClient {
+  private http: AxiosInstance;
+
+  constructor(kubecostUrl: string = 'http://kubecost-cost-analyzer:9090') {
+    this.http = axios.create({
+      baseURL: kubecostUrl,
+      timeout: 30000,
+    });
+  }
+
+  async getAllocations(params: {
+    window: string; // e.g., '7d', '1M', 'lastweek'
+    aggregate?: string; // 'namespace', 'label:team', 'controller'
+    idle?: boolean;
+    external?: boolean;
+    shareNamespaces?: string;
+    shareTenancyCosts?: boolean;
+  }): Promise<KubecostAllocation[]> {
+    const response = await this.http.get('/model/allocation', {
+      params: {
+        window: params.window,
+        aggregate: params.aggregate || 'namespace',
+        idle: params.idle ?? false,
+        external: params.external ?? false,
+        shareNamespaces: params.shareNamespaces,
+        shareTenancyCosts: params.shareTenancyCosts ?? true,
+        includeSharedCostBreakdown: true,
+        reconcile: true,
+        format: 'json',
       },
     });
 
-    await this.s3Client.send(command);
-    this.logger.log(`S3 lifecycle policy set for bucket: ${bucket}`);
+    const data = response.data?.data?.[0] || {};
+    return Object.values(data) as KubecostAllocation[];
+  }
+
+  async getNamespaceCosts(window: string = '30d'): Promise<Array<{
+    namespace: string;
+    totalCost: number;
+    cpuCost: number;
+    ramCost: number;
+    storagesCost: number;
+    efficiency: number;
+  }>> {
+    const allocations = await this.getAllocations({ window, aggregate: 'namespace' });
+
+    return allocations.map(a => ({
+      namespace: a.name,
+      totalCost: Math.round(a.totalCost * 100) / 100,
+      cpuCost: Math.round(a.cpuCost * 100) / 100,
+      ramCost: Math.round(a.ramCost * 100) / 100,
+      storagesCost: Math.round(a.pvCost * 100) / 100,
+      efficiency: Math.round(a.totalEfficiency * 1000) / 10,
+    })).sort((a, b) => b.totalCost - a.totalCost);
+  }
+
+  async getLabelCosts(
+    label: string,
+    window: string = '30d'
+  ): Promise<Array<{ labelValue: string; totalCost: number }>> {
+    const allocations = await this.getAllocations({
+      window,
+      aggregate: `label:${label}`,
+    });
+
+    return allocations
+      .map(a => ({
+        labelValue: a.name,
+        totalCost: Math.round(a.totalCost * 100) / 100,
+      }))
+      .sort((a, b) => b.totalCost - a.totalCost);
+  }
+
+  async getCostEfficiencyReport(window: string = '7d'): Promise<{
+    overprovisioned: Array<{ namespace: string; wastedCost: number; efficiency: number }>;
+    underprovisioned: Array<{ namespace: string; namespace2: string }>;
+    totalWastedCost: number;
+  }> {
+    const allocations = await this.getAllocations({ window, aggregate: 'namespace' });
+
+    const overprovisioned = allocations
+      .filter(a => a.totalEfficiency < 0.5 && a.totalCost > 10)
+      .map(a => ({
+        namespace: a.name,
+        wastedCost: Math.round((a.totalCost * (1 - a.totalEfficiency)) * 100) / 100,
+        efficiency: Math.round(a.totalEfficiency * 1000) / 10,
+      }))
+      .sort((a, b) => b.wastedCost - a.wastedCost);
+
+    const totalWastedCost = overprovisioned.reduce((sum, a) => sum + a.wastedCost, 0);
+
+    return {
+      overprovisioned,
+      underprovisioned: [],
+      totalWastedCost: Math.round(totalWastedCost * 100) / 100,
+    };
   }
 }
 ```
 
 ---
 
-## 9. FinOps Dashboard
+## 9. Monthly Cost Report Generator
 
 ```typescript
-// finops-dashboard/src/dashboard.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+// services/finops/src/monthly-report-generator.ts
+import { CostDashboardService } from './cost-dashboard.service';
+import { KubecostClient } from './kubecost.client';
+import { ContainerRightsizingAnalyzer } from './container-rightsizing';
+import { S3LifecyclePolicyGenerator } from './s3-lifecycle-generator';
+import { ReservedCapacityCalculator } from './reserved-capacity-calculator';
 
-export interface DailyCloudCost {
-  date: Date;
-  team: string;
-  service: string;
-  compute: number;
-  storage: number;
-  network: number;
-  total: number;
-  budget: number;
-  budgetUtilization: number;
+interface MonthlyReport {
+  period: string;
+  generatedAt: string;
+  totalMonthlyCost: number;
+  topServices: Array<{ name: string; cost: number; percentOfTotal: number }>;
+  recommendations: Array<{
+    category: string;
+    description: string;
+    estimatedSavings: number;
+    effort: 'low' | 'medium' | 'high';
+    priority: number;
+  }>;
+  costTrend: {
+    previousMonth: number;
+    currentMonth: number;
+    changePercent: number;
+  };
+  teamBreakdown: Array<{ team: string; cost: number; services: number }>;
+  kpiMetrics: {
+    costPerRequest: number;
+    costPerUser: number;
+    costPerGB: number;
+  };
 }
 
-@Injectable()
-export class FinOpsDashboardService {
-  private readonly logger = new Logger(FinOpsDashboardService.name);
+export class MonthlyReportGenerator {
+  private costDashboard: CostDashboardService;
+  private kubecost: KubecostClient;
+  private rightsizing: ContainerRightsizingAnalyzer;
+  private s3Lifecycle: S3LifecyclePolicyGenerator;
+  private riCalculator: ReservedCapacityCalculator;
 
-  // Monthly Budgets per Team
-  private readonly TEAM_BUDGETS: Record<string, number> = {
-    payments: 5000,
-    logistics: 3000,
-    analytics: 2000,
-    platform: 4000,
-  };
-
-  @Cron('0 7 * * *') // ทุกวัน 07:00
-  async generateDailyCostReport(): Promise<void> {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-
-    const costs = await this.getDailyCosts(yesterday);
-    
-    for (const cost of costs) {
-      // แจ้งเตือนถ้า Budget เกิน 80%
-      if (cost.budgetUtilization > 80) {
-        await this.sendBudgetAlert(cost);
-      }
-    }
-
-    await this.updateDashboard(costs);
-    this.logger.log(`Daily cost report generated for ${yesterday.toISOString().split('T')[0]}`);
+  constructor() {
+    this.costDashboard = new CostDashboardService();
+    this.kubecost = new KubecostClient();
+    this.rightsizing = new ContainerRightsizingAnalyzer();
+    this.s3Lifecycle = new S3LifecyclePolicyGenerator();
+    this.riCalculator = new ReservedCapacityCalculator();
   }
 
-  async getDailyCosts(date: Date): Promise<DailyCloudCost[]> {
-    // ดึงจาก AWS Cost Explorer หรือ Kubecost
-    const costs: DailyCloudCost[] = [];
-    
-    for (const [team, budget] of Object.entries(this.TEAM_BUDGETS)) {
-      // Mock data - ในการใช้งานจริงดึงจาก API
-      const dailyCost = budget / 30 * (0.8 + Math.random() * 0.4);
-      const monthlyUsed = dailyCost * new Date().getDate();
-      
-      costs.push({
-        date,
+  async generateReport(month?: string): Promise<MonthlyReport> {
+    const targetMonth = month || new Date().toISOString().substring(0, 7);
+    const prevMonth = this.getPreviousMonth(targetMonth);
+
+    console.log(`Generating cost report for ${targetMonth}...`);
+
+    const [currentCost, previousCost, namespaceCosts] = await Promise.all([
+      this.costDashboard.getMonthlyCostReport(targetMonth),
+      this.costDashboard.getMonthlyCostReport(prevMonth),
+      this.kubecost.getNamespaceCosts('30d').catch(() => []),
+    ]);
+
+    const changePercent = previousCost.totalCost > 0
+      ? ((currentCost.totalCost - previousCost.totalCost) / previousCost.totalCost) * 100
+      : 0;
+
+    // Generate recommendations
+    const recommendations = this.generateRecommendations(currentCost, namespaceCosts);
+
+    // Calculate KPIs (using placeholder values - integrate with metrics)
+    const kpiMetrics = {
+      costPerRequest: Math.round((currentCost.totalCost / 1000000) * 100) / 100, // placeholder
+      costPerUser: Math.round((currentCost.totalCost / 10000) * 100) / 100, // placeholder
+      costPerGB: Math.round((currentCost.totalCost / 500) * 100) / 100, // placeholder
+    };
+
+    const topServices = currentCost.byService
+      .slice(0, 10)
+      .map(s => ({
+        name: s.service,
+        cost: s.amount,
+        percentOfTotal: Math.round((s.amount / currentCost.totalCost) * 1000) / 10,
+      }));
+
+    // Team breakdown from tags
+    const teamBreakdown = Object.entries(currentCost.byTag)
+      .map(([team, cost]) => ({
         team,
-        service: `${team}-services`,
-        compute: dailyCost * 0.6,
-        storage: dailyCost * 0.25,
-        network: dailyCost * 0.15,
-        total: dailyCost,
-        budget,
-        budgetUtilization: (monthlyUsed / budget) * 100,
+        cost: Math.round(cost * 100) / 100,
+        services: namespaceCosts.filter(n => n.namespace.includes(team)).length,
+      }))
+      .sort((a, b) => b.cost - a.cost);
+
+    const report: MonthlyReport = {
+      period: targetMonth,
+      generatedAt: new Date().toISOString(),
+      totalMonthlyCost: currentCost.totalCost,
+      topServices,
+      recommendations,
+      costTrend: {
+        previousMonth: previousCost.totalCost,
+        currentMonth: currentCost.totalCost,
+        changePercent: Math.round(changePercent * 10) / 10,
+      },
+      teamBreakdown,
+      kpiMetrics,
+    };
+
+    return report;
+  }
+
+  private generateRecommendations(
+    costReport: any,
+    namespaceCosts: any[]
+  ): MonthlyReport['recommendations'] {
+    const recommendations: MonthlyReport['recommendations'] = [];
+
+    // 1. Reserved Instances
+    const ec2Cost = costReport.byService.find((s: any) => s.service === 'Amazon EC2');
+    if (ec2Cost && ec2Cost.amount > 500) {
+      recommendations.push({
+        category: 'Reserved Instances',
+        description: 'Purchase 1-year Reserved Instances for predictable EC2 workloads. Estimated 30-40% savings.',
+        estimatedSavings: Math.round(ec2Cost.amount * 0.35 * 100) / 100,
+        effort: 'low',
+        priority: 1,
       });
     }
-    
-    return costs;
-  }
 
-  async getCostTrend(team: string, days: number = 30): Promise<{
-    dates: string[];
-    costs: number[];
-    trend: 'INCREASING' | 'DECREASING' | 'STABLE';
-    changePercent: number;
-  }> {
-    const dates: string[] = [];
-    const costs: number[] = [];
-    
-    for (let i = days - 1; i >= 0; i--) {
-      const date = new Date();
-      date.setDate(date.getDate() - i);
-      dates.push(date.toISOString().split('T')[0]);
-      
-      // Mock: ดึงจาก Database จริง
-      costs.push(Math.random() * 200 + 100);
+    // 2. S3 Lifecycle
+    const s3Cost = costReport.byService.find((s: any) => s.service === 'Amazon S3');
+    if (s3Cost && s3Cost.amount > 200) {
+      const storageSavings = this.s3Lifecycle.estimateMonthlySavings(
+        10000, // 10TB estimated
+        { hotPercent: 20, warmPercent: 30, coldPercent: 50 }
+      );
+      recommendations.push({
+        category: 'Storage Tiering',
+        description: `Implement S3 lifecycle policies to move infrequent data to cheaper storage classes. ${storageSavings.savingsPercent}% estimated savings.`,
+        estimatedSavings: storageSavings.savings,
+        effort: 'low',
+        priority: 2,
+      });
     }
-    
-    const firstHalf = costs.slice(0, Math.floor(days / 2));
-    const secondHalf = costs.slice(Math.floor(days / 2));
-    
-    const firstAvg = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
-    const secondAvg = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
-    
-    const changePercent = ((secondAvg - firstAvg) / firstAvg) * 100;
-    
-    let trend: 'INCREASING' | 'DECREASING' | 'STABLE';
-    if (changePercent > 5) trend = 'INCREASING';
-    else if (changePercent < -5) trend = 'DECREASING';
-    else trend = 'STABLE';
 
-    return { dates, costs, trend, changePercent };
+    // 3. Container right-sizing
+    const inefficientNamespaces = namespaceCosts.filter(n => n.efficiency < 50);
+    if (inefficientNamespaces.length > 0) {
+      const wastedCost = inefficientNamespaces.reduce(
+        (sum, n) => sum + n.totalCost * (1 - n.efficiency / 100), 0
+      );
+      recommendations.push({
+        category: 'Container Right-sizing',
+        description: `${inefficientNamespaces.length} namespaces have <50% efficiency. Right-size container requests/limits.`,
+        estimatedSavings: Math.round(wastedCost * 0.5 * 100) / 100,
+        effort: 'medium',
+        priority: 3,
+      });
+    }
+
+    // 4. Spot instances
+    recommendations.push({
+      category: 'Spot Instances',
+      description: 'Move stateless services to Spot instances with graceful termination. 60-80% savings on compute.',
+      estimatedSavings: Math.round((costReport.totalCost * 0.3) * 100) / 100,
+      effort: 'high',
+      priority: 4,
+    });
+
+    // 5. Database optimization
+    const rdsCost = costReport.byService.find((s: any) => s.service?.includes('RDS'));
+    if (rdsCost && rdsCost.amount > 300) {
+      recommendations.push({
+        category: 'Database Optimization',
+        description: 'Evaluate Aurora Serverless v2 for variable workloads. Enable storage auto-scaling.',
+        estimatedSavings: Math.round(rdsCost.amount * 0.2 * 100) / 100,
+        effort: 'medium',
+        priority: 5,
+      });
+    }
+
+    return recommendations.sort((a, b) => a.priority - b.priority);
   }
 
-  private async sendBudgetAlert(cost: DailyCloudCost): Promise<void> {
-    this.logger.warn(
-      `Budget alert for team ${cost.team}: ${cost.budgetUtilization.toFixed(1)}% of monthly budget used`
-    );
-    // ส่ง Slack/Email notification
+  formatReportAsMarkdown(report: MonthlyReport): string {
+    const totalSavings = report.recommendations
+      .reduce((sum, r) => sum + r.estimatedSavings, 0);
+
+    let md = `# Monthly Cost Report - ${report.period}\n\n`;
+    md += `**Generated:** ${new Date(report.generatedAt).toLocaleString('th-TH')}\n\n`;
+
+    md += `## สรุปภาพรวม\n\n`;
+    md += `| Metric | Value |\n|--------|-------|\n`;
+    md += `| Total Monthly Cost | $${report.totalMonthlyCost.toFixed(2)} |\n`;
+    md += `| vs Previous Month | ${report.costTrend.changePercent > 0 ? '+' : ''}${report.costTrend.changePercent}% |\n`;
+    md += `| Potential Savings | $${totalSavings.toFixed(2)}/month |\n\n`;
+
+    md += `## Top Services by Cost\n\n`;
+    md += `| Service | Cost | % of Total |\n|---------|------|------------|\n`;
+    report.topServices.forEach(s => {
+      md += `| ${s.name} | $${s.cost.toFixed(2)} | ${s.percentOfTotal}% |\n`;
+    });
+
+    md += `\n## Recommendations\n\n`;
+    report.recommendations.forEach((rec, i) => {
+      md += `### ${i + 1}. ${rec.category} (Effort: ${rec.effort})\n`;
+      md += `${rec.description}\n\n`;
+      md += `**Estimated Savings:** $${rec.estimatedSavings.toFixed(2)}/month\n\n`;
+    });
+
+    return md;
   }
 
-  private async updateDashboard(costs: DailyCloudCost[]): Promise<void> {
-    // อัปเดต Grafana Dashboard หรือ Custom Dashboard
-    this.logger.log(`Dashboard updated with ${costs.length} team cost records`);
+  private getPreviousMonth(month: string): string {
+    const date = new Date(month + '-01');
+    date.setMonth(date.getMonth() - 1);
+    return date.toISOString().substring(0, 7);
   }
 }
 ```
 
 ---
 
-## 10. Cost Monitoring with Kubecost
+## สรุป
 
-```yaml
-# kubecost/values.yaml
-kubecostToken: "YOUR_KUBECOST_TOKEN"
+| หัวข้อ | Tool/Technique | Potential Savings |
+|--------|---------------|------------------|
+| Cost Dashboard | AWS Cost Explorer API | ความเข้าใจ Cost Drivers |
+| Container Right-sizing | CloudWatch + K8s Metrics | 20-40% compute cost |
+| Spot Instances | SIGTERM Handler + Draining | 60-80% EC2 cost |
+| Reserved Instances | 1-year RI Calculator | 30-40% on predictable workloads |
+| Cost Attribution | K8s Label-based Allocation | Accountability per team |
+| Database Optimization | Aurora Serverless v2 Analysis | 20-50% for variable workloads |
+| Storage Tiering | S3 Lifecycle Policies | 40-70% storage cost |
+| FinOps Culture | Monthly Reports + KPIs | 30%+ overall reduction |
 
-global:
-  prometheus:
-    enabled: false  # ใช้ Prometheus ที่มีอยู่แล้ว
-    fqdn: http://prometheus-server.monitoring.svc.cluster.local
-
-  grafana:
-    enabled: false  # ใช้ Grafana ที่มีอยู่แล้ว
-    proxy: false
-    
-kubecostProductConfigs:
-  clusterName: production-cluster
-  currencyCode: USD
-  defaultIdle: true
-  grafanaURL: http://grafana.monitoring.svc.cluster.local
-  
-  # AWS Spot Pricing Integration
-  spotLabel: node-lifecycle
-  spotLabelValue: spot
-  
-  # Custom Discount (ถ้ามี Reserved Instances)
-  customPricesEnabled: true
-  defaultModelPricing:
-    enabled: true
-    CPU: 0.03  # $/CPU-hour
-    spotCPU: 0.009
-    RAM: 0.01  # $/GB-hour
-    spotRAM: 0.003
-    storage: 0.00004  # $/GB-hour
-    zoneNetworkEgress: 0.01  # $/GB
-
-networkCosts:
-  enabled: true
-  podMonitor:
-    enabled: true
-  config:
-    destinations:
-      crossRegionDestinationCosts:
-        - region: ap-southeast-1
-          zoneName: ap-southeast-1a
-          bandwidth: 0.02
-      directClassificationServices:
-        - "s3"
-        - "dynamodb"
-
-alerts:
-  enabled: true
-  slack:
-    enabled: true
-    webhook: ${SLACK_WEBHOOK_URL}
-  email:
-    enabled: true
-    smtpAddress: smtp.example.com
-    
-  # Alert เมื่อ Budget เกิน
-  budgetAlerts:
-    - name: payments-team-budget
-      namespace: team-payments
-      monthlyBudget: 5000
-      threshold: 80  # เปอร์เซ็นต์
-```
+> "FinOps is a team sport — engineering, finance, and product must work together to optimize cloud spending without sacrificing velocity"
 
 ---
 
-## 11. FinOps Practices for Engineering Teams
-
-```typescript
-// finops-practices/src/engineering-finops.md
-/**
- * FinOps Practices สำหรับ Engineering Teams
- * 
- * 1. Cost Awareness Culture
- *    - แสดงต้นทุนใน CI/CD Pipeline
- *    - Cost Review ใน Sprint Retrospective
- *    - ประมาณต้นทุนก่อน Deploy Feature ใหม่
- * 
- * 2. Engineering Practices
- *    - ตั้งค่า Resource Requests/Limits ทุก Pod
- *    - ใช้ HPA เพื่อ Scale ตามความต้องการ
- *    - ปิด Dev/Staging environments หลัง 18:00
- *    - ใช้ Spot/Preemptible สำหรับ Batch Jobs
- * 
- * 3. Architecture Decisions
- *    - เลือก Database ให้เหมาะกับ Workload
- *    - ใช้ Cache ลด Database Reads
- *    - Compress API Responses
- *    - ใช้ CDN สำหรับ Static Assets
- * 
- * 4. Monitoring & Optimization
- *    - ดู Cost Dashboard ทุกสัปดาห์
- *    - ตรวจสอบ Unused Resources ทุกเดือน
- *    - ทำ Right-sizing ทุก Quarter
- */
-
-// ตัวอย่าง: Cost Estimation ใน CI/CD
-interface DeploymentCostEstimate {
-  serviceName: string;
-  replicaCount: number;
-  cpuRequest: string;
-  memoryRequest: string;
-  estimatedMonthlyCost: number;
-  comparisonToPrevious?: {
-    previousCost: number;
-    change: number;
-    changePercent: number;
-  };
-}
-
-function estimateDeploymentCost(config: any): DeploymentCostEstimate {
-  const CPU_COST_PER_CORE_MONTH = 30;
-  const MEMORY_COST_PER_GB_MONTH = 5;
-  
-  const cpuCores = parseFloat(config.cpuRequest.replace('m', '')) / 1000;
-  const memoryGb = parseFloat(config.memoryRequest.replace('Mi', '')) / 1024;
-  
-  const monthlyCost = 
-    (cpuCores * CPU_COST_PER_CORE_MONTH * config.replicas) +
-    (memoryGb * MEMORY_COST_PER_GB_MONTH * config.replicas);
-  
-  return {
-    serviceName: config.name,
-    replicaCount: config.replicas,
-    cpuRequest: config.cpuRequest,
-    memoryRequest: config.memoryRequest,
-    estimatedMonthlyCost: monthlyCost,
-  };
-}
-```
-
----
-
-## สรุปบทที่ 98
-
-| กลยุทธ์ | การประหยัดโดยประมาณ | ความซับซ้อน |
-|---------|------------------|------------|
-| **Right-sizing** | 20-40% ของ Compute | ต่ำ |
-| **Spot Instances** | 60-80% ของ Batch Workloads | กลาง |
-| **Reserved Capacity** | 30-60% ของ Baseline | กลาง |
-| **Database Archiving** | 30-50% ของ Storage | กลาง |
-| **Topology-aware Routing** | 10-20% ของ Network | ต่ำ |
-| **Storage Lifecycle** | 50-80% ของ Log Storage | ต่ำ |
-| **CDN Integration** | 30-50% ของ Egress | กลาง |
-| **Cost Chargeback** | 10-20% ผ่าน Accountability | สูง |
-| **FinOps Culture** | 15-25% ผ่าน Awareness | สูง |
-| **รวมทั้งหมด** | **40-60%** ของต้นทุนรวม | - |
+*ถัดไป: Part 99 - Final Project: Complete Microservices System*
