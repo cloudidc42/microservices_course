@@ -1,1228 +1,2348 @@
-# Part 93: Case Study: Payment System
+# Part 93: Case Studies - Payment System
 
-## บทนำ
+## ระบบการชำระเงิน (Payment System) - กรณีศึกษา
 
-ระบบชำระเงินเป็นหัวใจสำคัญของทุก E-Commerce และ FinTech ในไทย บทนี้จะออกแบบระบบชำระเงินที่คล้ายกับ PromptPay, SCB Easy, หรือ KBank KPlus โดยครอบคลุม PCI-DSS, Transaction Processing, Reconciliation และ Fraud Detection
+การสร้างระบบการชำระเงินในสถาปัตยกรรม Microservices เป็นหนึ่งในความท้าทายที่ซับซ้อนที่สุด เนื่องจากต้องการความปลอดภัยสูง ความน่าเชื่อถือ และการปฏิบัติตามมาตรฐาน PCI DSS
 
 ---
 
-## 1. Thai Payment Ecosystem Overview
+## 1. สถาปัตยกรรมระบบการชำระเงิน
 
 ```
-ระบบชำระเงินในไทย:
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Thailand Payment Landscape                      │
+│                    Payment System Architecture                    │
+├─────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  PromptPay (NITMX)  ─────────────────────────────────────────  │
-│  QR Code Payment    ─── ระบบกลาง National ───────────────────  │
+│  Client ──► API Gateway ──► Payment Orchestrator                 │
+│                                    │                             │
+│              ┌─────────────────────┼─────────────────────┐       │
+│              ▼                     ▼                     ▼       │
+│    Payment Gateway Service   Fraud Detection      Currency       │
+│    (Stripe/PayPal)           Service              Conversion     │
+│              │                     │                             │
+│              ▼                     ▼                             │
+│    Transaction Service       Risk Engine                         │
+│              │                                                   │
+│              ▼                                                   │
+│    Notification Service ──► Reconciliation Service               │
+│              │                                                   │
+│              ▼                                                   │
+│    Chargeback Service                                            │
 │                                                                   │
-│  Banks:              PSPs:                Mobile Wallets:         │
-│  ┌──────────────┐   ┌──────────────┐    ┌───────────────────┐  │
-│  │ SCB (Easy)   │   │ Omise        │    │ TrueMoney Wallet  │  │
-│  │ KBank (KPlus)│   │ 2C2P         │    │ Rabbit LINE Pay   │  │
-│  │ BBL          │   │ Stripe TH    │    │ WeChat Pay TH     │  │
-│  │ Krungthai    │   │ PaySolutions │    │ GrabPay           │  │
-│  └──────────────┘   └──────────────┘    └───────────────────┘  │
-│                                                                   │
-│  Crypto (emerging):                                              │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │ Bitkub, Satang Pro, Zipmex                               │   │
-│  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
----
+### PCI DSS Compliance Requirements
 
-## 2. System Architecture
+PCI DSS (Payment Card Industry Data Security Standard) กำหนดข้อกำหนด 12 ข้อหลักสำหรับการรักษาความปลอดภัยข้อมูลบัตรชำระเงิน:
 
-### 2.1 High-Level Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                      Payment Platform                             │
-│                                                                    │
-│  ┌─────────────┐  ┌─────────────────────────────────────────┐   │
-│  │   Merchant  │  │              API Gateway                 │   │
-│  │    App      │──│  - mTLS Authentication                   │   │
-│  └─────────────┘  │  - API Key Validation                    │   │
-│                   │  - Rate Limiting (10 TPS per merchant)    │   │
-│  ┌─────────────┐  │  - Request Logging (Audit)               │   │
-│  │  Mobile App │──│  - IP Allowlist                          │   │
-│  └─────────────┘  └──────────────────┬──────────────────────┘   │
-│                                       │                           │
-│  ┌────────────────────────────────────▼──────────────────────┐  │
-│  │                    Core Payment Services                    │  │
-│  │                                                              │  │
-│  │  ┌───────────────┐  ┌────────────────┐  ┌──────────────┐  │  │
-│  │  │ Payment       │  │ Transaction    │  │  Wallet      │  │  │
-│  │  │ Orchestrator  │  │ Service        │  │  Service     │  │  │
-│  │  └───────┬───────┘  └───────┬────────┘  └──────┬───────┘  │  │
-│  │          │                  │                   │           │  │
-│  │  ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼───────┐  │  │
-│  │  │ Fraud         │  │ Reconciliation │  │  Notification│  │  │
-│  │  │ Detection     │  │ Service        │  │  Service     │  │  │
-│  │  └───────────────┘  └────────────────┘  └──────────────┘  │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │                  External Integrations                      │  │
-│  │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌───────────┐  │  │
-│  │  │ PromptPay│  │SCB/KBank │  │  Omise   │  │TrueMoney  │  │  │
-│  │  │  (NITMX) │  │  Direct  │  │   2C2P   │  │           │  │  │
-│  │  └─────────┘  └──────────┘  └──────────┘  └───────────┘  │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 Database Architecture
-
-```
-Database Design สำหรับ Payment System:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   Payment Database (PostgreSQL)              │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  IMPORTANT: ข้อมูลทางการเงินต้องเป็น DECIMAL ไม่ใช่ FLOAT  │
-│  │  และ ทุก column sensitive ต้องเข้ารหัส (pgcrypto)      │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                               │
-│  Tables:                                                      │
-│  - transactions (partitioned by month)                       │
-│  - payment_methods (encrypted card data)                     │
-│  - wallets                                                    │
-│  - ledger_entries (double-entry bookkeeping)                 │
-│  - reconciliation_reports                                    │
-│  - fraud_events                                              │
-│  - audit_logs (append-only)                                  │
-└─────────────────────────────────────────────────────────────┘
-```
+1. **ติดตั้งและดูแล Firewall** - ป้องกันข้อมูลผู้ถือบัตร
+2. **ไม่ใช้รหัสผ่านค่าเริ่มต้น** - เปลี่ยนรหัสผ่านและการตั้งค่าความปลอดภัยทั้งหมด
+3. **ป้องกันข้อมูลผู้ถือบัตร** - เข้ารหัสข้อมูลที่จัดเก็บ
+4. **เข้ารหัสการส่งข้อมูล** - ใช้ TLS/SSL สำหรับการส่งข้อมูลผ่านเครือข่าย
+5. **ใช้ Anti-Virus** - ป้องกันมัลแวร์
+6. **พัฒนาระบบที่ปลอดภัย** - ใช้ Secure SDLC
+7. **จำกัดการเข้าถึงข้อมูล** - Need-to-know basis
+8. **กำหนด Unique ID** - สำหรับทุกคนที่เข้าถึงระบบ
+9. **จำกัดการเข้าถึงทางกายภาพ** - ป้องกันการเข้าถึงโดยตรง
+10. **ติดตามและ Monitor** - บันทึกทุกการเข้าถึง
+11. **ทดสอบระบบความปลอดภัย** - ทดสอบสม่ำเสมอ
+12. **นโยบายความปลอดภัยข้อมูล** - สำหรับบุคลากรทั้งหมด
 
 ---
 
-## 3. PCI-DSS Considerations
+## 2. Payment Orchestrator Service
 
-### 3.1 PCI-DSS Requirements Overview
+```typescript
+// payment-orchestrator/src/orchestrator.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, DataSource } from 'typeorm';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { v4 as uuidv4 } from 'uuid';
 
-```
-PCI-DSS Requirement Categories:
-
-Requirement 1-2: Network Security
-├── Firewall configuration
-├── No default vendor passwords  
-└── Protect cardholder data
-
-Requirement 3-4: Protect Stored Data
-├── Protect stored cardholder data
-└── Encrypt transmission of cardholder data
-
-Requirement 5-6: Vulnerability Management
-├── Anti-virus software
-└── Develop/maintain secure systems
-
-Requirement 7-9: Access Control
-├── Restrict access to cardholder data
-├── Identify and authenticate access
-└── Restrict physical access
-
-Requirement 10-11: Monitor & Test
-├── Track and monitor all access
-└── Regularly test security systems
-
-Requirement 12: Information Security Policy
-└── Maintain information security policy
-```
-
-### 3.2 Tokenization Implementation
-
-```go
-// payment-service/internal/tokenization/tokenizer.go
-package tokenization
-
-import (
-    "context"
-    "crypto/aes"
-    "crypto/cipher"
-    "crypto/rand"
-    "encoding/base64"
-    "fmt"
-    "io"
-    
-    vault "github.com/hashicorp/vault/api"
-)
-
-// Card Tokenization - ไม่เก็บ PAN (Primary Account Number) ตรงๆ
-// แทนที่ด้วย Token ที่ไม่มีค่าถ้าถูก leak
-
-type CardTokenizer struct {
-    vaultClient *vault.Client
-    db          TokenRepository
+export interface PaymentRequest {
+  orderId: string;
+  customerId: string;
+  amount: number;
+  currency: string;
+  paymentMethod: PaymentMethod;
+  metadata?: Record<string, any>;
 }
 
-type CardData struct {
-    PAN         string // 4111111111111111
-    ExpiryMonth int
-    ExpiryYear  int
-    CVV         string // ห้ามเก็บหลัง Authorization!
-    HolderName  string
+export interface PaymentMethod {
+  type: 'card' | 'paypal' | 'bank_transfer';
+  token?: string;
+  paypalOrderId?: string;
+  bankAccount?: BankAccount;
 }
 
-type CardToken struct {
-    Token       string // tok_xxxxxxxxxxxxxxxx
-    Last4       string // 1111
-    Brand       string // Visa, Mastercard
-    ExpiryMonth int
-    ExpiryYear  int
-    HolderName  string
+export interface PaymentResult {
+  paymentId: string;
+  status: PaymentStatus;
+  transactionId?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  amount: number;
+  currency: string;
+  processedAt: Date;
 }
 
-func (t *CardTokenizer) Tokenize(ctx context.Context, card CardData) (*CardToken, error) {
-    // Validate card number (Luhn algorithm)
-    if !luhn.Validate(card.PAN) {
-        return nil, ErrInvalidCardNumber
-    }
-    
-    // Detect card brand
-    brand := detectBrand(card.PAN)
-    last4 := card.PAN[len(card.PAN)-4:]
-    
-    // Encrypt PAN using Vault Transit (Hardware Security Module)
-    encrypted, err := t.vaultClient.Logical().Write(
-        "transit/encrypt/payment-key",
-        map[string]interface{}{
-            "plaintext": base64.StdEncoding.EncodeToString([]byte(card.PAN)),
-        },
-    )
-    if err != nil {
-        return nil, fmt.Errorf("encryption failed: %w", err)
-    }
-    
-    // Generate non-sensitive token
-    tokenID := generateToken() // tok_xxx
-    
-    // Store token → encrypted PAN mapping (in HSM-backed storage)
-    if err := t.db.StoreToken(ctx, TokenRecord{
-        Token:          tokenID,
-        EncryptedPAN:   encrypted.Data["ciphertext"].(string),
-        Last4:          last4,
-        Brand:          brand,
-        ExpiryMonth:    card.ExpiryMonth,
-        ExpiryYear:     card.ExpiryYear,
-        HolderName:     card.HolderName,
-        // CVV ห้ามเก็บ!!
-    }); err != nil {
-        return nil, err
-    }
-    
-    return &CardToken{
-        Token:       tokenID,
-        Last4:       last4,
-        Brand:       brand,
-        ExpiryMonth: card.ExpiryMonth,
-        ExpiryYear:  card.ExpiryYear,
-        HolderName:  card.HolderName,
-    }, nil
+export enum PaymentStatus {
+  PENDING = 'PENDING',
+  PROCESSING = 'PROCESSING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  CANCELLED = 'CANCELLED',
+  REFUNDED = 'REFUNDED',
 }
 
-// Detokenize สำหรับส่งไป Payment Processor เท่านั้น
-func (t *CardTokenizer) Detokenize(ctx context.Context, token string) (*CardData, error) {
-    // Audit log: ทุกครั้งที่ Detokenize ต้อง Log
-    auditLog(ctx, "DETOKENIZE", token)
-    
-    record, err := t.db.GetToken(ctx, token)
-    if err != nil {
-        return nil, err
-    }
-    
-    // Decrypt from Vault
-    decrypted, err := t.vaultClient.Logical().Write(
-        "transit/decrypt/payment-key",
-        map[string]interface{}{
-            "ciphertext": record.EncryptedPAN,
-        },
-    )
-    if err != nil {
-        return nil, err
-    }
-    
-    panBytes, _ := base64.StdEncoding.DecodeString(decrypted.Data["plaintext"].(string))
-    
-    return &CardData{
-        PAN:         string(panBytes),
-        ExpiryMonth: record.ExpiryMonth,
-        ExpiryYear:  record.ExpiryYear,
-        HolderName:  record.HolderName,
-    }, nil
-}
-```
-
-### 3.3 Audit Logging
-
-```go
-// payment-service/internal/audit/logger.go
-package audit
-
-import (
-    "context"
-    "time"
-)
-
-// Audit Log ต้องเป็น Append-only (ห้าม Update/Delete)
-type AuditLog struct {
-    ID          string    `db:"id"`
-    UserID      string    `db:"user_id"`
-    Action      string    `db:"action"`      // PAYMENT_INITIATED, CARD_TOKENIZED
-    ResourceType string   `db:"resource_type"` // transaction, card_token
-    ResourceID  string    `db:"resource_id"`
-    IPAddress   string    `db:"ip_address"`
-    UserAgent   string    `db:"user_agent"`
-    Success     bool      `db:"success"`
-    Metadata    JSONB     `db:"metadata"`
-    CreatedAt   time.Time `db:"created_at"`
+export interface BankAccount {
+  accountNumber: string;
+  routingNumber: string;
+  accountType: 'checking' | 'savings';
 }
 
-// SQL: audit_logs table ใช้ INSERT-only policy
-// CREATE RULE no_update AS ON UPDATE TO audit_logs DO INSTEAD NOTHING;
-// CREATE RULE no_delete AS ON DELETE TO audit_logs DO INSTEAD NOTHING;
+@Injectable()
+export class PaymentOrchestratorService {
+  private readonly logger = new Logger(PaymentOrchestratorService.name);
 
-type AuditLogger struct {
-    db DB
-}
+  constructor(
+    private readonly fraudDetectionService: FraudDetectionService,
+    private readonly currencyConversionService: CurrencyConversionService,
+    private readonly paymentGatewayService: PaymentGatewayService,
+    private readonly transactionService: TransactionService,
+    private readonly notificationService: NotificationService,
+    private readonly eventEmitter: EventEmitter2,
+    private readonly dataSource: DataSource,
+  ) {}
 
-func (l *AuditLogger) Log(ctx context.Context, entry AuditLog) error {
-    entry.ID = generateUUID()
-    entry.CreatedAt = time.Now().UTC()
-    entry.IPAddress = getIPFromContext(ctx)
-    entry.UserAgent = getUserAgentFromContext(ctx)
-    
-    _, err := l.db.ExecContext(ctx, `
-        INSERT INTO audit_logs 
-        (id, user_id, action, resource_type, resource_id, ip_address, user_agent, success, metadata, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    `, entry.ID, entry.UserID, entry.Action, entry.ResourceType,
-        entry.ResourceID, entry.IPAddress, entry.UserAgent,
-        entry.Success, entry.Metadata, entry.CreatedAt)
-    
-    return err
-}
-```
+  async processPayment(request: PaymentRequest): Promise<PaymentResult> {
+    const paymentId = uuidv4();
+    const idempotencyKey = `${request.orderId}-${request.customerId}`;
 
----
+    this.logger.log(`Processing payment ${paymentId} for order ${request.orderId}`);
 
-## 4. Transaction Processing
-
-### 4.1 Transaction State Machine
-
-```
-Transaction States:
-┌──────────────────────────────────────────────────────────────────┐
-│                     Transaction FSM                               │
-│                                                                    │
-│  INITIATED ──────> PROCESSING ──────> COMPLETED                  │
-│      │                  │                                         │
-│      │                  ├──────────> FAILED                       │
-│      │                  │                                         │
-│      │                  └──────────> PENDING_3DS                  │
-│      │                                    │                        │
-│      │                              AUTHORIZED                     │
-│      │                                    │                        │
-│      └──> CANCELLED              CAPTURED (final for cards)        │
-│                                           │                        │
-│                                    REFUND_REQUESTED                │
-│                                           │                        │
-│                                    REFUNDED                        │
-└──────────────────────────────────────────┘
-```
-
-### 4.2 PromptPay Integration
-
-```go
-// payment-service/internal/providers/promptpay/client.go
-package promptpay
-
-import (
-    "context"
-    "crypto/tls"
-    "encoding/xml"
-    "fmt"
-    "time"
-)
-
-// PromptPay ผ่าน NITMX/ITMX Standards
-// อ้างอิง: Bank of Thailand Payment Standard
-
-type PromptPayClient struct {
-    bankCode    string
-    merchantID  string
-    privateKey  []byte
-    certificate []byte
-    baseURL     string
-    httpClient  *http.Client
-}
-
-type QRPaymentRequest struct {
-    MerchantID  string
-    Amount      decimal.Decimal
-    Currency    string // THB
-    Reference   string // Order ID
-    Description string
-    ExpiresAt   time.Time
-}
-
-type QRPaymentResponse struct {
-    QRString    string  // EMVCo QR string
-    QRImageURL  string  // QR image URL
-    TransactionID string
-    ExpiresAt   time.Time
-}
-
-func (c *PromptPayClient) GenerateQR(ctx context.Context, req QRPaymentRequest) (*QRPaymentResponse, error) {
-    // สร้าง EMVCo QR Code ตาม Bank of Thailand Standard
-    qrData := buildEMVCoQR(
-        c.merchantID,
-        req.Amount,
-        req.Currency,
-        req.Reference,
-    )
-    
-    // Sign with merchant certificate
-    signature, err := c.signData(qrData)
-    if err != nil {
-        return nil, fmt.Errorf("sign QR data: %w", err)
-    }
-    
-    // Call NITMX API
-    resp, err := c.callNITMX(ctx, "/qr/generate", map[string]interface{}{
-        "merchant_id":   c.merchantID,
-        "qr_data":       qrData,
-        "signature":     signature,
-        "amount":        req.Amount.String(),
-        "currency":      req.Currency,
-        "reference":     req.Reference,
-        "expires_at":    req.ExpiresAt.Unix(),
-    })
-    
-    return &QRPaymentResponse{
-        QRString:      resp.QRString,
-        QRImageURL:    resp.QRImageURL,
-        TransactionID: resp.TransactionID,
-        ExpiresAt:     req.ExpiresAt,
-    }, nil
-}
-
-// Webhook รับการแจ้งเตือนเมื่อมีการชำระเงิน
-func (c *PromptPayClient) HandleWebhook(ctx context.Context, payload []byte, signature string) (*PaymentNotification, error) {
-    // Verify signature
-    if !c.verifySignature(payload, signature) {
-        return nil, ErrInvalidSignature
-    }
-    
-    var notification PaymentNotification
-    if err := json.Unmarshal(payload, &notification); err != nil {
-        return nil, err
-    }
-    
-    // Idempotency check
-    if processed, _ := c.isProcessed(ctx, notification.TransactionID); processed {
-        return &notification, nil // Already processed
-    }
-    
-    return &notification, nil
-}
-
-// EMVCo QR Code Builder (ตาม Thailand QR Standard)
-func buildEMVCoQR(merchantID string, amount decimal.Decimal, currency, reference string) string {
-    // Format: ID(length)Value
-    // 00: Payload Format Indicator = 01
-    // 01: Point of Initiation Method = 12 (Dynamic QR)
-    // 29: Merchant Account Information (PromptPay)
-    //     00: Globally Unique ID
-    //     01: Merchant ID (Thai National ID/Phone/Tax ID)
-    // 52: Merchant Category Code
-    // 53: Transaction Currency (764 = THB)
-    // 54: Transaction Amount
-    // 58: Country Code = TH
-    // 59: Merchant Name
-    // 60: Merchant City
-    // 62: Additional Data
-    //     05: Reference Label
-    // 63: CRC
-    
-    data := fmt.Sprintf("000201" +   // Payload Format
-        "010212" +                    // Dynamic QR
-        "2937" +                      // Merchant Account (PromptPay)
-        "0016A000000677010111" +      // PromptPay AID
-        "011300%s" +                  // Merchant ID (13 digits)
-        "5204%s" +                    // MCC
-        "5303764" +                   // THB
-        "54%02d%s" +                  // Amount
-        "5802TH" +                    // Country
-        "...",
-        merchantID,
-        "5812",                       // General Merchandise
-        len(amount.String()), amount.String(),
-    )
-    
-    // Append CRC16
-    crc := calculateCRC16(data + "6304")
-    return data + fmt.Sprintf("6304%04X", crc)
-}
-```
-
-### 4.3 Credit Card Processing (3DS 2.0)
-
-```go
-// payment-service/internal/providers/card/processor.go
-package card
-
-import (
-    "context"
-    "time"
-)
-
-type CardProcessor struct {
-    omise    *OmiseClient
-    tokenizer *Tokenizer
-    db       TransactionRepository
-}
-
-type ChargeRequest struct {
-    CardToken   string
-    Amount      decimal.Decimal
-    Currency    string
-    OrderID     string
-    CustomerID  string
-    Description string
-    ReturnURL   string // สำหรับ 3DS redirect
-}
-
-func (p *CardProcessor) Charge(ctx context.Context, req ChargeRequest) (*ChargeResponse, error) {
-    // 1. Fraud check ก่อน charge
-    fraudScore, err := p.fraudService.Score(ctx, FraudCheckRequest{
-        CustomerID: req.CustomerID,
-        Amount:     req.Amount,
-        CardToken:  req.CardToken,
-    })
-    if err == nil && fraudScore.Score > 80 {
-        return nil, ErrHighFraudRisk
-    }
-    
-    // 2. Detokenize (เฉพาะส่วนที่จำเป็น)
-    card, err := p.tokenizer.Detokenize(ctx, req.CardToken)
-    if err != nil {
-        return nil, fmt.Errorf("detokenize failed: %w", err)
-    }
-    
-    // 3. Create transaction record
-    txn := &Transaction{
-        ID:          generateTxnID(),
-        OrderID:     req.OrderID,
-        CustomerID:  req.CustomerID,
-        Amount:      req.Amount,
-        Currency:    req.Currency,
-        Status:      TxnStatusProcessing,
-        CreatedAt:   time.Now(),
-    }
-    
-    if err := p.db.Create(ctx, txn); err != nil {
-        return nil, err
-    }
-    
-    // 4. Call Payment Processor (Omise)
-    chargeResult, err := p.omise.CreateCharge(ctx, &omise.ChargeParams{
-        Amount:      req.Amount.Mul(decimal.NewFromInt(100)).IntPart(), // Satang
-        Currency:    "THB",
-        Card:        card.PANToken, // Omise token
-        Description: req.Description,
-        ReturnURI:   req.ReturnURL,
-        Metadata:    map[string]interface{}{"order_id": req.OrderID},
-        ThreeDSVersion: "2",
-    })
-    
-    if err != nil {
-        p.db.UpdateStatus(ctx, txn.ID, TxnStatusFailed, err.Error())
-        return nil, err
-    }
-    
-    // 5. Handle 3DS if required
-    if chargeResult.Status == "pending" && chargeResult.AuthorizeURI != "" {
-        p.db.UpdateStatus(ctx, txn.ID, TxnStatusPending3DS, "")
-        return &ChargeResponse{
-            Status:       "requires_action",
-            RedirectURL:  chargeResult.AuthorizeURI,
-            TransactionID: txn.ID,
-        }, nil
-    }
-    
-    // 6. Update transaction
-    status := TxnStatusCompleted
-    if chargeResult.Status == "failed" {
-        status = TxnStatusFailed
-    }
-    p.db.UpdateStatus(ctx, txn.ID, status, chargeResult.FailureMessage)
-    
-    return &ChargeResponse{
-        Status:        string(status),
-        TransactionID: txn.ID,
-        ChargeID:      chargeResult.ID,
-    }, nil
-}
-```
-
----
-
-## 5. Reconciliation System
-
-### 5.1 Reconciliation Architecture
-
-```
-Reconciliation คือ: การตรวจสอบว่า Transaction ของเรา
-ตรงกับที่ Bank/PSP บันทึกไว้หรือไม่
-
-Daily Reconciliation Flow:
-┌──────────────────────────────────────────────────────────────┐
-│                                                               │
-│  02:00 AM: Download Settlement Files from Banks/PSPs         │
-│     ↓                                                         │
-│  02:30 AM: Parse and Normalize Data                          │
-│     ↓                                                         │
-│  03:00 AM: Match against Internal Transactions               │
-│     ↓                                                         │
-│  03:30 AM: Generate Discrepancy Report                       │
-│     ↓                                                         │
-│  04:00 AM: Alert Finance Team for manual review              │
-│     ↓                                                         │
-│  09:00 AM: Finance team resolves discrepancies               │
-└──────────────────────────────────────────────────────────────┘
-
-Types of Discrepancies:
-1. Missing in Bank (ระบบเราบันทึก แต่ Bank ไม่มี)
-2. Missing in Ours (Bank มี แต่ระบบเราไม่มี)
-3. Amount Mismatch (จำนวนไม่ตรงกัน)
-4. Status Mismatch (สถานะไม่ตรงกัน)
-```
-
-### 5.2 Double-Entry Bookkeeping
-
-```go
-// payment-service/internal/ledger/ledger.go
-package ledger
-
-import (
-    "context"
-    "database/sql"
-    "time"
-    
-    "github.com/shopspring/decimal"
-)
-
-// Double-Entry Bookkeeping
-// ทุก Transaction ต้องมี Debit = Credit
-
-type LedgerEntry struct {
-    ID            string          `db:"id"`
-    TransactionID string          `db:"transaction_id"`
-    AccountID     string          `db:"account_id"`
-    EntryType     string          `db:"entry_type"` // DEBIT or CREDIT
-    Amount        decimal.Decimal `db:"amount"`
-    Currency      string          `db:"currency"`
-    Description   string          `db:"description"`
-    BalanceBefore decimal.Decimal `db:"balance_before"`
-    BalanceAfter  decimal.Decimal `db:"balance_after"`
-    CreatedAt     time.Time       `db:"created_at"`
-}
-
-// Accounts:
-// CUSTOMER_WALLET_XXXX  (Asset)
-// MERCHANT_WALLET_XXXX  (Liability to merchant)
-// PLATFORM_FEE          (Revenue)
-// PAYMENT_GATEWAY_FEE   (Expense)
-// CLEARING_ACCOUNT      (Transitional)
-
-type LedgerService struct {
-    db *sql.DB
-}
-
-// Customer pays merchant: ตัวอย่าง 1,000 THB, fee 2%
-func (l *LedgerService) RecordPayment(ctx context.Context, params PaymentParams) error {
-    tx, err := l.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    amount := params.Amount              // 1,000
-    fee := amount.Mul(decimal.NewFromFloat(0.02)) // 20
-    merchantAmount := amount.Sub(fee)    // 980
-
-    entries := []LedgerEntry{
-        // Customer pays
-        {
-            AccountID:   "CUSTOMER_WALLET_" + params.CustomerID,
-            EntryType:   "DEBIT",
-            Amount:      amount,
-            Description: "Payment for order " + params.OrderID,
-        },
-        // Goes to clearing
-        {
-            AccountID:   "CLEARING_ACCOUNT",
-            EntryType:   "CREDIT",
-            Amount:      amount,
-            Description: "Payment clearing",
-        },
-        // Clearing to merchant
-        {
-            AccountID:   "CLEARING_ACCOUNT",
-            EntryType:   "DEBIT",
-            Amount:      merchantAmount,
-            Description: "Settlement to merchant",
-        },
-        {
-            AccountID:   "MERCHANT_WALLET_" + params.MerchantID,
-            EntryType:   "CREDIT",
-            Amount:      merchantAmount,
-            Description: "Payment received for order " + params.OrderID,
-        },
-        // Platform fee
-        {
-            AccountID:   "CLEARING_ACCOUNT",
-            EntryType:   "DEBIT",
-            Amount:      fee,
-            Description: "Platform fee",
-        },
-        {
-            AccountID:   "PLATFORM_FEE_REVENUE",
-            EntryType:   "CREDIT",
-            Amount:      fee,
-            Description: "Platform fee from order " + params.OrderID,
-        },
+    // ตรวจสอบ Idempotency - ป้องกันการชำระซ้ำ
+    const existingPayment = await this.transactionService.findByIdempotencyKey(idempotencyKey);
+    if (existingPayment) {
+      this.logger.log(`Duplicate payment detected for key ${idempotencyKey}`);
+      return this.mapToPaymentResult(existingPayment);
     }
 
-    for _, entry := range entries {
-        entry.ID = generateUUID()
-        entry.TransactionID = params.TransactionID
-        entry.Currency = params.Currency
-        entry.CreatedAt = time.Now()
+    // เริ่ม Database Transaction
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // 1. บันทึก Transaction เริ่มต้นด้วยสถานะ PENDING
+      const transaction = await this.transactionService.create({
+        paymentId,
+        idempotencyKey,
+        ...request,
+        status: PaymentStatus.PENDING,
+      }, queryRunner);
+
+      // 2. ตรวจสอบการฉ้อโกง (Fraud Detection)
+      const fraudResult = await this.fraudDetectionService.analyze({
+        customerId: request.customerId,
+        amount: request.amount,
+        currency: request.currency,
+        paymentMethod: request.paymentMethod,
+        metadata: request.metadata,
+      });
+
+      if (fraudResult.isBlocked) {
+        await this.transactionService.updateStatus(
+          paymentId,
+          PaymentStatus.FAILED,
+          'FRAUD_DETECTED',
+          fraudResult.reason,
+          queryRunner,
+        );
+        await queryRunner.commitTransaction();
         
-        // Update running balance atomically
-        var currentBalance decimal.Decimal
-        err := tx.QueryRowContext(ctx, `
-            SELECT COALESCE(balance, 0) FROM account_balances 
-            WHERE account_id = $1 FOR UPDATE
-        `, entry.AccountID).Scan(&currentBalance)
+        this.eventEmitter.emit('payment.fraud_detected', { paymentId, ...fraudResult });
         
-        if entry.EntryType == "DEBIT" {
-            entry.BalanceBefore = currentBalance
-            entry.BalanceAfter = currentBalance.Sub(entry.Amount)
-        } else {
-            entry.BalanceBefore = currentBalance
-            entry.BalanceAfter = currentBalance.Add(entry.Amount)
+        return {
+          paymentId,
+          status: PaymentStatus.FAILED,
+          errorCode: 'FRAUD_DETECTED',
+          errorMessage: fraudResult.reason,
+          amount: request.amount,
+          currency: request.currency,
+          processedAt: new Date(),
+        };
+      }
+
+      // 3. แปลงสกุลเงิน (ถ้าจำเป็น)
+      let processAmount = request.amount;
+      let processCurrency = request.currency;
+      
+      if (request.currency !== 'USD') {
+        const conversionResult = await this.currencyConversionService.convert(
+          request.amount,
+          request.currency,
+          'USD',
+        );
+        processAmount = conversionResult.convertedAmount;
+        processCurrency = 'USD';
+        
+        await this.transactionService.updateConversionInfo(
+          paymentId,
+          {
+            originalAmount: request.amount,
+            originalCurrency: request.currency,
+            convertedAmount: processAmount,
+            exchangeRate: conversionResult.rate,
+          },
+          queryRunner,
+        );
+      }
+
+      // 4. อัปเดตสถานะเป็น PROCESSING
+      await this.transactionService.updateStatus(
+        paymentId,
+        PaymentStatus.PROCESSING,
+        undefined,
+        undefined,
+        queryRunner,
+      );
+
+      // 5. ประมวลผลการชำระเงินผ่าน Gateway
+      const gatewayResult = await this.paymentGatewayService.processPayment({
+        paymentId,
+        amount: processAmount,
+        currency: processCurrency,
+        paymentMethod: request.paymentMethod,
+        metadata: {
+          orderId: request.orderId,
+          customerId: request.customerId,
+        },
+      });
+
+      if (gatewayResult.success) {
+        // 6. อัปเดตสถานะเป็น COMPLETED
+        await this.transactionService.updateStatus(
+          paymentId,
+          PaymentStatus.COMPLETED,
+          undefined,
+          undefined,
+          queryRunner,
+          gatewayResult.transactionId,
+        );
+
+        await queryRunner.commitTransaction();
+
+        // 7. ส่ง Event สำหรับ Notification
+        this.eventEmitter.emit('payment.completed', {
+          paymentId,
+          orderId: request.orderId,
+          customerId: request.customerId,
+          amount: request.amount,
+          currency: request.currency,
+          transactionId: gatewayResult.transactionId,
+        });
+
+        return {
+          paymentId,
+          status: PaymentStatus.COMPLETED,
+          transactionId: gatewayResult.transactionId,
+          amount: request.amount,
+          currency: request.currency,
+          processedAt: new Date(),
+        };
+      } else {
+        await this.transactionService.updateStatus(
+          paymentId,
+          PaymentStatus.FAILED,
+          gatewayResult.errorCode,
+          gatewayResult.errorMessage,
+          queryRunner,
+        );
+
+        await queryRunner.commitTransaction();
+
+        this.eventEmitter.emit('payment.failed', {
+          paymentId,
+          orderId: request.orderId,
+          errorCode: gatewayResult.errorCode,
+        });
+
+        return {
+          paymentId,
+          status: PaymentStatus.FAILED,
+          errorCode: gatewayResult.errorCode,
+          errorMessage: gatewayResult.errorMessage,
+          amount: request.amount,
+          currency: request.currency,
+          processedAt: new Date(),
+        };
+      }
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      this.logger.error(`Payment ${paymentId} failed with error: ${error.message}`, error.stack);
+      
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async refundPayment(paymentId: string, amount?: number, reason?: string): Promise<PaymentResult> {
+    const transaction = await this.transactionService.findById(paymentId);
+    
+    if (!transaction) {
+      throw new Error(`Payment ${paymentId} not found`);
+    }
+
+    if (transaction.status !== PaymentStatus.COMPLETED) {
+      throw new Error(`Cannot refund payment with status ${transaction.status}`);
+    }
+
+    const refundAmount = amount || transaction.amount;
+    
+    const refundResult = await this.paymentGatewayService.refundPayment(
+      transaction.transactionId,
+      refundAmount,
+      reason,
+    );
+
+    if (refundResult.success) {
+      await this.transactionService.updateStatus(paymentId, PaymentStatus.REFUNDED);
+      
+      this.eventEmitter.emit('payment.refunded', {
+        paymentId,
+        refundAmount,
+        reason,
+      });
+    }
+
+    return {
+      paymentId,
+      status: PaymentStatus.REFUNDED,
+      transactionId: refundResult.refundId,
+      amount: refundAmount,
+      currency: transaction.currency,
+      processedAt: new Date(),
+    };
+  }
+
+  private mapToPaymentResult(transaction: any): PaymentResult {
+    return {
+      paymentId: transaction.paymentId,
+      status: transaction.status,
+      transactionId: transaction.transactionId,
+      amount: transaction.amount,
+      currency: transaction.currency,
+      processedAt: transaction.createdAt,
+    };
+  }
+}
+```
+
+---
+
+## 3. Payment Gateway Integration
+
+### Stripe Integration
+
+```typescript
+// payment-gateway/src/stripe.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import Stripe from 'stripe';
+import { ConfigService } from '@nestjs/config';
+
+export interface GatewayPaymentRequest {
+  paymentId: string;
+  amount: number;
+  currency: string;
+  paymentMethod: {
+    type: string;
+    token?: string;
+  };
+  metadata: Record<string, string>;
+}
+
+export interface GatewayPaymentResult {
+  success: boolean;
+  transactionId?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  gatewayResponse?: any;
+}
+
+@Injectable()
+export class StripePaymentService {
+  private readonly stripe: Stripe;
+  private readonly logger = new Logger(StripePaymentService.name);
+
+  constructor(private readonly configService: ConfigService) {
+    this.stripe = new Stripe(
+      this.configService.get<string>('STRIPE_SECRET_KEY'),
+      { apiVersion: '2023-10-16' }
+    );
+  }
+
+  async processPayment(request: GatewayPaymentRequest): Promise<GatewayPaymentResult> {
+    try {
+      this.logger.log(`Processing Stripe payment for ${request.paymentId}`);
+
+      // สร้าง Payment Intent
+      const paymentIntent = await this.stripe.paymentIntents.create({
+        amount: Math.round(request.amount * 100), // แปลงเป็น cents
+        currency: request.currency.toLowerCase(),
+        payment_method: request.paymentMethod.token,
+        confirm: true,
+        metadata: {
+          paymentId: request.paymentId,
+          ...request.metadata,
+        },
+        // ตั้งค่า Idempotency key
+        idempotencyKey: request.paymentId,
+      });
+
+      if (paymentIntent.status === 'succeeded') {
+        return {
+          success: true,
+          transactionId: paymentIntent.id,
+          gatewayResponse: paymentIntent,
+        };
+      } else if (paymentIntent.status === 'requires_action') {
+        // จำเป็นต้องมีการยืนยัน 3D Secure
+        return {
+          success: false,
+          errorCode: 'REQUIRES_ACTION',
+          errorMessage: 'Payment requires additional authentication',
+          gatewayResponse: paymentIntent,
+        };
+      } else {
+        return {
+          success: false,
+          errorCode: 'PAYMENT_FAILED',
+          errorMessage: `Payment failed with status: ${paymentIntent.status}`,
+          gatewayResponse: paymentIntent,
+        };
+      }
+    } catch (error) {
+      if (error instanceof Stripe.errors.StripeCardError) {
+        return {
+          success: false,
+          errorCode: error.code,
+          errorMessage: error.message,
+        };
+      }
+      
+      if (error instanceof Stripe.errors.StripeInvalidRequestError) {
+        return {
+          success: false,
+          errorCode: 'INVALID_REQUEST',
+          errorMessage: error.message,
+        };
+      }
+
+      throw error;
+    }
+  }
+
+  async refundPayment(
+    transactionId: string,
+    amount: number,
+    reason?: string,
+  ): Promise<{ success: boolean; refundId?: string }> {
+    try {
+      const refund = await this.stripe.refunds.create({
+        payment_intent: transactionId,
+        amount: Math.round(amount * 100),
+        reason: this.mapRefundReason(reason),
+      });
+
+      return {
+        success: refund.status === 'succeeded',
+        refundId: refund.id,
+      };
+    } catch (error) {
+      this.logger.error(`Stripe refund failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async createWebhookEvent(payload: string | Buffer, signature: string): Promise<Stripe.Event> {
+    const webhookSecret = this.configService.get<string>('STRIPE_WEBHOOK_SECRET');
+    return this.stripe.webhooks.constructEvent(payload, signature, webhookSecret);
+  }
+
+  async handleWebhookEvent(event: Stripe.Event): Promise<void> {
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        this.logger.log(`PaymentIntent succeeded: ${paymentIntent.id}`);
+        break;
+        
+      case 'payment_intent.payment_failed':
+        const failedPayment = event.data.object as Stripe.PaymentIntent;
+        this.logger.warn(`PaymentIntent failed: ${failedPayment.id}`);
+        break;
+        
+      case 'charge.dispute.created':
+        const dispute = event.data.object as Stripe.Dispute;
+        this.logger.warn(`Chargeback created: ${dispute.id}`);
+        // ส่ง Event ไปยัง Chargeback Service
+        break;
+    }
+  }
+
+  private mapRefundReason(reason?: string): Stripe.RefundCreateParams.Reason | undefined {
+    const reasonMap: Record<string, Stripe.RefundCreateParams.Reason> = {
+      'duplicate': 'duplicate',
+      'fraudulent': 'fraudulent',
+      'customer_request': 'requested_by_customer',
+    };
+    return reason ? reasonMap[reason] : 'requested_by_customer';
+  }
+}
+```
+
+### PayPal Integration
+
+```typescript
+// payment-gateway/src/paypal.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import axios, { AxiosInstance } from 'axios';
+
+interface PayPalAccessToken {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  expiresAt: Date;
+}
+
+@Injectable()
+export class PayPalPaymentService {
+  private readonly logger = new Logger(PayPalPaymentService.name);
+  private readonly httpClient: AxiosInstance;
+  private accessToken: PayPalAccessToken | null = null;
+
+  constructor(private readonly configService: ConfigService) {
+    const baseURL = configService.get('PAYPAL_ENV') === 'production'
+      ? 'https://api-m.paypal.com'
+      : 'https://api-m.sandbox.paypal.com';
+
+    this.httpClient = axios.create({
+      baseURL,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private async getAccessToken(): Promise<string> {
+    if (this.accessToken && new Date() < this.accessToken.expiresAt) {
+      return this.accessToken.access_token;
+    }
+
+    const clientId = this.configService.get('PAYPAL_CLIENT_ID');
+    const clientSecret = this.configService.get('PAYPAL_CLIENT_SECRET');
+    const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+    const response = await this.httpClient.post(
+      '/v1/oauth2/token',
+      'grant_type=client_credentials',
+      {
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      },
+    );
+
+    this.accessToken = {
+      ...response.data,
+      expiresAt: new Date(Date.now() + (response.data.expires_in - 60) * 1000),
+    };
+
+    return this.accessToken.access_token;
+  }
+
+  async captureOrder(orderId: string): Promise<GatewayPaymentResult> {
+    try {
+      const token = await this.getAccessToken();
+      
+      const response = await this.httpClient.post(
+        `/v2/checkout/orders/${orderId}/capture`,
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+
+      if (response.data.status === 'COMPLETED') {
+        const capture = response.data.purchase_units[0].payments.captures[0];
+        return {
+          success: true,
+          transactionId: capture.id,
+          gatewayResponse: response.data,
+        };
+      }
+
+      return {
+        success: false,
+        errorCode: response.data.status,
+        errorMessage: 'PayPal order not completed',
+        gatewayResponse: response.data,
+      };
+    } catch (error) {
+      this.logger.error(`PayPal capture failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async refundPayment(
+    captureId: string,
+    amount: number,
+    currency: string,
+  ): Promise<{ success: boolean; refundId?: string }> {
+    try {
+      const token = await this.getAccessToken();
+      
+      const response = await this.httpClient.post(
+        `/v2/payments/captures/${captureId}/refund`,
+        {
+          amount: {
+            value: amount.toFixed(2),
+            currency_code: currency,
+          },
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+
+      return {
+        success: response.data.status === 'COMPLETED',
+        refundId: response.data.id,
+      };
+    } catch (error) {
+      this.logger.error(`PayPal refund failed: ${error.message}`);
+      throw error;
+    }
+  }
+}
+```
+
+---
+
+## 4. Fraud Detection Service
+
+```typescript
+// fraud-detection/src/fraud-detection.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { InjectRedis } from '@liaoliaots/nestjs-redis';
+import Redis from 'ioredis';
+
+export interface FraudAnalysisRequest {
+  customerId: string;
+  amount: number;
+  currency: string;
+  paymentMethod: {
+    type: string;
+    token?: string;
+  };
+  metadata?: Record<string, any>;
+  ipAddress?: string;
+  deviceFingerprint?: string;
+  location?: {
+    country: string;
+    city: string;
+    latitude: number;
+    longitude: number;
+  };
+}
+
+export interface FraudAnalysisResult {
+  isBlocked: boolean;
+  riskScore: number; // 0-100
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  reason?: string;
+  flags: FraudFlag[];
+  requiresAdditionalVerification: boolean;
+}
+
+export interface FraudFlag {
+  type: string;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+  description: string;
+}
+
+@Injectable()
+export class FraudDetectionService {
+  private readonly logger = new Logger(FraudDetectionService.name);
+
+  // เกณฑ์การตรวจจับการฉ้อโกง
+  private readonly VELOCITY_WINDOW_SECONDS = 3600; // 1 ชั่วโมง
+  private readonly MAX_TRANSACTIONS_PER_HOUR = 10;
+  private readonly MAX_AMOUNT_PER_HOUR = 10000;
+  private readonly HIGH_RISK_AMOUNT_THRESHOLD = 5000;
+  private readonly BLOCK_SCORE_THRESHOLD = 75;
+  private readonly VERIFY_SCORE_THRESHOLD = 50;
+
+  constructor(
+    @InjectRedis() private readonly redis: Redis,
+    private readonly riskRuleEngine: RiskRuleEngine,
+    private readonly mlFraudModel: MLFraudModelService,
+    private readonly blacklistService: BlacklistService,
+  ) {}
+
+  async analyze(request: FraudAnalysisRequest): Promise<FraudAnalysisResult> {
+    const flags: FraudFlag[] = [];
+    let riskScore = 0;
+
+    // 1. ตรวจสอบ Blacklist
+    const blacklistCheck = await this.checkBlacklist(request);
+    if (blacklistCheck.isBlacklisted) {
+      return {
+        isBlocked: true,
+        riskScore: 100,
+        riskLevel: 'CRITICAL',
+        reason: `Blacklisted: ${blacklistCheck.reason}`,
+        flags: [{ type: 'BLACKLIST', severity: 'HIGH', description: blacklistCheck.reason }],
+        requiresAdditionalVerification: false,
+      };
+    }
+
+    // 2. ตรวจสอบ Velocity (ความถี่การทำธุรกรรม)
+    const velocityFlags = await this.checkVelocity(request.customerId, request.amount);
+    flags.push(...velocityFlags);
+    riskScore += velocityFlags.reduce((sum, f) => sum + this.getFlagScore(f), 0);
+
+    // 3. ตรวจสอบจำนวนเงิน
+    const amountFlags = this.checkAmountRules(request.amount);
+    flags.push(...amountFlags);
+    riskScore += amountFlags.reduce((sum, f) => sum + this.getFlagScore(f), 0);
+
+    // 4. ตรวจสอบ Geolocation
+    if (request.location) {
+      const geoFlags = await this.checkGeolocation(request.customerId, request.location);
+      flags.push(...geoFlags);
+      riskScore += geoFlags.reduce((sum, f) => sum + this.getFlagScore(f), 0);
+    }
+
+    // 5. ใช้ Rule Engine
+    const ruleFlags = await this.riskRuleEngine.evaluate(request);
+    flags.push(...ruleFlags);
+    riskScore += ruleFlags.reduce((sum, f) => sum + this.getFlagScore(f), 0);
+
+    // 6. ใช้ ML Model (ถ้ามี)
+    try {
+      const mlScore = await this.mlFraudModel.predict({
+        amount: request.amount,
+        customerId: request.customerId,
+        deviceFingerprint: request.deviceFingerprint,
+        flags: flags.map(f => f.type),
+      });
+      riskScore = Math.max(riskScore, mlScore * 100);
+    } catch (error) {
+      this.logger.warn(`ML model prediction failed: ${error.message}`);
+    }
+
+    // จำกัด Score ไม่เกิน 100
+    riskScore = Math.min(riskScore, 100);
+
+    const riskLevel = this.getRiskLevel(riskScore);
+    const isBlocked = riskScore >= this.BLOCK_SCORE_THRESHOLD;
+    const requiresAdditionalVerification = 
+      !isBlocked && riskScore >= this.VERIFY_SCORE_THRESHOLD;
+
+    // บันทึกผลการตรวจสอบใน Redis เพื่อ Analytics
+    await this.recordAnalysisResult(request.customerId, riskScore, isBlocked);
+
+    return {
+      isBlocked,
+      riskScore,
+      riskLevel,
+      reason: isBlocked ? this.getBlockReason(flags) : undefined,
+      flags,
+      requiresAdditionalVerification,
+    };
+  }
+
+  private async checkVelocity(customerId: string, amount: number): Promise<FraudFlag[]> {
+    const flags: FraudFlag[] = [];
+    const key = `velocity:${customerId}`;
+    const now = Date.now();
+    const windowStart = now - this.VELOCITY_WINDOW_SECONDS * 1000;
+
+    // ใช้ Redis Sorted Set เก็บ timestamp ของธุรกรรม
+    await this.redis.zadd(key, now, `${now}`);
+    await this.redis.zremrangebyscore(key, '-inf', windowStart);
+    await this.redis.expire(key, this.VELOCITY_WINDOW_SECONDS * 2);
+
+    const transactionCount = await this.redis.zcard(key);
+    
+    if (transactionCount > this.MAX_TRANSACTIONS_PER_HOUR) {
+      flags.push({
+        type: 'HIGH_VELOCITY',
+        severity: 'HIGH',
+        description: `${transactionCount} transactions in the last hour`,
+      });
+    } else if (transactionCount > this.MAX_TRANSACTIONS_PER_HOUR * 0.7) {
+      flags.push({
+        type: 'MEDIUM_VELOCITY',
+        severity: 'MEDIUM',
+        description: `${transactionCount} transactions approaching limit`,
+      });
+    }
+
+    // ตรวจสอบยอดรวมต่อชั่วโมง
+    const amountKey = `velocity:amount:${customerId}`;
+    const currentHourAmount = parseFloat(await this.redis.get(amountKey) || '0');
+    const newTotal = currentHourAmount + amount;
+    
+    await this.redis.setex(amountKey, this.VELOCITY_WINDOW_SECONDS, newTotal.toString());
+
+    if (newTotal > this.MAX_AMOUNT_PER_HOUR) {
+      flags.push({
+        type: 'HIGH_AMOUNT_VELOCITY',
+        severity: 'HIGH',
+        description: `Total amount $${newTotal} exceeds hourly limit`,
+      });
+    }
+
+    return flags;
+  }
+
+  private checkAmountRules(amount: number): FraudFlag[] {
+    const flags: FraudFlag[] = [];
+    
+    if (amount > this.HIGH_RISK_AMOUNT_THRESHOLD) {
+      flags.push({
+        type: 'HIGH_AMOUNT',
+        severity: 'MEDIUM',
+        description: `Transaction amount $${amount} exceeds threshold`,
+      });
+    }
+
+    // ตรวจสอบจำนวนเงินที่น่าสงสัย (เช่น จำนวนที่ใกล้ขีดจำกัดการรายงาน)
+    if (amount === 9999 || amount === 4999) {
+      flags.push({
+        type: 'STRUCTURING_SUSPICION',
+        severity: 'HIGH',
+        description: 'Amount appears structured to avoid reporting thresholds',
+      });
+    }
+
+    return flags;
+  }
+
+  private async checkGeolocation(
+    customerId: string,
+    location: { country: string; city: string; latitude: number; longitude: number },
+  ): Promise<FraudFlag[]> {
+    const flags: FraudFlag[] = [];
+    const lastLocationKey = `location:${customerId}`;
+    const lastLocation = await this.redis.hgetall(lastLocationKey);
+
+    if (lastLocation && lastLocation.country) {
+      // ตรวจสอบ Impossible Travel
+      if (lastLocation.country !== location.country) {
+        const timeSinceLastTransaction = Date.now() - parseInt(lastLocation.timestamp);
+        const distanceKm = this.calculateDistance(
+          parseFloat(lastLocation.latitude),
+          parseFloat(lastLocation.longitude),
+          location.latitude,
+          location.longitude,
+        );
+        
+        const maxPossibleSpeed = 1000; // km/h (เครื่องบิน)
+        const timeHours = timeSinceLastTransaction / 3600000;
+        const requiredSpeed = distanceKm / timeHours;
+
+        if (requiredSpeed > maxPossibleSpeed) {
+          flags.push({
+            type: 'IMPOSSIBLE_TRAVEL',
+            severity: 'HIGH',
+            description: `Impossible travel detected: ${distanceKm.toFixed(0)}km in ${(timeHours * 60).toFixed(0)} minutes`,
+          });
         }
-        
-        // Insert ledger entry
-        _, err = tx.ExecContext(ctx, `
-            INSERT INTO ledger_entries 
-            (id, transaction_id, account_id, entry_type, amount, currency, 
-             description, balance_before, balance_after, created_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        `, entry.ID, entry.TransactionID, entry.AccountID, entry.EntryType,
-            entry.Amount, entry.Currency, entry.Description,
-            entry.BalanceBefore, entry.BalanceAfter, entry.CreatedAt)
-        
-        // Update balance
-        _, err = tx.ExecContext(ctx, `
-            INSERT INTO account_balances (account_id, balance) VALUES ($1, $2)
-            ON CONFLICT (account_id) DO UPDATE SET balance = $2
-        `, entry.AccountID, entry.BalanceAfter)
+      }
     }
 
-    return tx.Commit()
+    // บันทึก Location ปัจจุบัน
+    await this.redis.hset(lastLocationKey, {
+      country: location.country,
+      city: location.city,
+      latitude: location.latitude.toString(),
+      longitude: location.longitude.toString(),
+      timestamp: Date.now().toString(),
+    });
+    await this.redis.expire(lastLocationKey, 86400); // 24 ชั่วโมง
+
+    return flags;
+  }
+
+  private calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // รัศมีโลก (km)
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  }
+
+  private async checkBlacklist(request: FraudAnalysisRequest): Promise<{
+    isBlacklisted: boolean;
+    reason?: string;
+  }> {
+    const results = await Promise.all([
+      this.blacklistService.checkCustomer(request.customerId),
+      request.ipAddress ? this.blacklistService.checkIP(request.ipAddress) : Promise.resolve(null),
+    ]);
+
+    for (const result of results) {
+      if (result?.isBlacklisted) {
+        return result;
+      }
+    }
+
+    return { isBlacklisted: false };
+  }
+
+  private getRiskLevel(score: number): 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' {
+    if (score < 25) return 'LOW';
+    if (score < 50) return 'MEDIUM';
+    if (score < 75) return 'HIGH';
+    return 'CRITICAL';
+  }
+
+  private getFlagScore(flag: FraudFlag): number {
+    const severityScores = { LOW: 10, MEDIUM: 25, HIGH: 40 };
+    return severityScores[flag.severity] || 0;
+  }
+
+  private getBlockReason(flags: FraudFlag[]): string {
+    const highSeverityFlags = flags.filter(f => f.severity === 'HIGH');
+    if (highSeverityFlags.length > 0) {
+      return highSeverityFlags.map(f => f.description).join('; ');
+    }
+    return 'Multiple risk factors detected';
+  }
+
+  private async recordAnalysisResult(
+    customerId: string,
+    score: number,
+    isBlocked: boolean,
+  ): Promise<void> {
+    const key = `fraud:stats:${customerId}`;
+    await this.redis.lpush(key, JSON.stringify({
+      score,
+      isBlocked,
+      timestamp: new Date().toISOString(),
+    }));
+    await this.redis.ltrim(key, 0, 99); // เก็บ 100 รายการล่าสุด
+    await this.redis.expire(key, 86400 * 30); // 30 วัน
+  }
 }
 ```
 
-### 5.3 Reconciliation Service
+---
 
-```go
-// reconciliation-service/internal/reconciler/reconciler.go
-package reconciler
+## 5. Currency Conversion Service
 
-import (
-    "context"
-    "time"
-)
+```typescript
+// currency-conversion/src/currency.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { InjectRedis } from '@liaoliaots/nestjs-redis';
+import Redis from 'ioredis';
+import { firstValueFrom } from 'rxjs';
 
-type ReconciliationService struct {
-    internalDB  TransactionRepository
-    bankClients map[string]BankClient
-    reporter    ReportService
-    notifier    NotificationService
+export interface ConversionResult {
+  fromCurrency: string;
+  toCurrency: string;
+  originalAmount: number;
+  convertedAmount: number;
+  rate: number;
+  rateTimestamp: Date;
 }
 
-func (r *ReconciliationService) RunDailyReconciliation(ctx context.Context, date time.Time) error {
-    report := &ReconciliationReport{
-        Date:      date,
-        StartedAt: time.Now(),
+@Injectable()
+export class CurrencyConversionService {
+  private readonly logger = new Logger(CurrencyConversionService.name);
+  private readonly RATE_CACHE_TTL = 3600; // 1 ชั่วโมง
+  private readonly RATE_CACHE_PREFIX = 'exchange_rate:';
+
+  constructor(
+    private readonly httpService: HttpService,
+    @InjectRedis() private readonly redis: Redis,
+  ) {}
+
+  async convert(
+    amount: number,
+    fromCurrency: string,
+    toCurrency: string,
+  ): Promise<ConversionResult> {
+    if (fromCurrency === toCurrency) {
+      return {
+        fromCurrency,
+        toCurrency,
+        originalAmount: amount,
+        convertedAmount: amount,
+        rate: 1,
+        rateTimestamp: new Date(),
+      };
     }
 
-    // Get all payment methods
-    paymentMethods := []string{"omise", "promptpay", "truemoney", "kbank_direct"}
+    const rate = await this.getExchangeRate(fromCurrency, toCurrency);
+    const convertedAmount = Math.round(amount * rate * 100) / 100;
+
+    return {
+      fromCurrency,
+      toCurrency,
+      originalAmount: amount,
+      convertedAmount,
+      rate,
+      rateTimestamp: new Date(),
+    };
+  }
+
+  async getExchangeRate(fromCurrency: string, toCurrency: string): Promise<number> {
+    const cacheKey = `${this.RATE_CACHE_PREFIX}${fromCurrency}_${toCurrency}`;
     
-    for _, method := range paymentMethods {
-        result, err := r.reconcileMethod(ctx, date, method)
-        if err != nil {
-            report.Errors = append(report.Errors, ReconciliationError{
-                Method: method,
-                Error:  err.Error(),
-            })
-            continue
-        }
-        report.Results = append(report.Results, *result)
+    // ตรวจสอบ Cache ก่อน
+    const cachedRate = await this.redis.get(cacheKey);
+    if (cachedRate) {
+      return parseFloat(cachedRate);
     }
 
-    report.FinishedAt = time.Now()
-    report.Status = "completed"
+    // ดึงอัตราแลกเปลี่ยนจาก External API
+    try {
+      const response = await firstValueFrom(
+        this.httpService.get(
+          `https://api.exchangeratesapi.io/v1/latest?base=${fromCurrency}&symbols=${toCurrency}&access_key=${process.env.EXCHANGE_RATE_API_KEY}`,
+        ),
+      );
+
+      const rate = response.data.rates[toCurrency];
+      
+      if (!rate) {
+        throw new Error(`Exchange rate not found for ${fromCurrency} to ${toCurrency}`);
+      }
+
+      // Cache อัตราแลกเปลี่ยน
+      await this.redis.setex(cacheKey, this.RATE_CACHE_TTL, rate.toString());
+      
+      return rate;
+    } catch (error) {
+      this.logger.error(`Failed to fetch exchange rate: ${error.message}`);
+      
+      // ใช้ Rate จาก Fallback ที่เก็บในฐานข้อมูล
+      return this.getFallbackRate(fromCurrency, toCurrency);
+    }
+  }
+
+  async getSupportedCurrencies(): Promise<string[]> {
+    return ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'KRW', 'THB', 'SGD', 'AUD', 'CAD'];
+  }
+
+  private async getFallbackRate(fromCurrency: string, toCurrency: string): Promise<number> {
+    // อัตราแลกเปลี่ยนสำรอง (ควรอัปเดตเป็นประจำ)
+    const fallbackRates: Record<string, number> = {
+      'USD_THB': 35.5,
+      'EUR_THB': 38.2,
+      'GBP_THB': 44.8,
+      'USD_EUR': 0.92,
+      'USD_GBP': 0.79,
+    };
+
+    const key = `${fromCurrency}_${toCurrency}`;
+    const rate = fallbackRates[key];
     
-    // Save report
-    if err := r.reporter.Save(ctx, report); err != nil {
-        return err
+    if (!rate) {
+      throw new Error(`No fallback rate available for ${fromCurrency} to ${toCurrency}`);
+    }
+
+    this.logger.warn(`Using fallback rate for ${key}: ${rate}`);
+    return rate;
+  }
+}
+```
+
+---
+
+## 6. Transaction Management & Idempotency
+
+```typescript
+// transaction/src/transaction.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, QueryRunner } from 'typeorm';
+import { InjectRedis } from '@liaoliaots/nestjs-redis';
+import Redis from 'ioredis';
+
+import { Transaction } from './entities/transaction.entity';
+import { PaymentStatus } from '../types/payment.types';
+
+@Injectable()
+export class TransactionService {
+  private readonly logger = new Logger(TransactionService.name);
+  private readonly IDEMPOTENCY_TTL = 86400 * 7; // 7 วัน
+
+  constructor(
+    @InjectRepository(Transaction)
+    private readonly transactionRepository: Repository<Transaction>,
+    @InjectRedis() private readonly redis: Redis,
+  ) {}
+
+  async create(data: Partial<Transaction>, queryRunner?: QueryRunner): Promise<Transaction> {
+    const transaction = this.transactionRepository.create(data);
+    
+    if (queryRunner) {
+      return queryRunner.manager.save(transaction);
     }
     
-    // Alert if discrepancies found
-    totalDiscrepancies := 0
-    for _, result := range report.Results {
-        totalDiscrepancies += len(result.Discrepancies)
-    }
+    return this.transactionRepository.save(transaction);
+  }
+
+  async findByIdempotencyKey(key: string): Promise<Transaction | null> {
+    // ตรวจสอบจาก Redis Cache ก่อน (เร็วกว่า)
+    const cacheKey = `idempotency:${key}`;
+    const cachedResult = await this.redis.get(cacheKey);
     
-    if totalDiscrepancies > 0 {
-        r.notifier.AlertFinanceTeam(ctx, AlertRequest{
-            Subject: fmt.Sprintf("Reconciliation: %d discrepancies found for %s", 
-                totalDiscrepancies, date.Format("2006-01-02")),
-            ReportURL: fmt.Sprintf("/reports/reconciliation/%s", report.ID),
+    if (cachedResult) {
+      const transactionId = cachedResult;
+      return this.transactionRepository.findOne({ where: { paymentId: transactionId } });
+    }
+
+    // ถ้าไม่มีใน Cache ตรวจสอบจาก Database
+    const transaction = await this.transactionRepository.findOne({
+      where: { idempotencyKey: key },
+    });
+
+    if (transaction) {
+      // บันทึกลง Cache
+      await this.redis.setex(cacheKey, this.IDEMPOTENCY_TTL, transaction.paymentId);
+    }
+
+    return transaction;
+  }
+
+  async findById(paymentId: string): Promise<Transaction | null> {
+    return this.transactionRepository.findOne({ where: { paymentId } });
+  }
+
+  async updateStatus(
+    paymentId: string,
+    status: PaymentStatus,
+    errorCode?: string,
+    errorMessage?: string,
+    queryRunner?: QueryRunner,
+    transactionId?: string,
+  ): Promise<void> {
+    const updateData: Partial<Transaction> = {
+      status,
+      updatedAt: new Date(),
+    };
+
+    if (errorCode) updateData.errorCode = errorCode;
+    if (errorMessage) updateData.errorMessage = errorMessage;
+    if (transactionId) updateData.transactionId = transactionId;
+    if (status === PaymentStatus.COMPLETED) updateData.completedAt = new Date();
+
+    if (queryRunner) {
+      await queryRunner.manager.update(Transaction, { paymentId }, updateData);
+    } else {
+      await this.transactionRepository.update({ paymentId }, updateData);
+    }
+  }
+
+  async getTransactionStats(customerId: string): Promise<{
+    totalTransactions: number;
+    totalAmount: number;
+    successRate: number;
+  }> {
+    const result = await this.transactionRepository
+      .createQueryBuilder('t')
+      .where('t.customerId = :customerId', { customerId })
+      .select([
+        'COUNT(*) as totalTransactions',
+        'SUM(CASE WHEN t.status = :completed THEN t.amount ELSE 0 END) as totalAmount',
+        'AVG(CASE WHEN t.status = :completed THEN 1 ELSE 0 END) * 100 as successRate',
+      ])
+      .setParameter('completed', PaymentStatus.COMPLETED)
+      .getRawOne();
+
+    return {
+      totalTransactions: parseInt(result.totalTransactions),
+      totalAmount: parseFloat(result.totalAmount),
+      successRate: parseFloat(result.successRate),
+    };
+  }
+}
+```
+
+### Transaction Entity
+
+```typescript
+// transaction/src/entities/transaction.entity.ts
+import {
+  Entity,
+  Column,
+  PrimaryGeneratedColumn,
+  CreateDateColumn,
+  UpdateDateColumn,
+  Index,
+} from 'typeorm';
+
+@Entity('transactions')
+@Index(['customerId', 'createdAt'])
+@Index(['status', 'createdAt'])
+export class Transaction {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ unique: true })
+  @Index()
+  paymentId: string;
+
+  @Column({ unique: true })
+  @Index()
+  idempotencyKey: string;
+
+  @Column()
+  @Index()
+  orderId: string;
+
+  @Column()
+  @Index()
+  customerId: string;
+
+  @Column('decimal', { precision: 10, scale: 2 })
+  amount: number;
+
+  @Column({ length: 3 })
+  currency: string;
+
+  @Column({
+    type: 'enum',
+    enum: ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED', 'REFUNDED'],
+    default: 'PENDING',
+  })
+  @Index()
+  status: string;
+
+  @Column({ nullable: true })
+  transactionId: string;
+
+  @Column({ nullable: true })
+  errorCode: string;
+
+  @Column({ nullable: true })
+  errorMessage: string;
+
+  @Column('json', { nullable: true })
+  conversionInfo: {
+    originalAmount: number;
+    originalCurrency: string;
+    convertedAmount: number;
+    exchangeRate: number;
+  };
+
+  @Column('json', { nullable: true })
+  metadata: Record<string, any>;
+
+  @Column({ nullable: true })
+  completedAt: Date;
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @UpdateDateColumn()
+  updatedAt: Date;
+}
+```
+
+---
+
+## 7. Payment Notification Service
+
+```typescript
+// notification/src/payment-notification.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
+import { MailService } from './mail.service';
+import { SMSService } from './sms.service';
+import { PushNotificationService } from './push.service';
+
+interface PaymentCompletedEvent {
+  paymentId: string;
+  orderId: string;
+  customerId: string;
+  amount: number;
+  currency: string;
+  transactionId: string;
+}
+
+interface PaymentFailedEvent {
+  paymentId: string;
+  orderId: string;
+  errorCode: string;
+}
+
+@Injectable()
+export class PaymentNotificationService {
+  private readonly logger = new Logger(PaymentNotificationService.name);
+
+  constructor(
+    @InjectQueue('notifications') private readonly notificationQueue: Queue,
+    private readonly mailService: MailService,
+    private readonly smsService: SMSService,
+    private readonly pushService: PushNotificationService,
+    private readonly customerService: CustomerService,
+  ) {}
+
+  @OnEvent('payment.completed')
+  async handlePaymentCompleted(event: PaymentCompletedEvent): Promise<void> {
+    this.logger.log(`Processing payment completed notification for ${event.paymentId}`);
+    
+    // เพิ่มใน Queue เพื่อ Process แบบ Async
+    await this.notificationQueue.add('payment-completed', event, {
+      attempts: 3,
+      backoff: {
+        type: 'exponential',
+        delay: 1000,
+      },
+    });
+  }
+
+  @OnEvent('payment.failed')
+  async handlePaymentFailed(event: PaymentFailedEvent): Promise<void> {
+    await this.notificationQueue.add('payment-failed', event, {
+      attempts: 3,
+    });
+  }
+
+  @OnEvent('payment.fraud_detected')
+  async handleFraudDetected(event: any): Promise<void> {
+    // ส่งการแจ้งเตือนด้านความปลอดภัยทันที
+    await this.sendSecurityAlert(event);
+  }
+
+  async processPaymentCompletedNotification(event: PaymentCompletedEvent): Promise<void> {
+    const customer = await this.customerService.findById(event.customerId);
+    
+    if (!customer) {
+      this.logger.warn(`Customer ${event.customerId} not found`);
+      return;
+    }
+
+    const notificationData = {
+      recipientName: `${customer.firstName} ${customer.lastName}`,
+      amount: event.amount,
+      currency: event.currency,
+      orderId: event.orderId,
+      transactionId: event.transactionId,
+      paymentDate: new Date().toLocaleDateString('th-TH'),
+    };
+
+    // ส่งแบบขนาน
+    await Promise.allSettled([
+      this.sendEmailNotification(customer.email, notificationData),
+      customer.phone ? this.sendSMSNotification(customer.phone, notificationData) : Promise.resolve(),
+      customer.pushToken ? this.sendPushNotification(customer.pushToken, notificationData) : Promise.resolve(),
+    ]);
+  }
+
+  private async sendEmailNotification(email: string, data: any): Promise<void> {
+    try {
+      await this.mailService.send({
+        to: email,
+        subject: 'Payment Confirmation',
+        template: 'payment-confirmation',
+        data,
+      });
+    } catch (error) {
+      this.logger.error(`Failed to send email to ${email}: ${error.message}`);
+    }
+  }
+
+  private async sendSMSNotification(phone: string, data: any): Promise<void> {
+    try {
+      await this.smsService.send({
+        to: phone,
+        message: `Payment confirmed! Order #${data.orderId} - ${data.currency} ${data.amount}. Transaction ID: ${data.transactionId}`,
+      });
+    } catch (error) {
+      this.logger.error(`Failed to send SMS to ${phone}: ${error.message}`);
+    }
+  }
+
+  private async sendPushNotification(token: string, data: any): Promise<void> {
+    try {
+      await this.pushService.send({
+        token,
+        title: 'Payment Successful',
+        body: `Your payment of ${data.currency} ${data.amount} has been processed`,
+        data: { orderId: data.orderId },
+      });
+    } catch (error) {
+      this.logger.error(`Failed to send push notification: ${error.message}`);
+    }
+  }
+
+  private async sendSecurityAlert(event: any): Promise<void> {
+    // ส่งการแจ้งเตือนด้านความปลอดภัยไปยัง Security Team
+    await this.mailService.send({
+      to: process.env.SECURITY_TEAM_EMAIL,
+      subject: '🚨 Fraud Attempt Detected',
+      template: 'fraud-alert',
+      data: event,
+    });
+  }
+}
+```
+
+---
+
+## 8. Reconciliation Service
+
+```typescript
+// reconciliation/src/reconciliation.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+
+export interface ReconciliationReport {
+  date: Date;
+  totalTransactions: number;
+  matchedTransactions: number;
+  discrepancies: Discrepancy[];
+  totalAmount: number;
+  matchedAmount: number;
+  discrepancyAmount: number;
+}
+
+export interface Discrepancy {
+  transactionId: string;
+  ourRecord: TransactionRecord;
+  gatewayRecord: GatewayRecord;
+  type: 'AMOUNT_MISMATCH' | 'STATUS_MISMATCH' | 'MISSING_IN_GATEWAY' | 'MISSING_IN_OUR_SYSTEM';
+}
+
+@Injectable()
+export class ReconciliationService {
+  private readonly logger = new Logger(ReconciliationService.name);
+
+  constructor(
+    @InjectRepository(Transaction)
+    private readonly transactionRepository: Repository<Transaction>,
+    private readonly stripeService: StripePaymentService,
+    private readonly reportService: ReportService,
+    private readonly alertService: AlertService,
+  ) {}
+
+  // รันทุกวัน เวลา 02:00 น.
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async runDailyReconciliation(): Promise<void> {
+    this.logger.log('Starting daily reconciliation...');
+    
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    try {
+      const report = await this.reconcile(yesterday, today);
+      
+      this.logger.log(`Reconciliation complete: ${report.matchedTransactions}/${report.totalTransactions} matched`);
+      
+      // บันทึกรายงาน
+      await this.reportService.saveReconciliationReport(report);
+      
+      // แจ้งเตือนถ้ามี Discrepancies
+      if (report.discrepancies.length > 0) {
+        await this.alertService.sendReconciliationAlert(report);
+      }
+    } catch (error) {
+      this.logger.error(`Reconciliation failed: ${error.message}`, error.stack);
+      await this.alertService.sendSystemAlert('Reconciliation Failed', error.message);
+    }
+  }
+
+  async reconcile(startDate: Date, endDate: Date): Promise<ReconciliationReport> {
+    // ดึงข้อมูลจาก Database ของเรา
+    const ourTransactions = await this.transactionRepository
+      .createQueryBuilder('t')
+      .where('t.createdAt >= :startDate AND t.createdAt < :endDate', { startDate, endDate })
+      .andWhere('t.status = :status', { status: 'COMPLETED' })
+      .getMany();
+
+    // ดึงข้อมูลจาก Stripe
+    const gatewayTransactions = await this.fetchGatewayTransactions(startDate, endDate);
+    
+    const discrepancies: Discrepancy[] = [];
+    let matchedTransactions = 0;
+    let matchedAmount = 0;
+
+    // เปรียบเทียบข้อมูล
+    for (const ourTx of ourTransactions) {
+      const gatewayTx = gatewayTransactions.find(
+        gTx => gTx.id === ourTx.transactionId
+      );
+
+      if (!gatewayTx) {
+        discrepancies.push({
+          transactionId: ourTx.transactionId,
+          ourRecord: { id: ourTx.paymentId, amount: ourTx.amount, status: ourTx.status },
+          gatewayRecord: null,
+          type: 'MISSING_IN_GATEWAY',
+        });
+        continue;
+      }
+
+      // ตรวจสอบจำนวนเงิน
+      const gatewayAmount = gatewayTx.amount / 100; // แปลงจาก cents
+      if (Math.abs(ourTx.amount - gatewayAmount) > 0.01) {
+        discrepancies.push({
+          transactionId: ourTx.transactionId,
+          ourRecord: { id: ourTx.paymentId, amount: ourTx.amount, status: ourTx.status },
+          gatewayRecord: { id: gatewayTx.id, amount: gatewayAmount, status: gatewayTx.status },
+          type: 'AMOUNT_MISMATCH',
+        });
+        continue;
+      }
+
+      matchedTransactions++;
+      matchedAmount += ourTx.amount;
+    }
+
+    // ตรวจสอบ Transactions ที่มีใน Gateway แต่ไม่มีในระบบเรา
+    for (const gatewayTx of gatewayTransactions) {
+      const ourTx = ourTransactions.find(t => t.transactionId === gatewayTx.id);
+      if (!ourTx) {
+        discrepancies.push({
+          transactionId: gatewayTx.id,
+          ourRecord: null,
+          gatewayRecord: { id: gatewayTx.id, amount: gatewayTx.amount / 100, status: gatewayTx.status },
+          type: 'MISSING_IN_OUR_SYSTEM',
+        });
+      }
+    }
+
+    const totalAmount = ourTransactions.reduce((sum, t) => sum + t.amount, 0);
+
+    return {
+      date: startDate,
+      totalTransactions: ourTransactions.length,
+      matchedTransactions,
+      discrepancies,
+      totalAmount,
+      matchedAmount,
+      discrepancyAmount: totalAmount - matchedAmount,
+    };
+  }
+
+  private async fetchGatewayTransactions(startDate: Date, endDate: Date): Promise<any[]> {
+    // ดึงข้อมูลจาก Stripe API
+    const transactions = [];
+    let hasMore = true;
+    let startingAfter: string | undefined;
+
+    while (hasMore) {
+      const response = await this.stripeService.listCharges({
+        created: {
+          gte: Math.floor(startDate.getTime() / 1000),
+          lt: Math.floor(endDate.getTime() / 1000),
+        },
+        limit: 100,
+        starting_after: startingAfter,
+      });
+
+      transactions.push(...response.data);
+      hasMore = response.has_more;
+      
+      if (hasMore) {
+        startingAfter = response.data[response.data.length - 1].id;
+      }
+    }
+
+    return transactions;
+  }
+}
+```
+
+---
+
+## 9. Chargeback Handling Service
+
+```typescript
+// chargeback/src/chargeback.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { OnEvent } from '@nestjs/event-emitter';
+
+export enum ChargebackStatus {
+  RECEIVED = 'RECEIVED',
+  UNDER_REVIEW = 'UNDER_REVIEW',
+  EVIDENCE_SUBMITTED = 'EVIDENCE_SUBMITTED',
+  WON = 'WON',
+  LOST = 'LOST',
+  EXPIRED = 'EXPIRED',
+}
+
+export interface ChargebackEvidence {
+  type: 'RECEIPT' | 'SHIPPING_PROOF' | 'CUSTOMER_COMMUNICATION' | 'REFUND_POLICY' | 'OTHER';
+  description: string;
+  fileUrl?: string;
+}
+
+@Injectable()
+export class ChargebackService {
+  private readonly logger = new Logger(ChargebackService.name);
+
+  constructor(
+    @InjectRepository(Chargeback)
+    private readonly chargebackRepository: Repository<Chargeback>,
+    private readonly stripeService: StripePaymentService,
+    private readonly transactionService: TransactionService,
+    private readonly notificationService: PaymentNotificationService,
+  ) {}
+
+  @OnEvent('stripe.charge.dispute.created')
+  async handleChargebackCreated(disputeData: any): Promise<void> {
+    this.logger.log(`Chargeback received for dispute: ${disputeData.id}`);
+    
+    const transaction = await this.transactionService.findByTransactionId(
+      disputeData.charge
+    );
+
+    if (!transaction) {
+      this.logger.warn(`Transaction not found for charge: ${disputeData.charge}`);
+      return;
+    }
+
+    const chargeback = await this.chargebackRepository.save({
+      disputeId: disputeData.id,
+      paymentId: transaction.paymentId,
+      amount: disputeData.amount / 100,
+      currency: disputeData.currency.toUpperCase(),
+      reason: disputeData.reason,
+      status: ChargebackStatus.RECEIVED,
+      responseDeadline: new Date(disputeData.evidence_details.due_by * 1000),
+      rawData: disputeData,
+    });
+
+    // แจ้งทีม Finance
+    await this.notificationService.sendChargebackAlert(chargeback);
+
+    // เริ่มกระบวนการตรวจสอบอัตโนมัติ
+    await this.autoReviewChargeback(chargeback);
+  }
+
+  async submitEvidence(
+    chargebackId: string,
+    evidence: ChargebackEvidence[],
+  ): Promise<void> {
+    const chargeback = await this.chargebackRepository.findOne({
+      where: { id: chargebackId }
+    });
+
+    if (!chargeback) {
+      throw new Error(`Chargeback ${chargebackId} not found`);
+    }
+
+    if (chargeback.status !== ChargebackStatus.UNDER_REVIEW) {
+      throw new Error(`Cannot submit evidence for chargeback with status ${chargeback.status}`);
+    }
+
+    // ส่ง Evidence ไปยัง Stripe
+    const evidenceData = this.buildStripeEvidence(evidence, chargeback);
+    
+    await this.stripeService.updateDispute(chargeback.disputeId, {
+      evidence: evidenceData,
+      submit: true,
+    });
+
+    await this.chargebackRepository.update(chargebackId, {
+      status: ChargebackStatus.EVIDENCE_SUBMITTED,
+      evidence,
+      evidenceSubmittedAt: new Date(),
+    });
+
+    this.logger.log(`Evidence submitted for chargeback ${chargebackId}`);
+  }
+
+  private async autoReviewChargeback(chargeback: Chargeback): Promise<void> {
+    const transaction = await this.transactionService.findById(chargeback.paymentId);
+    
+    // ตรวจสอบว่าคุ้มค่าที่จะต่อสู้หรือไม่
+    const isFightable = await this.assessFightability(chargeback, transaction);
+    
+    if (!isFightable) {
+      this.logger.log(`Accepting chargeback ${chargeback.id} - not worth fighting`);
+      await this.chargebackRepository.update(chargeback.id, {
+        status: ChargebackStatus.LOST,
+        notes: 'Accepted - not cost effective to fight',
+      });
+      return;
+    }
+
+    // เก็บ Evidence อัตโนมัติ
+    const autoEvidence = await this.collectAutoEvidence(transaction);
+    
+    await this.chargebackRepository.update(chargeback.id, {
+      status: ChargebackStatus.UNDER_REVIEW,
+      autoCollectedEvidence: autoEvidence,
+    });
+  }
+
+  private async assessFightability(chargeback: Chargeback, transaction: any): Promise<boolean> {
+    // ต่อสู้ถ้า:
+    // 1. จำนวนเงินสูงกว่า $50
+    // 2. มี Evidence เพียงพอ
+    // 3. ประเภทของ Chargeback ไม่ใช่ "fraud" ที่ชัดเจน
+    
+    if (chargeback.amount < 50) return false;
+    if (chargeback.reason === 'fraudulent' && !transaction.hasDeliveryProof) return false;
+    
+    return true;
+  }
+
+  private async collectAutoEvidence(transaction: any): Promise<ChargebackEvidence[]> {
+    const evidence: ChargebackEvidence[] = [];
+
+    // เพิ่ม Receipt
+    evidence.push({
+      type: 'RECEIPT',
+      description: `Transaction receipt for order ${transaction.orderId}`,
+    });
+
+    // เพิ่ม Customer Communication (ถ้ามี)
+    if (transaction.customerCommunication) {
+      evidence.push({
+        type: 'CUSTOMER_COMMUNICATION',
+        description: 'Email communication with customer',
+        fileUrl: transaction.customerCommunication,
+      });
+    }
+
+    return evidence;
+  }
+
+  private buildStripeEvidence(evidence: ChargebackEvidence[], chargeback: Chargeback): any {
+    const stripeEvidence: any = {
+      billing_address: chargeback.billingAddress,
+      product_description: chargeback.productDescription,
+    };
+
+    for (const item of evidence) {
+      switch (item.type) {
+        case 'RECEIPT':
+          stripeEvidence.receipt = item.fileUrl;
+          break;
+        case 'SHIPPING_PROOF':
+          stripeEvidence.shipping_documentation = item.fileUrl;
+          break;
+        case 'CUSTOMER_COMMUNICATION':
+          stripeEvidence.customer_communication = item.fileUrl;
+          break;
+        case 'REFUND_POLICY':
+          stripeEvidence.refund_policy = item.description;
+          break;
+      }
+    }
+
+    return stripeEvidence;
+  }
+}
+```
+
+---
+
+## 10. Docker Compose Configuration
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  payment-orchestrator:
+    build: ./payment-orchestrator
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/payments
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      FRAUD_SERVICE_URL: http://fraud-detection:3000
+      CURRENCY_SERVICE_URL: http://currency-conversion:3000
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    networks:
+      - payment-network
+
+  fraud-detection:
+    build: ./fraud-detection
+    ports:
+      - "3002:3000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      ML_MODEL_URL: http://ml-model:8000
+    depends_on:
+      - redis
+    networks:
+      - payment-network
+
+  currency-conversion:
+    build: ./currency-conversion
+    ports:
+      - "3003:3000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      EXCHANGE_RATE_API_KEY: ${EXCHANGE_RATE_API_KEY}
+    networks:
+      - payment-network
+
+  notification:
+    build: ./notification
+    ports:
+      - "3004:3000"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+    networks:
+      - payment-network
+
+  reconciliation:
+    build: ./reconciliation
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/payments
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+    networks:
+      - payment-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - payment-network
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass redispassword
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - payment-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - payment-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - payment-network
+
+networks:
+  payment-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+---
+
+## 11. Kubernetes Deployment
+
+```yaml
+# k8s/payment-orchestrator-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-orchestrator
+  namespace: payment-system
+  labels:
+    app: payment-orchestrator
+    version: v1.0.0
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-orchestrator
+  template:
+    metadata:
+      labels:
+        app: payment-orchestrator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: payment-sa
+      containers:
+        - name: payment-orchestrator
+          image: your-registry/payment-orchestrator:1.0.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: payment-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: payment-secrets
+                  key: redis-url
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: payment-secrets
+                  key: stripe-secret-key
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - payment-orchestrator
+                topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-orchestrator-svc
+  namespace: payment-system
+spec:
+  selector:
+    app: payment-orchestrator
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-orchestrator-hpa
+  namespace: payment-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-orchestrator
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+```
+
+---
+
+## 12. PCI DSS Network Policy
+
+```yaml
+# k8s/network-policy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-network-policy
+  namespace: payment-system
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-orchestrator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # อนุญาตให้รับจาก API Gateway เท่านั้น
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: api-gateway
+          podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    # อนุญาตให้เชื่อมต่อ Database
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # อนุญาตให้เชื่อมต่อ Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # อนุญาตให้เชื่อมต่อ Kafka
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+    # อนุญาตให้เชื่อมต่อ External APIs (Stripe, PayPal)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+---
+
+## 13. Monitoring & Alerting
+
+```typescript
+// monitoring/src/payment-metrics.ts
+import { Injectable } from '@nestjs/common';
+import { InjectMetric } from '@willsoto/nestjs-prometheus';
+import { Counter, Histogram, Gauge } from 'prom-client';
+
+@Injectable()
+export class PaymentMetricsService {
+  constructor(
+    @InjectMetric('payment_transactions_total')
+    private readonly transactionCounter: Counter<string>,
+    
+    @InjectMetric('payment_processing_duration_seconds')
+    private readonly processingDuration: Histogram<string>,
+    
+    @InjectMetric('payment_fraud_score')
+    private readonly fraudScoreHistogram: Histogram<string>,
+    
+    @InjectMetric('payment_active_transactions')
+    private readonly activeTransactions: Gauge<string>,
+    
+    @InjectMetric('payment_amount_total')
+    private readonly totalAmountCounter: Counter<string>,
+  ) {}
+
+  recordTransaction(
+    status: string,
+    method: string,
+    currency: string,
+    amount: number,
+  ): void {
+    this.transactionCounter.labels(status, method, currency).inc();
+    this.totalAmountCounter.labels(currency).inc(amount);
+  }
+
+  recordProcessingTime(durationSeconds: number, method: string): void {
+    this.processingDuration.labels(method).observe(durationSeconds);
+  }
+
+  recordFraudScore(score: number, blocked: string): void {
+    this.fraudScoreHistogram.labels(blocked).observe(score);
+  }
+
+  setActiveTransactions(count: number): void {
+    this.activeTransactions.set(count);
+  }
+}
+```
+
+```yaml
+# prometheus/payment-alerts.yaml
+groups:
+  - name: payment_alerts
+    rules:
+      - alert: HighPaymentFailureRate
+        expr: |
+          sum(rate(payment_transactions_total{status="FAILED"}[5m])) /
+          sum(rate(payment_transactions_total[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "High payment failure rate detected"
+          description: "Payment failure rate is {{ $value | humanizePercentage }} (threshold: 10%)"
+
+      - alert: FraudDetectionAnomaly
+        expr: |
+          sum(rate(payment_transactions_total{status="FRAUD_DETECTED"}[5m])) > 10
+        for: 1m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Unusual fraud activity detected"
+          description: "{{ $value }} fraud attempts in the last 5 minutes"
+
+      - alert: PaymentProcessingLatency
+        expr: |
+          histogram_quantile(0.95, payment_processing_duration_seconds_bucket) > 5
+        for: 5m
+        labels:
+          severity: warning
+          team: payments
+        annotations:
+          summary: "High payment processing latency"
+          description: "95th percentile latency is {{ $value }}s"
+
+      - alert: ReconciliationDiscrepancy
+        expr: reconciliation_discrepancies_total > 0
+        labels:
+          severity: critical
+          team: finance
+        annotations:
+          summary: "Payment reconciliation discrepancy found"
+          description: "{{ $value }} discrepancies found in reconciliation"
+```
+
+---
+
+## 14. Integration Tests
+
+```typescript
+// tests/payment-integration.test.ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import * as request from 'supertest';
+import { AppModule } from '../src/app.module';
+
+describe('Payment System Integration Tests', () => {
+  let app: INestApplication;
+  let authToken: string;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    // ดึง Auth Token
+    const authResponse = await request(app.getHttpServer())
+      .post('/auth/login')
+      .send({ email: 'test@example.com', password: 'password' });
+    
+    authToken = authResponse.body.accessToken;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  describe('Payment Processing', () => {
+    it('should process a valid payment successfully', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({
+          orderId: 'ORDER-001',
+          customerId: 'CUSTOMER-001',
+          amount: 100.00,
+          currency: 'USD',
+          paymentMethod: {
+            type: 'card',
+            token: 'tok_visa', // Stripe Test Token
+          },
         })
-    }
+        .expect(201);
 
-    return nil
-}
+      expect(response.body.status).toBe('COMPLETED');
+      expect(response.body.paymentId).toBeDefined();
+      expect(response.body.transactionId).toBeDefined();
+    });
 
-func (r *ReconciliationService) reconcileMethod(ctx context.Context, date time.Time, method string) (*ReconciliationResult, error) {
-    // Step 1: Get internal transactions
-    internalTxns, err := r.internalDB.GetByDateAndMethod(ctx, date, method)
-    if err != nil {
-        return nil, err
-    }
-    
-    // Step 2: Get bank/PSP settlement file
-    client := r.bankClients[method]
-    bankTxns, err := client.GetSettlement(ctx, date)
-    if err != nil {
-        return nil, err
-    }
-    
-    // Step 3: Match
-    internalMap := make(map[string]*Transaction)
-    for _, txn := range internalTxns {
-        internalMap[txn.ExternalRef] = txn
-    }
-    
-    bankMap := make(map[string]*BankTransaction)
-    for _, txn := range bankTxns {
-        bankMap[txn.Reference] = txn
-    }
-    
-    result := &ReconciliationResult{
-        Method:    method,
-        Date:      date,
-        Internal:  len(internalTxns),
-        Bank:      len(bankTxns),
-    }
-    
-    // Find discrepancies
-    for ref, internal := range internalMap {
-        bank, exists := bankMap[ref]
-        if !exists {
-            result.Discrepancies = append(result.Discrepancies, Discrepancy{
-                Type:      "MISSING_IN_BANK",
-                Reference: ref,
-                InternalAmount: internal.Amount,
-            })
-            continue
-        }
-        
-        if !internal.Amount.Equal(bank.Amount) {
-            result.Discrepancies = append(result.Discrepancies, Discrepancy{
-                Type:           "AMOUNT_MISMATCH",
-                Reference:      ref,
-                InternalAmount: internal.Amount,
-                BankAmount:     bank.Amount,
-                Difference:     internal.Amount.Sub(bank.Amount),
-            })
-        }
-    }
-    
-    for ref := range bankMap {
-        if _, exists := internalMap[ref]; !exists {
-            result.Discrepancies = append(result.Discrepancies, Discrepancy{
-                Type:      "MISSING_IN_INTERNAL",
-                Reference: ref,
-                BankAmount: bankMap[ref].Amount,
-            })
-        }
-    }
-    
-    return result, nil
-}
+    it('should return same result for duplicate payment (idempotency)', async () => {
+      const paymentData = {
+        orderId: 'ORDER-002',
+        customerId: 'CUSTOMER-001',
+        amount: 200.00,
+        currency: 'USD',
+        paymentMethod: { type: 'card', token: 'tok_visa' },
+      };
+
+      const firstResponse = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send(paymentData)
+        .expect(201);
+
+      const secondResponse = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send(paymentData)
+        .expect(201);
+
+      expect(firstResponse.body.paymentId).toBe(secondResponse.body.paymentId);
+    });
+
+    it('should reject payment with high fraud risk', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({
+          orderId: 'ORDER-003',
+          customerId: 'HIGH-RISK-CUSTOMER',
+          amount: 9999.00, // ใกล้ Structuring Threshold
+          currency: 'USD',
+          paymentMethod: { type: 'card', token: 'tok_visa' },
+        })
+        .expect(201);
+
+      expect(response.body.status).toBe('FAILED');
+      expect(response.body.errorCode).toBe('FRAUD_DETECTED');
+    });
+
+    it('should convert currency correctly', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({
+          orderId: 'ORDER-004',
+          customerId: 'CUSTOMER-001',
+          amount: 3550.00,
+          currency: 'THB', // Thai Baht
+          paymentMethod: { type: 'card', token: 'tok_visa' },
+        })
+        .expect(201);
+
+      expect(response.body.status).toBe('COMPLETED');
+    });
+  });
+
+  describe('Refunds', () => {
+    it('should process a full refund', async () => {
+      // ทำการชำระเงินก่อน
+      const paymentResponse = await request(app.getHttpServer())
+        .post('/payments')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({
+          orderId: 'ORDER-REFUND-001',
+          customerId: 'CUSTOMER-001',
+          amount: 50.00,
+          currency: 'USD',
+          paymentMethod: { type: 'card', token: 'tok_visa' },
+        })
+        .expect(201);
+
+      const paymentId = paymentResponse.body.paymentId;
+
+      // ทำการ Refund
+      const refundResponse = await request(app.getHttpServer())
+        .post(`/payments/${paymentId}/refund`)
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ reason: 'customer_request' })
+        .expect(200);
+
+      expect(refundResponse.body.status).toBe('REFUNDED');
+    });
+  });
+});
 ```
 
 ---
 
-## 6. Fraud Detection System
+## สรุปบทที่ 93
 
-### 6.1 Rule-Based + ML Fraud Detection
-
-```python
-# fraud-detection/app/services/fraud_scorer.py
-from dataclasses import dataclass
-from typing import List, Dict
-import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier
-import redis
-import json
-
-@dataclass
-class FraudCheckRequest:
-    transaction_id: str
-    customer_id: str
-    amount: float
-    currency: str
-    card_token: str
-    ip_address: str
-    device_fingerprint: str
-    merchant_id: str
-    timestamp: float
-
-@dataclass  
-class FraudScore:
-    score: float          # 0-100
-    decision: str         # APPROVE, REVIEW, REJECT
-    reasons: List[str]
-    rules_triggered: List[str]
-
-class FraudDetectionService:
-    def __init__(self, redis_client: redis.Redis, model_path: str):
-        self.redis = redis_client
-        self.model = self._load_model(model_path)
-        
-        # Rule thresholds
-        self.REVIEW_THRESHOLD = 60
-        self.REJECT_THRESHOLD = 80
-        
-    def score(self, req: FraudCheckRequest) -> FraudScore:
-        rules_triggered = []
-        base_score = 0
-        
-        # Rule 1: Velocity check - ธุรกรรมมากเกินไปใน 1 ชั่วโมง
-        hourly_count = self._get_hourly_count(req.customer_id)
-        if hourly_count > 20:
-            base_score += 30
-            rules_triggered.append(f"HIGH_VELOCITY: {hourly_count} txns/hour")
-        elif hourly_count > 10:
-            base_score += 15
-            rules_triggered.append(f"MEDIUM_VELOCITY: {hourly_count} txns/hour")
-        
-        # Rule 2: Amount anomaly
-        avg_amount = self._get_customer_avg_amount(req.customer_id)
-        if avg_amount > 0 and req.amount > avg_amount * 5:
-            base_score += 25
-            rules_triggered.append(f"UNUSUAL_AMOUNT: {req.amount} vs avg {avg_amount}")
-        
-        # Rule 3: IP reputation
-        ip_risk = self._check_ip_reputation(req.ip_address)
-        if ip_risk == "HIGH":
-            base_score += 30
-            rules_triggered.append(f"HIGH_RISK_IP: {req.ip_address}")
-        elif ip_risk == "MEDIUM":
-            base_score += 15
-            rules_triggered.append(f"MEDIUM_RISK_IP: {req.ip_address}")
-        
-        # Rule 4: Device fingerprint check
-        if self._is_new_device(req.customer_id, req.device_fingerprint):
-            base_score += 10
-            rules_triggered.append("NEW_DEVICE")
-        
-        # Rule 5: Geographic anomaly
-        if self._is_geographic_anomaly(req.customer_id, req.ip_address):
-            base_score += 20
-            rules_triggered.append("GEOGRAPHIC_ANOMALY")
-        
-        # Rule 6: Card testing (small amounts after new token)
-        if req.amount < 10 and self._is_new_card_token(req.card_token):
-            base_score += 25
-            rules_triggered.append("POTENTIAL_CARD_TESTING")
-        
-        # ML Model Score (ใช้ gradient boosting)
-        features = self._extract_features(req)
-        ml_score = self.model.predict_proba([features])[0][1] * 100
-        
-        # Combine rule-based + ML (weighted average)
-        final_score = (base_score * 0.4) + (ml_score * 0.6)
-        final_score = min(100, final_score)
-        
-        # Decision
-        if final_score >= self.REJECT_THRESHOLD:
-            decision = "REJECT"
-        elif final_score >= self.REVIEW_THRESHOLD:
-            decision = "REVIEW"
-        else:
-            decision = "APPROVE"
-        
-        # Update velocity counters
-        self._increment_velocity(req.customer_id)
-        
-        return FraudScore(
-            score=round(final_score, 2),
-            decision=decision,
-            reasons=self._get_human_reasons(rules_triggered),
-            rules_triggered=rules_triggered
-        )
-    
-    def _extract_features(self, req: FraudCheckRequest) -> List[float]:
-        """Extract ML features from transaction"""
-        customer_history = self._get_customer_history(req.customer_id)
-        
-        return [
-            req.amount,
-            req.amount / max(customer_history.get('avg_amount', req.amount), 1),
-            customer_history.get('total_transactions', 0),
-            customer_history.get('failed_transactions', 0),
-            customer_history.get('hourly_count', 0),
-            customer_history.get('daily_count', 0),
-            1 if self._is_new_device(req.customer_id, req.device_fingerprint) else 0,
-            1 if self._is_geographic_anomaly(req.customer_id, req.ip_address) else 0,
-            self._get_merchant_risk_score(req.merchant_id),
-            self._get_time_features(req.timestamp),
-        ]
-    
-    def _get_hourly_count(self, customer_id: str) -> int:
-        key = f"fraud:velocity:hourly:{customer_id}"
-        count = self.redis.get(key)
-        return int(count) if count else 0
-    
-    def _increment_velocity(self, customer_id: str):
-        hour_key = f"fraud:velocity:hourly:{customer_id}"
-        day_key = f"fraud:velocity:daily:{customer_id}"
-        
-        pipe = self.redis.pipeline()
-        pipe.incr(hour_key)
-        pipe.expire(hour_key, 3600)  # 1 hour
-        pipe.incr(day_key)
-        pipe.expire(day_key, 86400)  # 24 hours
-        pipe.execute()
-```
-
-### 6.2 Real-time Fraud Rules Engine
-
-```go
-// fraud-detection/internal/rules/engine.go
-package rules
-
-import (
-    "context"
-    "time"
-)
-
-type Rule struct {
-    ID          string
-    Name        string
-    Description string
-    Score       float64
-    Condition   func(ctx context.Context, txn Transaction, history CustomerHistory) bool
-}
-
-type RulesEngine struct {
-    rules  []Rule
-    redis  *redis.Client
-}
-
-func NewRulesEngine(redis *redis.Client) *RulesEngine {
-    engine := &RulesEngine{redis: redis}
-    
-    engine.rules = []Rule{
-        {
-            ID:          "R001",
-            Name:        "BLOCKED_CARD",
-            Description: "Card is in blocklist",
-            Score:       100,
-            Condition: func(ctx context.Context, txn Transaction, _ CustomerHistory) bool {
-                blocked, _ := engine.isCardBlocked(ctx, txn.CardToken)
-                return blocked
-            },
-        },
-        {
-            ID:          "R002",
-            Name:        "BLOCKED_IP",
-            Description: "IP address is in blocklist",
-            Score:       80,
-            Condition: func(ctx context.Context, txn Transaction, _ CustomerHistory) bool {
-                blocked, _ := engine.isIPBlocked(ctx, txn.IPAddress)
-                return blocked
-            },
-        },
-        {
-            ID:          "R003",
-            Name:        "CARD_COUNTRY_MISMATCH",
-            Description: "Card issuing country doesn't match transaction country",
-            Score:       30,
-            Condition: func(ctx context.Context, txn Transaction, _ CustomerHistory) bool {
-                return txn.CardCountry != "TH" && txn.MerchantCountry == "TH"
-            },
-        },
-        {
-            ID:          "R004",
-            Name:        "RAPID_RETRIES",
-            Description: "Multiple failed attempts in short time",
-            Score:       50,
-            Condition: func(ctx context.Context, txn Transaction, history CustomerHistory) bool {
-                return history.FailedLastHour >= 3
-            },
-        },
-        {
-            ID:          "R005",
-            Name:        "NIGHT_LARGE_TRANSACTION",
-            Description: "Large transaction during unusual hours",
-            Score:       20,
-            Condition: func(ctx context.Context, txn Transaction, _ CustomerHistory) bool {
-                hour := time.Now().In(bangkokTZ).Hour()
-                return (hour >= 1 && hour <= 5) && txn.Amount > 50000 // > 50,000 THB
-            },
-        },
-    }
-    
-    return engine
-}
-
-func (e *RulesEngine) Evaluate(ctx context.Context, txn Transaction, history CustomerHistory) []RuleResult {
-    var results []RuleResult
-    
-    for _, rule := range e.rules {
-        if rule.Condition(ctx, txn, history) {
-            results = append(results, RuleResult{
-                RuleID:  rule.ID,
-                Name:    rule.Name,
-                Score:   rule.Score,
-                Matched: true,
-            })
-        }
-    }
-    
-    return results
-}
-```
-
----
-
-## 7. Refund System
-
-```go
-// payment-service/internal/refund/processor.go
-package refund
-
-type RefundProcessor struct {
-    txnRepo      TransactionRepository
-    providerMap  map[string]PaymentProvider
-    ledger       LedgerService
-    notifier     NotificationService
-}
-
-func (p *RefundProcessor) ProcessRefund(ctx context.Context, req RefundRequest) (*Refund, error) {
-    // 1. Get original transaction
-    originalTxn, err := p.txnRepo.GetByID(ctx, req.TransactionID)
-    if err != nil {
-        return nil, ErrTransactionNotFound
-    }
-    
-    // 2. Validate
-    if originalTxn.Status != "completed" {
-        return nil, ErrInvalidTransactionStatus
-    }
-    
-    totalRefunded, _ := p.txnRepo.GetTotalRefunded(ctx, req.TransactionID)
-    if totalRefunded.Add(req.Amount).GreaterThan(originalTxn.Amount) {
-        return nil, ErrRefundExceedsOriginal
-    }
-    
-    // 3. Check refund window (ตาม Business Rule)
-    daysSinceCharge := time.Since(originalTxn.CreatedAt).Hours() / 24
-    if daysSinceCharge > 90 {
-        return nil, ErrRefundWindowExpired
-    }
-    
-    // 4. Create refund record
-    refund := &Refund{
-        ID:              generateUUID(),
-        TransactionID:   req.TransactionID,
-        Amount:          req.Amount,
-        Reason:          req.Reason,
-        Status:          RefundStatusProcessing,
-        RequestedByID:   req.RequestedByID,
-        RequestedAt:     time.Now(),
-    }
-    
-    if err := p.txnRepo.CreateRefund(ctx, refund); err != nil {
-        return nil, err
-    }
-    
-    // 5. Call payment provider
-    provider := p.providerMap[originalTxn.Provider]
-    result, err := provider.Refund(ctx, ProviderRefundRequest{
-        OriginalChargeID: originalTxn.ExternalID,
-        Amount:          req.Amount,
-        Reason:          req.Reason,
-    })
-    
-    if err != nil {
-        p.txnRepo.UpdateRefundStatus(ctx, refund.ID, RefundStatusFailed, err.Error())
-        return nil, fmt.Errorf("provider refund failed: %w", err)
-    }
-    
-    // 6. Update ledger
-    p.ledger.RecordRefund(ctx, LedgerRefundParams{
-        OriginalTransactionID: req.TransactionID,
-        RefundID:             refund.ID,
-        Amount:               req.Amount,
-        CustomerID:           originalTxn.CustomerID,
-        MerchantID:           originalTxn.MerchantID,
-    })
-    
-    // 7. Update status
-    p.txnRepo.UpdateRefundStatus(ctx, refund.ID, RefundStatusCompleted, "")
-    
-    // 8. Notify customer
-    p.notifier.SendRefundNotification(ctx, NotifyRequest{
-        CustomerID: originalTxn.CustomerID,
-        Amount:     req.Amount,
-        OrderID:    originalTxn.OrderID,
-    })
-    
-    return refund, nil
-}
-```
-
----
-
-## สรุป
-
-ระบบชำระเงินในไทยต้องคำนึงถึง:
-
-1. **PCI-DSS Compliance** - Tokenization, Audit Logging, Access Control
-2. **Local Payment Methods** - PromptPay, TrueMoney, Mobile Banking integration
-3. **Double-Entry Bookkeeping** - ความถูกต้องทางการเงิน 100%
-4. **Reconciliation** - ตรวจสอบกับ Bank ทุกวัน
-5. **Fraud Detection** - Rule-based + ML สำหรับ Real-time scoring
-6. **Idempotency** - ป้องกัน Double charge
-7. **Saga Pattern** - จัดการ Distributed Transactions
-
-> "In payment systems, correctness is not optional — it's the foundation"
-
----
-
-*ถัดไป: Part 94 - Case Study: Food Delivery*
+| หัวข้อ | รายละเอียด |
+|--------|-----------|
+| **สถาปัตยกรรม** | Payment Orchestrator + Fraud Detection + Currency Conversion + Notification + Reconciliation + Chargeback |
+| **PCI DSS** | ข้อกำหนด 12 ข้อสำหรับความปลอดภัยข้อมูลบัตรชำระเงิน |
+| **Payment Gateways** | Stripe (Credit Card) + PayPal (Digital Wallet) |
+| **Idempotency** | ใช้ Idempotency Key ป้องกันการชำระซ้ำ + Redis Cache |
+| **Fraud Detection** | Velocity Check + Geolocation + ML Model + Blacklist |
+| **Currency Conversion** | External API + Redis Cache + Fallback Rates |
+| **Reconciliation** | รันทุกวัน เปรียบเทียบข้อมูลกับ Gateway |
+| **Chargeback** | รับ Dispute → Auto Review → Submit Evidence |
+| **Monitoring** | Prometheus Metrics + Alert Rules |
+| **Security** | Network Policy + Secret Management + TLS |
+| **Testing** | Integration Tests ครอบคลุม Happy Path + Edge Cases |

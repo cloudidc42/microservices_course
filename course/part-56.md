@@ -1,28 +1,28 @@
-# Part 56: Message Queue Patterns ด้วย RabbitMQ
+# Part 56: RabbitMQ and Message Broker Patterns
 
 ## บทนำ
 
-RabbitMQ เป็น Message Broker ที่ได้รับความนิยมสูงในระบบ Microservices เพราะรองรับหลาย Exchange Type และ Pattern ที่ซับซ้อน การเข้าใจ Exchange Types, Dead Letter Queues, Priority Queues, และ Consumer Patterns อย่างถ่องแท้จะช่วยให้ระบบมีความ Reliable และ Scalable
+RabbitMQ เป็น Message Broker ที่ทรงพลังและยืดหยุ่นสูง ใช้ AMQP protocol
+ในบทนี้จะเรียนรู้ Pattern ขั้นสูงที่ใช้จริงใน Production รวมถึงการจัดการ Error,
+Dead Letter Queue, Priority Queue และ Monitoring
 
 ---
 
-## 1. RabbitMQ Architecture Overview
+## 1. RabbitMQ Concepts พื้นฐาน
+
+### Exchange Types
 
 ```
-Producer → Exchange → Binding → Queue → Consumer
-              ↓ (ถ้าส่งไม่ได้หรือ TTL หมด)
-          Dead Letter Exchange → Dead Letter Queue → DLQ Consumer
-```
+Producer → Exchange → Queue → Consumer
 
 Exchange Types:
-- **Direct**: Route ด้วย exact routing key
-- **Topic**: Route ด้วย wildcard patterns (`*` = one word, `#` = zero or more)
-- **Fanout**: Broadcast ทุก Queue ที่ bind
-- **Headers**: Route ด้วย message headers
+- direct:  routing key ต้องตรงกับ binding key
+- fanout:  broadcast ไปทุก queue
+- topic:   routing key แบบ wildcard (*, #)
+- headers: ใช้ message headers แทน routing key
+```
 
----
-
-## 2. RabbitMQ Setup และ Configuration
+### การติดตั้ง RabbitMQ ด้วย Docker
 
 ```yaml
 # docker-compose.rabbitmq.yml
@@ -30,1041 +30,684 @@ version: '3.8'
 
 services:
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    hostname: rabbitmq-1
+    image: rabbitmq:3.12-management
+    hostname: rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-admin123}
-      RABBITMQ_DEFAULT_VHOST: microservices
-      # เพิ่ม plugins
-      RABBITMQ_ENABLED_PLUGINS_FILE: /etc/rabbitmq/enabled_plugins
+      RABBITMQ_DEFAULT_PASS: adminpassword
+      RABBITMQ_DEFAULT_VHOST: /
     ports:
-      - "5672:5672"    # AMQP
+      - "5672:5672"    # AMQP port
       - "15672:15672"  # Management UI
       - "15692:15692"  # Prometheus metrics
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
-      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
-      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+      - ./rabbitmq-definitions.json:/etc/rabbitmq/definitions.json
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
       retries: 5
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+
+  rabbitmq-exporter:
+    image: kbudde/rabbitmq-exporter:latest
+    environment:
+      RABBIT_URL: http://rabbitmq:15672
+      RABBIT_USER: admin
+      RABBIT_PASSWORD: adminpassword
+    ports:
+      - "9419:9419"
+    depends_on:
+      - rabbitmq
 
 volumes:
   rabbitmq_data:
 ```
 
 ```ini
-# rabbitmq/rabbitmq.conf
-# Memory high watermark — เริ่ม block producers เมื่อใช้ RAM ถึง 70%
-vm_memory_high_watermark.relative = 0.7
+# rabbitmq.conf
+# การตั้งค่า RabbitMQ สำหรับ Production
+default_vhost = /
+default_user = admin
+default_pass = adminpassword
 
-# Disk free limit — block เมื่อ disk < 2GB
-disk_free_limit.absolute = 2GB
+# Memory threshold
+vm_memory_high_watermark.relative = 0.6
+vm_memory_high_watermark_paging_ratio = 0.5
 
-# Max message size (20MB)
-max_message_size = 20971520
+# Disk free space
+disk_free_limit.relative = 1.0
 
-# Consumer timeout
-consumer_timeout = 1800000
+# Logging
+log.console = true
+log.console.level = info
+log.file = /var/log/rabbitmq/rabbit.log
+log.file.level = info
 
-# Heartbeat
-heartbeat = 60
-
-# Prometheus plugin
-prometheus.path = /metrics
-
-# Management
+# Management plugin
 management.tcp.port = 15672
-management.load_definitions = /etc/rabbitmq/definitions.json
-```
+management.tcp.ip = 0.0.0.0
 
-```json
-// rabbitmq/definitions.json
-{
-  "vhosts": [{ "name": "microservices" }],
-  "users": [
-    {
-      "name": "admin",
-      "password_hash": "...",
-      "tags": "administrator"
-    },
-    {
-      "name": "app",
-      "password_hash": "...",
-      "tags": ""
-    }
-  ],
-  "permissions": [
-    {
-      "user": "app",
-      "vhost": "microservices",
-      "configure": "^(amq\\.gen.*|app\\..*)",
-      "write": ".*",
-      "read": ".*"
-    }
-  ],
-  "exchanges": [
-    {
-      "name": "orders",
-      "vhost": "microservices",
-      "type": "topic",
-      "durable": true,
-      "auto_delete": false
-    },
-    {
-      "name": "orders.dlx",
-      "vhost": "microservices",
-      "type": "direct",
-      "durable": true,
-      "auto_delete": false
-    }
-  ]
-}
+# Prometheus metrics
+prometheus.tcp.port = 15692
 ```
 
 ---
 
-## 3. RabbitMQ Connection Manager
+## 2. TypeScript AMQP Wrapper Library
+
+### การสร้าง RabbitMQ Client
 
 ```typescript
-// packages/shared/src/rabbitmq/connection.manager.ts
-
-import amqplib, {
-  Channel,
-  ConfirmChannel,
-  Connection,
-  Options,
-} from 'amqplib';
+// src/messaging/rabbitmq.client.ts
+import * as amqplib from 'amqplib';
 import { EventEmitter } from 'events';
+import { Logger } from '@nestjs/common';
 
-interface ConnectionManagerOptions {
+export interface RabbitMQConfig {
   url: string;
-  heartbeat?: number;
   reconnectDelay?: number;
   maxReconnectAttempts?: number;
+  heartbeat?: number;
+  prefetch?: number;
 }
 
-export class RabbitMQConnectionManager extends EventEmitter {
-  private connection: Connection | null = null;
-  private reconnectAttempts = 0;
-  private isShuttingDown = false;
+export interface PublishOptions {
+  exchange: string;
+  routingKey: string;
+  content: unknown;
+  options?: amqplib.Options.Publish;
+}
 
-  constructor(private readonly options: ConnectionManagerOptions) {
+export interface ConsumeOptions {
+  queue: string;
+  handler: (message: amqplib.ConsumeMessage) => Promise<void>;
+  options?: amqplib.Options.Consume;
+}
+
+export class RabbitMQClient extends EventEmitter {
+  private readonly logger = new Logger(RabbitMQClient.name);
+  private connection?: amqplib.Connection;
+  private channel?: amqplib.Channel;
+  private confirmChannel?: amqplib.ConfirmChannel;
+  private isConnected = false;
+  private reconnectAttempts = 0;
+
+  constructor(private readonly config: RabbitMQConfig) {
     super();
   }
 
-  async connect(): Promise<Connection> {
+  async connect(): Promise<void> {
     try {
-      this.connection = await amqplib.connect(this.options.url, {
-        heartbeat: this.options.heartbeat ?? 60,
+      this.connection = await amqplib.connect(this.config.url, {
+        heartbeat: this.config.heartbeat || 60,
       });
-
+      
       this.connection.on('error', (err) => {
-        console.error('[RabbitMQ] Connection error:', err.message);
-        this.emit('error', err);
+        this.logger.error('RabbitMQ connection error:', err);
+        this.handleDisconnect();
       });
-
+      
       this.connection.on('close', () => {
-        if (!this.isShuttingDown) {
-          console.warn('[RabbitMQ] Connection closed, reconnecting...');
-          this.scheduleReconnect();
-        }
+        this.logger.warn('RabbitMQ connection closed');
+        this.handleDisconnect();
       });
-
+      
+      // สร้าง channel ปกติ
+      this.channel = await this.connection.createChannel();
+      await this.channel.prefetch(this.config.prefetch || 10);
+      
+      // สร้าง confirm channel สำหรับ publisher confirms
+      this.confirmChannel = await this.connection.createConfirmChannel();
+      
+      this.isConnected = true;
       this.reconnectAttempts = 0;
       this.emit('connected');
-      console.log('[RabbitMQ] Connected successfully');
-
-      return this.connection;
+      
+      this.logger.log('RabbitMQ connected successfully');
     } catch (error) {
-      console.error('[RabbitMQ] Connection failed:', (error as Error).message);
-      this.scheduleReconnect();
-      throw error;
+      this.logger.error('Failed to connect to RabbitMQ:', error);
+      await this.scheduleReconnect();
     }
   }
 
-  async createChannel(): Promise<Channel> {
-    if (!this.connection) {
-      throw new Error('Not connected to RabbitMQ');
-    }
-
-    const channel = await this.connection.createChannel();
-    channel.on('error', (err) => {
-      console.error('[RabbitMQ] Channel error:', err.message);
-    });
-
-    return channel;
+  private async handleDisconnect(): Promise<void> {
+    this.isConnected = false;
+    this.channel = undefined;
+    this.confirmChannel = undefined;
+    this.connection = undefined;
+    
+    this.emit('disconnected');
+    await this.scheduleReconnect();
   }
 
-  async createConfirmChannel(): Promise<ConfirmChannel> {
-    if (!this.connection) {
-      throw new Error('Not connected to RabbitMQ');
-    }
-
-    const channel = await this.connection.createConfirmChannel();
-    channel.on('error', (err) => {
-      console.error('[RabbitMQ] Confirm channel error:', err.message);
-    });
-
-    return channel;
-  }
-
-  private scheduleReconnect(): void {
-    const maxAttempts = this.options.maxReconnectAttempts ?? -1; // -1 = infinite
-    if (maxAttempts !== -1 && this.reconnectAttempts >= maxAttempts) {
-      console.error('[RabbitMQ] Max reconnect attempts reached');
-      this.emit('max-reconnect-exceeded');
+  private async scheduleReconnect(): Promise<void> {
+    const maxAttempts = this.config.maxReconnectAttempts || Infinity;
+    
+    if (this.reconnectAttempts >= maxAttempts) {
+      this.logger.error(`Max reconnect attempts (${maxAttempts}) reached`);
+      this.emit('max_reconnects_reached');
       return;
     }
-
+    
     this.reconnectAttempts++;
     const delay = Math.min(
-      (this.options.reconnectDelay ?? 5000) * Math.pow(2, this.reconnectAttempts - 1),
-      60000 // max 60s
+      (this.config.reconnectDelay || 5000) * Math.pow(2, this.reconnectAttempts - 1),
+      30000  // Maximum 30 seconds
     );
+    
+    this.logger.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`);
+    
+    await new Promise(resolve => setTimeout(resolve, delay));
+    await this.connect();
+  }
 
-    console.log(
-      `[RabbitMQ] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`
+  async assertExchange(
+    name: string,
+    type: 'direct' | 'fanout' | 'topic' | 'headers',
+    options?: amqplib.Options.AssertExchange
+  ): Promise<void> {
+    if (!this.channel) throw new Error('Channel not available');
+    
+    await this.channel.assertExchange(name, type, {
+      durable: true,
+      ...options,
+    });
+  }
+
+  async assertQueue(
+    name: string,
+    options?: amqplib.Options.AssertQueue
+  ): Promise<amqplib.Replies.AssertQueue> {
+    if (!this.channel) throw new Error('Channel not available');
+    
+    return this.channel.assertQueue(name, {
+      durable: true,
+      ...options,
+    });
+  }
+
+  async bindQueue(
+    queue: string,
+    exchange: string,
+    routingKey: string,
+    args?: Record<string, unknown>
+  ): Promise<void> {
+    if (!this.channel) throw new Error('Channel not available');
+    await this.channel.bindQueue(queue, exchange, routingKey, args);
+  }
+
+  async publish(opts: PublishOptions): Promise<boolean> {
+    if (!this.confirmChannel) throw new Error('Confirm channel not available');
+    
+    const content = Buffer.from(JSON.stringify(opts.content));
+    
+    return new Promise((resolve, reject) => {
+      this.confirmChannel!.publish(
+        opts.exchange,
+        opts.routingKey,
+        content,
+        {
+          persistent: true,
+          contentType: 'application/json',
+          timestamp: Date.now(),
+          ...opts.options,
+        },
+        (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(true);
+          }
+        }
+      );
+    });
+  }
+
+  async consume(opts: ConsumeOptions): Promise<void> {
+    if (!this.channel) throw new Error('Channel not available');
+    
+    await this.channel.consume(
+      opts.queue,
+      async (msg) => {
+        if (!msg) return;
+        
+        try {
+          await opts.handler(msg);
+          this.channel?.ack(msg);
+        } catch (error) {
+          this.logger.error(`Error processing message from ${opts.queue}:`, error);
+          // Nack และส่งไป DLQ
+          this.channel?.nack(msg, false, false);
+        }
+      },
+      opts.options
     );
-
-    setTimeout(() => {
-      this.connect().catch(() => {
-        // Error handled in connect()
-      });
-    }, delay);
   }
 
   async close(): Promise<void> {
-    this.isShuttingDown = true;
-    if (this.connection) {
-      await this.connection.close();
-      this.connection = null;
+    try {
+      await this.channel?.close();
+      await this.confirmChannel?.close();
+      await this.connection?.close();
+    } catch (error) {
+      this.logger.error('Error closing RabbitMQ connection:', error);
     }
+  }
+
+  getChannel(): amqplib.Channel {
+    if (!this.channel) throw new Error('Channel not available');
+    return this.channel;
+  }
+
+  isReady(): boolean {
+    return this.isConnected && !!this.channel;
   }
 }
 ```
 
 ---
 
-## 4. Exchange Types ตัวอย่าง
+## 3. Exchange Patterns
+
+### Direct Exchange
 
 ```typescript
-// packages/shared/src/rabbitmq/exchanges.setup.ts
+// src/messaging/patterns/direct-exchange.ts
+import { RabbitMQClient } from '../rabbitmq.client';
 
-import { Channel } from 'amqplib';
+export class DirectExchangeExample {
+  constructor(private readonly client: RabbitMQClient) {}
 
-export async function setupExchanges(channel: Channel): Promise<void> {
-  // ─── 1. Direct Exchange ─────────────────────────────────────────────────
-  // ส่ง message ไปยัง queue ที่ routing key ตรงกัน
-  await channel.assertExchange('orders.direct', 'direct', {
-    durable: true,
-    autoDelete: false,
-  });
-
-  // ─── 2. Topic Exchange ──────────────────────────────────────────────────
-  // ส่ง message ด้วย wildcard pattern
-  // routing key: "order.created.thailand" → ตรงกับ "order.*.thailand", "order.#"
-  await channel.assertExchange('orders.topic', 'topic', {
-    durable: true,
-    autoDelete: false,
-  });
-
-  // ─── 3. Fanout Exchange ─────────────────────────────────────────────────
-  // Broadcast ไปทุก Queue ที่ bind (ไม่สนใจ routing key)
-  await channel.assertExchange('notifications.fanout', 'fanout', {
-    durable: true,
-    autoDelete: false,
-  });
-
-  // ─── 4. Headers Exchange ────────────────────────────────────────────────
-  // Route ด้วย message headers
-  await channel.assertExchange('orders.headers', 'headers', {
-    durable: true,
-    autoDelete: false,
-  });
-
-  // ─── Dead Letter Exchange ───────────────────────────────────────────────
-  await channel.assertExchange('orders.dlx', 'direct', {
-    durable: true,
-    autoDelete: false,
-  });
-
-  console.log('[RabbitMQ] Exchanges set up');
-}
-
-export async function setupQueues(channel: Channel): Promise<void> {
-  // ─── Queue with Dead Letter Exchange ────────────────────────────────────
-  await channel.assertQueue('order.processing', {
-    durable: true,
-    arguments: {
-      'x-dead-letter-exchange': 'orders.dlx',
-      'x-dead-letter-routing-key': 'order.processing.dead',
-      'x-message-ttl': 300000,      // 5 minutes TTL
-      'x-max-length': 10000,         // Max 10k messages
-      'x-max-length-bytes': 100 * 1024 * 1024, // 100MB max
-      'x-overflow': 'reject-publish', // Reject new messages when full
-    },
-  });
-
-  // DLQ
-  await channel.assertQueue('order.processing.dlq', {
-    durable: true,
-    arguments: {
-      'x-message-ttl': 7 * 24 * 60 * 60 * 1000, // Keep 7 days
-    },
-  });
-
-  // ─── Priority Queue ─────────────────────────────────────────────────────
-  await channel.assertQueue('order.priority', {
-    durable: true,
-    arguments: {
-      'x-max-priority': 10, // Priority 0-10 (10 = highest)
-      'x-dead-letter-exchange': 'orders.dlx',
-      'x-dead-letter-routing-key': 'order.priority.dead',
-    },
-  });
-
-  // ─── Bindings ────────────────────────────────────────────────────────────
-
-  // Direct binding
-  await channel.bindQueue('order.processing', 'orders.direct', 'new-order');
-
-  // Topic bindings
-  await channel.bindQueue(
-    'order.processing',
-    'orders.topic',
-    'order.created.*' // ตรงกับ order.created.anything
-  );
-  await channel.bindQueue(
-    'order.priority',
-    'orders.topic',
-    'order.vip.#' // ตรงกับ order.vip.anything.or.more
-  );
-
-  // DLQ binding
-  await channel.bindQueue(
-    'order.processing.dlq',
-    'orders.dlx',
-    'order.processing.dead'
-  );
-
-  // Fanout binding (ไม่ต้องระบุ routing key)
-  await channel.bindQueue('notifications.email', 'notifications.fanout', '');
-  await channel.bindQueue('notifications.sms', 'notifications.fanout', '');
-  await channel.bindQueue('notifications.push', 'notifications.fanout', '');
-
-  // Headers binding
-  await channel.bindQueue(
-    'order.processing',
-    'orders.headers',
-    '', // routing key ไม่สำคัญ
-    {
-      'x-match': 'all',         // ต้อง match ทุก header
-      'region': 'thailand',
-      'order-type': 'express',
-    }
-  );
-
-  console.log('[RabbitMQ] Queues and bindings set up');
-}
-```
-
----
-
-## 5. Publisher พร้อม Publisher Confirms
-
-```typescript
-// packages/shared/src/rabbitmq/publisher.ts
-
-import { ConfirmChannel, Options } from 'amqplib';
-
-export interface PublishOptions {
-  persistent?: boolean;
-  priority?: number; // 0-10 สำหรับ priority queues
-  expiration?: string; // TTL เป็น milliseconds string
-  messageId?: string;
-  correlationId?: string;
-  replyTo?: string;
-  headers?: Record<string, string | number | boolean>;
-  contentType?: string;
-  mandatory?: boolean; // ส่ง basic.return ถ้า unroutable
-}
-
-export interface PublishResult {
-  success: boolean;
-  messageId: string;
-  exchange: string;
-  routingKey: string;
-  error?: Error;
-}
-
-export class RabbitMQPublisher {
-  private channel!: ConfirmChannel;
-  private pendingConfirms: Map<
-    number,
-    { resolve: () => void; reject: (err: Error) => void }
-  > = new Map();
-  private deliveryTag = 0;
-
-  constructor(private readonly channelProvider: () => Promise<ConfirmChannel>) {}
-
-  async initialize(): Promise<void> {
-    this.channel = await this.channelProvider();
-
-    // Publisher Confirms
-    this.channel.on('ack', (seqNum: number, multiple: boolean) => {
-      if (multiple) {
-        // Confirm ทุก message ที่ seqNum <= seqNum
-        for (const [tag, { resolve }] of this.pendingConfirms) {
-          if (tag <= seqNum) {
-            resolve();
-            this.pendingConfirms.delete(tag);
-          }
-        }
-      } else {
-        this.pendingConfirms.get(seqNum)?.resolve();
-        this.pendingConfirms.delete(seqNum);
-      }
-    });
-
-    this.channel.on('nack', (seqNum: number, multiple: boolean) => {
-      const error = new Error('Message nacked by broker');
-      if (multiple) {
-        for (const [tag, { reject }] of this.pendingConfirms) {
-          if (tag <= seqNum) {
-            reject(error);
-            this.pendingConfirms.delete(tag);
-          }
-        }
-      } else {
-        this.pendingConfirms.get(seqNum)?.reject(error);
-        this.pendingConfirms.delete(seqNum);
-      }
-    });
-
-    // Handle unroutable messages
-    this.channel.on('return', (msg) => {
-      console.warn(
-        '[Publisher] Message returned (unroutable):',
-        msg.fields.routingKey
-      );
-    });
+  async setup(): Promise<void> {
+    // สร้าง exchange
+    await this.client.assertExchange('orders', 'direct', { durable: true });
+    
+    // สร้าง queues สำหรับแต่ละ routing key
+    await this.client.assertQueue('orders.created', { durable: true });
+    await this.client.assertQueue('orders.updated', { durable: true });
+    await this.client.assertQueue('orders.cancelled', { durable: true });
+    
+    // Bind queues กับ exchange
+    await this.client.bindQueue('orders.created', 'orders', 'order.created');
+    await this.client.bindQueue('orders.updated', 'orders', 'order.updated');
+    await this.client.bindQueue('orders.cancelled', 'orders', 'order.cancelled');
   }
 
-  async publish(
-    exchange: string,
-    routingKey: string,
-    message: unknown,
-    options: PublishOptions = {}
-  ): Promise<PublishResult> {
-    const messageId = options.messageId ?? generateMessageId();
-    const content = Buffer.from(JSON.stringify(message));
-    const seqNum = this.channel.getNextPublishSeqNo();
-
-    const publishOptions: Options.Publish = {
-      persistent: options.persistent ?? true,
-      messageId,
-      correlationId: options.correlationId,
-      replyTo: options.replyTo,
-      contentType: options.contentType ?? 'application/json',
-      timestamp: Math.floor(Date.now() / 1000),
-      headers: {
-        ...options.headers,
-        'x-origin-service': process.env.SERVICE_NAME ?? 'unknown',
-        'x-publish-time': new Date().toISOString(),
+  async publishOrderCreated(order: { id: string; total: number; customerId: string }): Promise<void> {
+    await this.client.publish({
+      exchange: 'orders',
+      routingKey: 'order.created',
+      content: {
+        eventType: 'order.created',
+        payload: order,
+        timestamp: new Date().toISOString(),
+        correlationId: crypto.randomUUID(),
       },
-      priority: options.priority,
-      expiration: options.expiration,
-      mandatory: options.mandatory ?? false,
-    };
+    });
+  }
+}
+```
 
-    return new Promise<PublishResult>((resolve, reject) => {
-      this.pendingConfirms.set(seqNum, {
-        resolve: () =>
-          resolve({
-            success: true,
-            messageId,
-            exchange,
-            routingKey,
-          }),
-        reject: (err) =>
-          reject({
-            success: false,
-            messageId,
-            exchange,
-            routingKey,
-            error: err,
-          }),
-      });
+### Fanout Exchange
 
-      const ok = this.channel.publish(
-        exchange,
-        routingKey,
-        content,
-        publishOptions
-      );
+```typescript
+// src/messaging/patterns/fanout-exchange.ts
+export class FanoutExchangeExample {
+  constructor(private readonly client: RabbitMQClient) {}
 
-      if (!ok) {
-        // Channel buffer is full — wait for drain
-        this.channel.once('drain', () => {
-          console.log('[Publisher] Channel drained, ready to publish again');
-        });
-      }
+  async setup(): Promise<void> {
+    // Fanout exchange - broadcast ไปทุก queue
+    await this.client.assertExchange('notifications', 'fanout', { durable: true });
+    
+    // สร้าง queues สำหรับ subscribers ต่างๆ
+    const subscribers = ['email-service', 'sms-service', 'push-notification-service', 'audit-log-service'];
+    
+    for (const subscriber of subscribers) {
+      await this.client.assertQueue(`notifications.${subscriber}`, { durable: true });
+      // Fanout ไม่ต้องการ routing key (ใช้ '' แทน)
+      await this.client.bindQueue(`notifications.${subscriber}`, 'notifications', '');
+    }
+  }
+
+  async broadcastNotification(notification: {
+    type: string;
+    message: string;
+    userId: string;
+  }): Promise<void> {
+    await this.client.publish({
+      exchange: 'notifications',
+      routingKey: '',  // Fanout ไม่ใช้ routing key
+      content: notification,
+    });
+  }
+}
+```
+
+### Topic Exchange
+
+```typescript
+// src/messaging/patterns/topic-exchange.ts
+export class TopicExchangeExample {
+  constructor(private readonly client: RabbitMQClient) {}
+
+  async setup(): Promise<void> {
+    await this.client.assertExchange('events', 'topic', { durable: true });
+    
+    // Queue สำหรับ order events ทั้งหมด
+    await this.client.assertQueue('events.orders.all', { durable: true });
+    await this.client.bindQueue('events.orders.all', 'events', 'order.#');
+    
+    // Queue สำหรับ payment events
+    await this.client.assertQueue('events.payment', { durable: true });
+    await this.client.bindQueue('events.payment', 'events', 'payment.*');
+    
+    // Queue สำหรับ critical events ทั้งหมด
+    await this.client.assertQueue('events.critical', { durable: true });
+    await this.client.bindQueue('events.critical', 'events', '*.critical.*');
+    
+    // Queue สำหรับทุก event ของ user-service
+    await this.client.assertQueue('events.user-service', { durable: true });
+    await this.client.bindQueue('events.user-service', 'events', 'user-service.#');
+  }
+
+  async publishEvent(domain: string, action: string, data: unknown): Promise<void> {
+    const routingKey = `${domain}.${action}`;
+    
+    await this.client.publish({
+      exchange: 'events',
+      routingKey,
+      content: {
+        domain,
+        action,
+        data,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+}
+```
+
+### Headers Exchange
+
+```typescript
+// src/messaging/patterns/headers-exchange.ts
+export class HeadersExchangeExample {
+  constructor(private readonly client: RabbitMQClient) {}
+
+  async setup(): Promise<void> {
+    await this.client.assertExchange('reports', 'headers', { durable: true });
+    
+    // Queue สำหรับ PDF reports ภาษาไทย
+    await this.client.assertQueue('reports.pdf.th', { durable: true });
+    await this.client.bindQueue('reports.pdf.th', 'reports', '', {
+      'x-match': 'all',  // ต้องตรงทั้งหมด
+      format: 'pdf',
+      language: 'th',
+    });
+    
+    // Queue สำหรับ Excel reports ทุกภาษา
+    await this.client.assertQueue('reports.excel.all', { durable: true });
+    await this.client.bindQueue('reports.excel.all', 'reports', '', {
+      'x-match': 'any',  // ตรงอย่างน้อย 1
+      format: 'xlsx',
     });
   }
 
-  // Batch publish
-  async publishBatch(
-    messages: Array<{
-      exchange: string;
-      routingKey: string;
-      message: unknown;
-      options?: PublishOptions;
-    }>
-  ): Promise<PublishResult[]> {
-    return Promise.all(
-      messages.map(({ exchange, routingKey, message, options }) =>
-        this.publish(exchange, routingKey, message, options)
-      )
-    );
+  async requestReport(format: string, language: string, data: unknown): Promise<void> {
+    await this.client.publish({
+      exchange: 'reports',
+      routingKey: '',  // Headers exchange ไม่ใช้ routing key
+      content: data,
+      options: {
+        headers: {
+          format,
+          language,
+          requestedAt: new Date().toISOString(),
+        },
+      },
+    });
   }
-
-  // Publish to queue directly (default exchange)
-  async sendToQueue(
-    queue: string,
-    message: unknown,
-    options: PublishOptions = {}
-  ): Promise<PublishResult> {
-    return this.publish('', queue, message, options);
-  }
-}
-
-function generateMessageId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 ```
 
 ---
 
-## 6. Consumer พร้อม Prefetch และ Acknowledgment
+## 4. Dead Letter Queue Pattern
+
+### การตั้งค่า DLQ
 
 ```typescript
-// packages/shared/src/rabbitmq/consumer.ts
+// src/messaging/patterns/dead-letter-queue.ts
+import { RabbitMQClient } from '../rabbitmq.client';
+import * as amqplib from 'amqplib';
 
-import { Channel, ConsumeMessage, Options } from 'amqplib';
-import { Histogram, Counter } from 'prom-client';
-
-export type MessageHandler<T = unknown> = (
-  message: T,
-  metadata: MessageMetadata
-) => Promise<void>;
-
-export interface MessageMetadata {
-  messageId: string;
-  correlationId?: string;
-  routingKey: string;
-  exchange: string;
-  headers: Record<string, unknown>;
-  deliveryTag: number;
-  redelivered: boolean;
-  timestamp?: Date;
-  retryCount: number;
+export interface RetryConfig {
+  maxRetries: number;
+  retryDelays: number[];  // Milliseconds สำหรับแต่ละ retry
 }
 
-export interface ConsumerOptions {
-  prefetchCount?: number;  // Flow control — max unacked messages
-  prefetchGlobal?: boolean; // Apply prefetch to channel or consumer
-  requeue?: boolean;       // Requeue on failure
-  maxRetries?: number;
-}
-
-export class RabbitMQConsumer {
-  private readonly processingDuration: Histogram<string>;
-  private readonly messagesConsumed: Counter<string>;
-  private readonly messagesFailed: Counter<string>;
+export class DeadLetterQueuePattern {
+  private readonly logger = console;
 
   constructor(
-    private readonly channel: Channel,
-    metrics?: {
-      processingDuration: Histogram<string>;
-      messagesConsumed: Counter<string>;
-      messagesFailed: Counter<string>;
+    private readonly client: RabbitMQClient,
+    private readonly retryConfig: RetryConfig = {
+      maxRetries: 3,
+      retryDelays: [1000, 5000, 30000],  // 1s, 5s, 30s
     }
-  ) {
-    this.processingDuration = metrics?.processingDuration ?? new Histogram({
-      name: 'mq_message_processing_duration_seconds',
-      help: 'Message processing duration',
-      labelNames: ['queue'],
-      buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10],
-    });
-    this.messagesConsumed = metrics?.messagesConsumed ?? new Counter({
-      name: 'mq_messages_consumed_total',
-      help: 'Messages consumed',
-      labelNames: ['queue', 'status'],
-    });
-    this.messagesFailed = metrics?.messagesFailed ?? new Counter({
-      name: 'mq_messages_failed_total',
-      help: 'Messages failed',
-      labelNames: ['queue'],
-    });
-  }
-
-  async consume<T = unknown>(
-    queue: string,
-    handler: MessageHandler<T>,
-    options: ConsumerOptions = {}
-  ): Promise<string> {
-    const {
-      prefetchCount = 10,
-      prefetchGlobal = false,
-      requeue = false,
-      maxRetries = 3,
-    } = options;
-
-    // ตั้ง prefetch — Flow control
-    await this.channel.prefetch(prefetchCount, prefetchGlobal);
-
-    const { consumerTag } = await this.channel.consume(queue, async (msg) => {
-      if (!msg) return; // Consumer cancelled
-
-      const timer = this.processingDuration.startTimer({ queue });
-      const metadata = extractMetadata(msg);
-
-      try {
-        const body = JSON.parse(msg.content.toString()) as T;
-
-        // ตรวจสอบ retry count
-        if (metadata.retryCount > maxRetries) {
-          console.warn(
-            `[Consumer] Message exceeded max retries (${maxRetries}), sending to DLQ`,
-            { messageId: metadata.messageId, queue }
-          );
-          this.channel.nack(msg, false, false); // requeue=false → DLQ
-          this.messagesConsumed.inc({ queue, status: 'dlq' });
-          timer();
-          return;
-        }
-
-        await handler(body, metadata);
-
-        this.channel.ack(msg);
-        this.messagesConsumed.inc({ queue, status: 'success' });
-
-      } catch (error) {
-        const err = error as Error;
-        console.error(
-          `[Consumer] Error processing message`,
-          {
-            messageId: metadata.messageId,
-            queue,
-            error: err.message,
-            retryCount: metadata.retryCount,
-          }
-        );
-
-        this.messagesFailed.inc({ queue });
-
-        // ตัดสินใจ: requeue หรือ DLQ
-        const shouldRequeue = requeue && metadata.retryCount < maxRetries;
-        this.channel.nack(msg, false, shouldRequeue);
-        this.messagesConsumed.inc({
-          queue,
-          status: shouldRequeue ? 'requeued' : 'failed',
-        });
-
-      } finally {
-        timer();
-      }
-    });
-
-    console.log(`[Consumer] Started consuming from ${queue} (tag: ${consumerTag})`);
-    return consumerTag;
-  }
-
-  // Competing Consumers Pattern — หลาย consumer process จาก queue เดียวกัน
-  async consumeWithConcurrency<T = unknown>(
-    queue: string,
-    handler: MessageHandler<T>,
-    concurrency: number,
-    options: Omit<ConsumerOptions, 'prefetchCount'> = {}
-  ): Promise<string[]> {
-    const tags: string[] = [];
-
-    for (let i = 0; i < concurrency; i++) {
-      const tag = await this.consume(queue, handler, {
-        ...options,
-        prefetchCount: 1, // Each consumer processes 1 at a time
-      });
-      tags.push(tag);
-    }
-
-    return tags;
-  }
-}
-
-function extractMetadata(msg: ConsumeMessage): MessageMetadata {
-  const headers = msg.properties.headers ?? {};
-  const retryCount = typeof headers['x-death'] === 'object' && headers['x-death'] !== null
-    ? (headers['x-death'] as Array<{ count: number }>)[0]?.count ?? 0
-    : 0;
-
-  return {
-    messageId: msg.properties.messageId ?? `unknown-${msg.fields.deliveryTag}`,
-    correlationId: msg.properties.correlationId,
-    routingKey: msg.fields.routingKey,
-    exchange: msg.fields.exchange,
-    headers: headers as Record<string, unknown>,
-    deliveryTag: msg.fields.deliveryTag,
-    redelivered: msg.fields.redelivered,
-    timestamp: msg.properties.timestamp
-      ? new Date(msg.properties.timestamp * 1000)
-      : undefined,
-    retryCount: Number(retryCount),
-  };
-}
-```
-
----
-
-## 7. Dead Letter Queue Handler
-
-```typescript
-// packages/shared/src/rabbitmq/dlq.handler.ts
-
-import { Channel } from 'amqplib';
-
-interface DeadLetterMessage {
-  originalQueue: string;
-  originalExchange: string;
-  originalRoutingKey: string;
-  reason: string;
-  deathCount: number;
-  content: unknown;
-  timestamp: Date;
-  messageId: string;
-}
-
-export class DeadLetterHandler {
-  constructor(
-    private readonly channel: Channel,
-    private readonly storage: DLQStorage
   ) {}
 
-  async startProcessing(dlqName: string): Promise<void> {
-    await this.channel.prefetch(5);
+  async setup(serviceName: string): Promise<void> {
+    const mainExchange = `${serviceName}.exchange`;
+    const dlxExchange = `${serviceName}.dlx`;
+    const mainQueue = `${serviceName}.queue`;
+    const dlqQueue = `${serviceName}.dlq`;
+    const retryQueue = `${serviceName}.retry`;
 
-    await this.channel.consume(dlqName, async (msg) => {
-      if (!msg) return;
-
-      try {
-        const xDeath = msg.properties.headers?.['x-death'];
-        const deaths = Array.isArray(xDeath) ? xDeath : [];
-
-        const dlm: DeadLetterMessage = {
-          originalQueue: deaths[0]?.queue ?? 'unknown',
-          originalExchange: deaths[0]?.exchange ?? 'unknown',
-          originalRoutingKey: Array.isArray(deaths[0]?.['routing-keys'])
-            ? deaths[0]['routing-keys'][0]
-            : 'unknown',
-          reason: deaths[0]?.reason ?? 'unknown',
-          deathCount: deaths[0]?.count ?? 1,
-          content: JSON.parse(msg.content.toString()),
-          timestamp: new Date(),
-          messageId: msg.properties.messageId ?? 'unknown',
-        };
-
-        // บันทึกลง Storage สำหรับ manual inspection
-        await this.storage.save(dlm);
-
-        // Notify operations team
-        await this.notifyOperations(dlm);
-
-        this.channel.ack(msg);
-
-        console.log(`[DLQ] Processed dead letter: ${dlm.messageId}`, {
-          originalQueue: dlm.originalQueue,
-          reason: dlm.reason,
-          deathCount: dlm.deathCount,
-        });
-
-      } catch (error) {
-        console.error('[DLQ] Error processing dead letter:', error);
-        this.channel.nack(msg, false, false); // ไม่ requeue
-      }
+    // 1. สร้าง Dead Letter Exchange
+    await this.client.assertExchange(dlxExchange, 'direct', { durable: true });
+    
+    // 2. สร้าง Dead Letter Queue
+    await this.client.assertQueue(dlqQueue, {
+      durable: true,
+      arguments: {
+        'x-queue-type': 'quorum',
+      },
     });
+    await this.client.bindQueue(dlqQueue, dlxExchange, 'dead-letter');
 
-    console.log(`[DLQ] Monitoring dead letters from: ${dlqName}`);
+    // 3. สร้าง Retry Queue พร้อม delay
+    for (let i = 0; i < this.retryConfig.maxRetries; i++) {
+      const retryQueueName = `${retryQueue}.${i + 1}`;
+      const delayMs = this.retryConfig.retryDelays[i];
+      
+      await this.client.assertQueue(retryQueueName, {
+        durable: true,
+        arguments: {
+          'x-message-ttl': delayMs,
+          'x-dead-letter-exchange': mainExchange,
+          'x-dead-letter-routing-key': 'main',
+        },
+      });
+    }
+
+    // 4. สร้าง Main Exchange และ Queue
+    await this.client.assertExchange(mainExchange, 'direct', { durable: true });
+    await this.client.assertQueue(mainQueue, {
+      durable: true,
+      arguments: {
+        'x-dead-letter-exchange': dlxExchange,
+        'x-dead-letter-routing-key': 'dead-letter',
+      },
+    });
+    await this.client.bindQueue(mainQueue, mainExchange, 'main');
   }
 
-  // Retry dead letter — ส่งกลับไป original queue
-  async retry(messageId: string): Promise<boolean> {
-    const dlm = await this.storage.findById(messageId);
-    if (!dlm) return false;
+  async consume(
+    serviceName: string,
+    handler: (content: unknown) => Promise<void>
+  ): Promise<void> {
+    const mainQueue = `${serviceName}.queue`;
+    const retryQueue = `${serviceName}.retry`;
+    const dlxExchange = `${serviceName}.dlx`;
+    const mainExchange = `${serviceName}.exchange`;
 
-    this.channel.publish(
-      dlm.originalExchange,
-      dlm.originalRoutingKey,
-      Buffer.from(JSON.stringify(dlm.content)),
+    await this.client.consume({
+      queue: mainQueue,
+      handler: async (msg: amqplib.ConsumeMessage) => {
+        const channel = this.client.getChannel();
+        
+        try {
+          const content = JSON.parse(msg.content.toString());
+          await handler(content);
+          channel.ack(msg);
+        } catch (error) {
+          const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) as number;
+          
+          if (retryCount < this.retryConfig.maxRetries) {
+            const nextRetryQueue = `${retryQueue}.${retryCount + 1}`;
+            
+            this.logger.warn(`Retry ${retryCount + 1}/${this.retryConfig.maxRetries} for message`);
+            
+            // ส่งไป retry queue
+            channel.sendToQueue(
+              nextRetryQueue,
+              msg.content,
+              {
+                persistent: true,
+                headers: {
+                  ...msg.properties.headers,
+                  'x-retry-count': retryCount + 1,
+                  'x-original-error': error instanceof Error ? error.message : 'Unknown error',
+                  'x-failed-at': new Date().toISOString(),
+                },
+              }
+            );
+            
+            channel.ack(msg);
+          } else {
+            this.logger.error(`Message failed after ${this.retryConfig.maxRetries} retries, sending to DLQ`);
+            channel.nack(msg, false, false);  // ส่งไป DLQ
+          }
+        }
+      },
+    });
+  }
+}
+```
+
+---
+
+## 5. Priority Queue
+
+```typescript
+// src/messaging/patterns/priority-queue.ts
+export enum MessagePriority {
+  CRITICAL = 10,
+  HIGH = 8,
+  NORMAL = 5,
+  LOW = 2,
+  BACKGROUND = 0,
+}
+
+export class PriorityQueuePattern {
+  constructor(private readonly client: RabbitMQClient) {}
+
+  async setup(queueName: string, maxPriority = 10): Promise<void> {
+    await this.client.assertQueue(queueName, {
+      durable: true,
+      arguments: {
+        'x-max-priority': maxPriority,
+      },
+    });
+  }
+
+  async publishWithPriority(
+    queueName: string,
+    content: unknown,
+    priority: MessagePriority
+  ): Promise<void> {
+    const channel = this.client.getChannel();
+    
+    channel.sendToQueue(
+      queueName,
+      Buffer.from(JSON.stringify(content)),
       {
         persistent: true,
-        messageId: dlm.messageId,
-        headers: {
-          'x-retry-from-dlq': true,
-          'x-retry-timestamp': new Date().toISOString(),
-        },
+        priority,
+        timestamp: Date.now(),
       }
     );
-
-    await this.storage.markRetried(messageId);
-    return true;
   }
 
-  private async notifyOperations(dlm: DeadLetterMessage): Promise<void> {
-    // Send to Slack, PagerDuty, etc.
-    console.error(`[DLQ ALERT] Dead letter from ${dlm.originalQueue}:`, {
-      messageId: dlm.messageId,
-      reason: dlm.reason,
-      deathCount: dlm.deathCount,
-    });
+  async publishOrderWithPriority(order: {
+    id: string;
+    type: 'express' | 'standard' | 'economy';
+    amount: number;
+  }): Promise<void> {
+    let priority: MessagePriority;
+    
+    if (order.type === 'express' || order.amount > 10000) {
+      priority = MessagePriority.HIGH;
+    } else if (order.type === 'standard') {
+      priority = MessagePriority.NORMAL;
+    } else {
+      priority = MessagePriority.LOW;
+    }
+    
+    await this.publishWithPriority('orders.processing', order, priority);
   }
-}
-
-interface DLQStorage {
-  save(message: DeadLetterMessage): Promise<void>;
-  findById(messageId: string): Promise<DeadLetterMessage | null>;
-  markRetried(messageId: string): Promise<void>;
 }
 ```
 
 ---
 
-## 8. Priority Queue ตัวอย่าง
+## 6. RPC over RabbitMQ
 
 ```typescript
-// packages/order-service/src/priority.producer.ts
+// src/messaging/patterns/rpc.ts
+import * as amqplib from 'amqplib';
+import { v4 as uuidv4 } from 'uuid';
 
-import { RabbitMQPublisher } from '@shared/rabbitmq/publisher';
+export class RpcPattern {
+  private pendingRequests = new Map<string, {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }>();
 
-interface OrderMessage {
-  orderId: string;
-  userId: string;
-  items: Array<{ productId: string; quantity: number }>;
-  totalAmount: number;
-  priority: 'vip' | 'premium' | 'standard';
-}
-
-export class OrderPriorityProducer {
-  constructor(private readonly publisher: RabbitMQPublisher) {}
-
-  async publishOrder(order: OrderMessage): Promise<void> {
-    // Map priority ไปยัง RabbitMQ priority number (0-10)
-    const priorityMap = {
-      vip: 9,
-      premium: 6,
-      standard: 3,
-    };
-
-    const mqPriority = priorityMap[order.priority];
-
-    await this.publisher.publish(
-      'orders.topic',
-      `order.created.${order.priority}`,
-      order,
-      {
-        priority: mqPriority,
-        messageId: `order-${order.orderId}`,
-        headers: {
-          'order-priority': order.priority,
-          'user-id': order.userId,
-        },
-      }
-    );
-
-    console.log(`[OrderProducer] Published order ${order.orderId} with priority ${mqPriority}`);
-  }
-}
-
-// ตัวอย่างการส่ง VIP order ที่มี priority สูง
-// order.vip.# → order.priority queue (priority 9)
-// order.standard.* → order.processing queue (priority 3)
-```
-
----
-
-## 9. Work Queue Pattern
-
-```typescript
-// packages/notification-service/src/work.queue.ts
-// Work Queue: หลาย Worker แย่ง consume จาก queue เดียวกัน
-
-import { Channel } from 'amqplib';
-
-interface EmailTask {
-  to: string;
-  subject: string;
-  templateId: string;
-  data: Record<string, unknown>;
-}
-
-export class EmailWorker {
-  private readonly workerId: string;
+  private replyQueue?: string;
 
   constructor(
-    private readonly channel: Channel,
-    workerIndex: number
-  ) {
-    this.workerId = `worker-${workerIndex}`;
-  }
+    private readonly client: RabbitMQClient,
+    private readonly timeoutMs = 30000
+  ) {}
 
-  async start(): Promise<void> {
-    // prefetch=1 ทำให้แต่ละ worker รับงานทีละ 1 ชิ้น
-    // Worker ที่ทำงานเสร็จเร็วจะรับงานใหม่ได้เร็วกว่า (fair dispatch)
-    await this.channel.prefetch(1);
-
-    await this.channel.consume('email.tasks', async (msg) => {
-      if (!msg) return;
-
-      const task: EmailTask = JSON.parse(msg.content.toString());
-
-      console.log(`[${this.workerId}] Processing email task:`, {
-        to: task.to,
-        subject: task.subject,
-      });
-
-      try {
-        await this.sendEmail(task);
-        this.channel.ack(msg);
-        console.log(`[${this.workerId}] Email sent successfully`);
-      } catch (error) {
-        console.error(`[${this.workerId}] Failed to send email:`, error);
-        // Nack — ส่งไป DLQ
-        this.channel.nack(msg, false, false);
-      }
-    });
-
-    console.log(`[${this.workerId}] Email worker started`);
-  }
-
-  private async sendEmail(task: EmailTask): Promise<void> {
-    // Simulate email sending
-    await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 500));
-    if (Math.random() < 0.01) {
-      throw new Error('Email service temporarily unavailable');
-    }
-  }
-}
-
-// ─── Start multiple workers ────────────────────────────────────────────────
-
-export async function startEmailWorkerPool(
-  channel: Channel,
-  workerCount: number
-): Promise<EmailWorker[]> {
-  const workers: EmailWorker[] = [];
-
-  for (let i = 0; i < workerCount; i++) {
-    const worker = new EmailWorker(channel, i);
-    await worker.start();
-    workers.push(worker);
-  }
-
-  console.log(`[WorkerPool] Started ${workerCount} email workers`);
-  return workers;
-}
-```
-
----
-
-## 10. Message TTL และ Per-Message TTL
-
-```typescript
-// packages/shared/src/rabbitmq/ttl.example.ts
-
-import { Channel } from 'amqplib';
-
-export async function setupTTLQueues(channel: Channel): Promise<void> {
-  // ─── Queue-level TTL: ทุก message ใน queue มี TTL เดียวกัน ─────────────
-  await channel.assertQueue('session.events', {
-    durable: true,
-    arguments: {
-      'x-message-ttl': 30 * 60 * 1000, // 30 minutes
-      'x-dead-letter-exchange': 'session.dlx',
-    },
-  });
-
-  // ─── Per-Message TTL: แต่ละ message มี TTL ต่างกัน ─────────────────────
-  // ต้องตั้ง x-message-ttl บน queue ก่อน หรือส่ง expiration ใน message
-}
-
-// ส่ง message พร้อม TTL เฉพาะของมันเอง
-export async function publishWithTTL(
-  channel: Channel,
-  queue: string,
-  message: unknown,
-  ttlMs: number
-): Promise<void> {
-  channel.sendToQueue(
-    queue,
-    Buffer.from(JSON.stringify(message)),
-    {
-      persistent: true,
-      expiration: String(ttlMs), // เป็น string!
-      messageId: `msg-${Date.now()}`,
-    }
-  );
-}
-
-// ตัวอย่าง: OTP message หมดอายุใน 5 นาที
-// publishWithTTL(channel, 'otp.requests', { userId, otp }, 5 * 60 * 1000);
-```
-
----
-
-## 11. Request-Reply Pattern ใน RabbitMQ
-
-```typescript
-// packages/shared/src/rabbitmq/rpc.ts
-// RPC over RabbitMQ — synchronous-style request-reply
-
-import { Channel, ConsumeMessage } from 'amqplib';
-
-export class RabbitMQRPC {
-  private pendingRequests: Map<
-    string,
-    { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
-  > = new Map();
-  private replyQueue!: string;
-
-  constructor(private readonly channel: Channel) {}
-
-  async initialize(): Promise<void> {
-    // สร้าง exclusive reply queue
-    const { queue } = await this.channel.assertQueue('', {
+  async setupClient(): Promise<void> {
+    // สร้าง exclusive queue สำหรับ replies
+    const q = await this.client.assertQueue('', {
       exclusive: true,
       autoDelete: true,
     });
-    this.replyQueue = queue;
-
-    // รอ reply messages
-    await this.channel.consume(
+    
+    this.replyQueue = q.queue;
+    
+    // เริ่ม consume replies
+    const channel = this.client.getChannel();
+    await channel.consume(
       this.replyQueue,
       (msg) => {
         if (!msg) return;
-
+        
         const correlationId = msg.properties.correlationId;
         const pending = this.pendingRequests.get(correlationId);
-
+        
         if (pending) {
-          clearTimeout(pending.timer);
+          clearTimeout(pending.timeout);
           this.pendingRequests.delete(correlationId);
-
+          
           try {
             const response = JSON.parse(msg.content.toString());
             if (response.error) {
@@ -1072,280 +715,405 @@ export class RabbitMQRPC {
             } else {
               pending.resolve(response.data);
             }
-          } catch (error) {
-            pending.reject(error as Error);
+          } catch (e) {
+            pending.reject(new Error('Failed to parse RPC response'));
           }
-
-          this.channel.ack(msg);
+          
+          channel.ack(msg);
         }
       },
       { noAck: false }
     );
-
-    console.log(`[RPC] Reply queue: ${this.replyQueue}`);
   }
 
-  async call<TRequest, TResponse>(
-    exchange: string,
-    routingKey: string,
-    request: TRequest,
-    timeoutMs = 30000
-  ): Promise<TResponse> {
-    const correlationId = `rpc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
-    return new Promise<TResponse>((resolve, reject) => {
-      const timer = setTimeout(() => {
+  async call<T>(
+    queue: string,
+    payload: unknown,
+    timeoutMs?: number
+  ): Promise<T> {
+    if (!this.replyQueue) {
+      throw new Error('RPC client not initialized. Call setupClient() first.');
+    }
+    
+    const correlationId = uuidv4();
+    const timeout = timeoutMs || this.timeoutMs;
+    
+    return new Promise((resolve, reject) => {
+      const timeoutHandle = setTimeout(() => {
         this.pendingRequests.delete(correlationId);
-        reject(new Error(`RPC timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-
+        reject(new Error(`RPC call to ${queue} timed out after ${timeout}ms`));
+      }, timeout);
+      
       this.pendingRequests.set(correlationId, {
         resolve: resolve as (value: unknown) => void,
         reject,
-        timer,
+        timeout: timeoutHandle,
       });
-
-      this.channel.publish(
-        exchange,
-        routingKey,
-        Buffer.from(JSON.stringify(request)),
+      
+      const channel = this.client.getChannel();
+      channel.sendToQueue(
+        queue,
+        Buffer.from(JSON.stringify(payload)),
         {
           correlationId,
-          replyTo: this.replyQueue,
-          persistent: false, // RPC requests are usually ephemeral
+          replyTo: this.replyQueue!,
+          persistent: false,  // RPC ไม่ต้องการ persistence
         }
       );
     });
   }
+
+  async setupServer(
+    queue: string,
+    handler: (payload: unknown) => Promise<unknown>
+  ): Promise<void> {
+    await this.client.assertQueue(queue, { durable: true });
+    
+    const channel = this.client.getChannel();
+    await channel.prefetch(1);  // Process one request at a time
+    
+    await channel.consume(queue, async (msg) => {
+      if (!msg) return;
+      
+      try {
+        const payload = JSON.parse(msg.content.toString());
+        const result = await handler(payload);
+        
+        if (msg.properties.replyTo && msg.properties.correlationId) {
+          channel.sendToQueue(
+            msg.properties.replyTo,
+            Buffer.from(JSON.stringify({ data: result })),
+            {
+              correlationId: msg.properties.correlationId,
+            }
+          );
+        }
+        
+        channel.ack(msg);
+      } catch (error) {
+        if (msg.properties.replyTo && msg.properties.correlationId) {
+          channel.sendToQueue(
+            msg.properties.replyTo,
+            Buffer.from(JSON.stringify({ 
+              error: error instanceof Error ? error.message : 'Unknown error' 
+            })),
+            { correlationId: msg.properties.correlationId }
+          );
+        }
+        
+        channel.ack(msg);  // Ack แม้จะ error เพื่อไม่ให้ retry
+      }
+    });
+  }
 }
 
-// RPC Server side
-export async function createRPCServer<TRequest, TResponse>(
-  channel: Channel,
-  queue: string,
-  handler: (request: TRequest) => Promise<TResponse>
-): Promise<void> {
-  await channel.prefetch(1);
-
-  await channel.consume(queue, async (msg) => {
-    if (!msg) return;
-
-    const request = JSON.parse(msg.content.toString()) as TRequest;
-    let response: { data?: TResponse; error?: string };
-
-    try {
-      const data = await handler(request);
-      response = { data };
-    } catch (error) {
-      response = { error: (error as Error).message };
-    }
-
-    if (msg.properties.replyTo) {
-      channel.sendToQueue(
-        msg.properties.replyTo,
-        Buffer.from(JSON.stringify(response)),
-        { correlationId: msg.properties.correlationId }
-      );
-    }
-
-    channel.ack(msg);
+// Example การใช้งาน RPC
+async function rpcExample() {
+  const client = new RabbitMQClient({ url: 'amqp://localhost' });
+  await client.connect();
+  
+  const rpc = new RpcPattern(client);
+  
+  // Server side
+  await rpc.setupServer('user.getById', async (payload: unknown) => {
+    const { userId } = payload as { userId: string };
+    // ดึงข้อมูล user จาก database
+    return { id: userId, name: 'John Doe', email: 'john@example.com' };
   });
+  
+  // Client side
+  await rpc.setupClient();
+  
+  const user = await rpc.call<{ id: string; name: string; email: string }>(
+    'user.getById',
+    { userId: '123' },
+    5000  // timeout 5 seconds
+  );
+  
+  console.log('User:', user);
 }
 ```
 
 ---
 
-## 12. Full Setup Example
+## 7. Publisher Confirms และ Consumer Acknowledgements
 
 ```typescript
-// packages/order-service/src/messaging.setup.ts
+// src/messaging/reliable-publisher.ts
+export class ReliablePublisher {
+  private unconfirmedMessages = new Map<number, {
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }>();
+  
+  private deliveryTag = 0;
 
-import { RabbitMQConnectionManager } from '@shared/rabbitmq/connection.manager';
-import { setupExchanges, setupQueues } from '@shared/rabbitmq/exchanges.setup';
-import { RabbitMQPublisher } from '@shared/rabbitmq/publisher';
-import { RabbitMQConsumer } from '@shared/rabbitmq/consumer';
-import { DeadLetterHandler } from '@shared/rabbitmq/dlq.handler';
-import { startEmailWorkerPool } from './work.queue';
+  constructor(
+    private readonly client: RabbitMQClient,
+    private readonly confirmTimeoutMs = 5000
+  ) {}
 
-export async function setupMessaging() {
-  const connectionManager = new RabbitMQConnectionManager({
-    url: process.env.RABBITMQ_URL ?? 'amqp://admin:admin123@rabbitmq:5672/microservices',
-    heartbeat: 60,
-    reconnectDelay: 5000,
-    maxReconnectAttempts: -1, // infinite
-  });
+  async publishWithConfirm(opts: {
+    exchange: string;
+    routingKey: string;
+    content: unknown;
+  }): Promise<void> {
+    return this.client.publish({
+      exchange: opts.exchange,
+      routingKey: opts.routingKey,
+      content: opts.content,
+      options: {
+        persistent: true,
+        mandatory: true,  // Return ถ้า route ไม่ได้
+      },
+    }).then(() => void 0);
+  }
 
-  const connection = await connectionManager.connect();
-
-  // Setup channel สำหรับ setup (ไม่ใช้ consume)
-  const setupChannel = await connectionManager.createChannel();
-  await setupExchanges(setupChannel);
-  await setupQueues(setupChannel);
-  await setupChannel.close();
-
-  // Publisher channel (confirm channel)
-  const publishChannel = await connectionManager.createConfirmChannel();
-  const publisher = new RabbitMQPublisher(() =>
-    Promise.resolve(publishChannel)
-  );
-  await publisher.initialize();
-
-  // Consumer channel
-  const consumeChannel = await connectionManager.createChannel();
-  const consumer = new RabbitMQConsumer(consumeChannel);
-
-  // Start consuming order events
-  await consumer.consume<OrderCreatedEvent>(
-    'order.processing',
-    async (event, metadata) => {
-      console.log(`Processing order: ${event.orderId}`, {
-        messageId: metadata.messageId,
-        retryCount: metadata.retryCount,
-      });
-
-      // Process order...
-      await processOrder(event);
-    },
-    {
-      prefetchCount: 10,
-      maxRetries: 3,
-    }
-  );
-
-  // DLQ monitoring
-  const dlqChannel = await connectionManager.createChannel();
-  const dlqHandler = new DeadLetterHandler(dlqChannel, createDLQStorage());
-  await dlqHandler.startProcessing('order.processing.dlq');
-
-  // Email workers (work queue pattern)
-  const emailChannel = await connectionManager.createChannel();
-  await startEmailWorkerPool(emailChannel, 3);
-
-  console.log('[Messaging] All messaging components started');
-
-  return { publisher, consumer, connectionManager };
-}
-
-interface OrderCreatedEvent {
-  orderId: string;
-  userId: string;
-  items: Array<{ productId: string; quantity: number }>;
-  totalAmount: number;
-}
-
-async function processOrder(event: OrderCreatedEvent): Promise<void> {
-  // Business logic here
-  console.log(`Processing order: ${event.orderId}`);
-}
-
-function createDLQStorage() {
-  // Simple in-memory storage (use database in production)
-  const storage = new Map<string, unknown>();
-  return {
-    async save(msg: unknown) {
-      const m = msg as { messageId: string };
-      storage.set(m.messageId, msg);
-    },
-    async findById(id: string) {
-      return storage.get(id) ?? null;
-    },
-    async markRetried(id: string) {
-      const msg = storage.get(id) as Record<string, unknown> | undefined;
-      if (msg) {
-        storage.set(id, { ...msg, retried: true, retriedAt: new Date() });
-      }
-    },
-  };
+  async publishBatch(messages: Array<{
+    exchange: string;
+    routingKey: string;
+    content: unknown;
+  }>): Promise<void> {
+    // ส่ง messages พร้อมกัน
+    const promises = messages.map(msg => this.publishWithConfirm(msg));
+    await Promise.all(promises);
+  }
 }
 ```
 
 ---
 
-## 13. Docker Compose ครบสมบูรณ์
+## 8. Competing Consumers Pattern
+
+```typescript
+// src/messaging/patterns/competing-consumers.ts
+export class CompetingConsumersPattern {
+  constructor(
+    private readonly client: RabbitMQClient,
+    private readonly consumerCount: number = 5
+  ) {}
+
+  async setup(queueName: string): Promise<void> {
+    // สร้าง queue เพียงอันเดียว
+    await this.client.assertQueue(queueName, { durable: true });
+    
+    // ตั้งค่า prefetch เพื่อกระจาย load อย่างเป็นธรรม
+    const channel = this.client.getChannel();
+    await channel.prefetch(1);
+  }
+
+  async startConsumers(
+    queueName: string,
+    handler: (message: unknown) => Promise<void>
+  ): Promise<void> {
+    const consumers: Promise<void>[] = [];
+    
+    for (let i = 0; i < this.consumerCount; i++) {
+      consumers.push(
+        this.client.consume({
+          queue: queueName,
+          handler: async (msg) => {
+            const content = JSON.parse(msg.content.toString());
+            console.log(`Consumer ${i + 1} processing message`);
+            await handler(content);
+          },
+        })
+      );
+    }
+    
+    await Promise.all(consumers);
+  }
+}
+```
+
+---
+
+## 9. Message TTL และ Queue Expiry
+
+```typescript
+// src/messaging/patterns/ttl-expiry.ts
+export class TTLAndExpiryPattern {
+  constructor(private readonly client: RabbitMQClient) {}
+
+  async createTemporaryQueue(
+    name: string,
+    ttlSeconds: number
+  ): Promise<void> {
+    await this.client.assertQueue(name, {
+      durable: false,
+      arguments: {
+        // Queue หมดอายุหลังจากไม่มีคนใช้นาน 30 วินาที
+        'x-expires': ttlSeconds * 1000,
+        // Message หมดอายุหลัง 5 นาที
+        'x-message-ttl': 300000,
+      },
+    });
+  }
+
+  async publishWithTTL(
+    exchange: string,
+    routingKey: string,
+    content: unknown,
+    ttlMs: number
+  ): Promise<void> {
+    await this.client.publish({
+      exchange,
+      routingKey,
+      content,
+      options: {
+        expiration: ttlMs.toString(),  // Per-message TTL
+      },
+    });
+  }
+
+  async createSessionQueue(sessionId: string): Promise<void> {
+    const queueName = `session.${sessionId}`;
+    
+    await this.client.assertQueue(queueName, {
+      durable: false,
+      exclusive: false,
+      autoDelete: false,
+      arguments: {
+        'x-expires': 3600000,  // Queue หมดอายุหลัง 1 ชั่วโมง
+        'x-message-ttl': 1800000,  // Message หมดอายุหลัง 30 นาที
+      },
+    });
+  }
+}
+```
+
+---
+
+## 10. Kubernetes Deployment สำหรับ RabbitMQ Cluster
 
 ```yaml
-# docker-compose.full-messaging.yml
-version: '3.8'
-
-services:
+# rabbitmq-cluster.yaml
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rabbitmq-production
+  namespace: messaging
+spec:
+  replicas: 3
+  image: rabbitmq:3.12-management
+  
+  service:
+    type: ClusterIP
+    
+  persistence:
+    storageClassName: standard
+    storage: 20Gi
+    
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+      
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    hostname: rabbitmq-1
-    environment:
-      RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: admin123
-      RABBITMQ_DEFAULT_VHOST: microservices
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-      - "15692:15692"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+    additionalConfig: |
+      cluster_formation.peer_discovery_backend = rabbit_peer_discovery_k8s
+      cluster_formation.k8s.host = kubernetes.default.svc.cluster.local
+      cluster_formation.k8s.address_type = hostname
+      vm_memory_high_watermark_paging_ratio = 0.5
+      vm_memory_high_watermark.relative = 0.6
+      disk_free_limit.relative = 1.0
+      collect_statistics_interval = 10000
+      
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: rabbitmq-production
+          topologyKey: kubernetes.io/hostname
+          
+  override:
+    statefulSet:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: rabbitmq
+                env:
+                  - name: RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS
+                    value: "-rabbit consumer_timeout 36000000"
+```
 
-  order-service:
-    build: ./packages/order-service
-    environment:
-      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/microservices
-      DB_HOST: postgres
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    deploy:
-      replicas: 2
+---
 
-  notification-service:
-    build: ./packages/notification-service
-    environment:
-      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/microservices
-      SMTP_HOST: mailhog
-      SMTP_PORT: 1025
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    deploy:
-      replicas: 3  # Competing consumers
+## 11. Prometheus Monitoring
 
-  # Dev SMTP
-  mailhog:
-    image: mailhog/mailhog:latest
-    ports:
-      - "1025:1025"
-      - "8025:8025"
-
-volumes:
-  rabbitmq_data:
+```yaml
+# prometheus-rabbitmq-config.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rabbitmq-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: rabbitmq
+  endpoints:
+    - port: prometheus
+      interval: 15s
+      path: /metrics
+---
+# prometheus-rules-rabbitmq.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rabbitmq-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: rabbitmq
+      interval: 30s
+      rules:
+        - alert: RabbitMQHighQueueMessages
+          expr: rabbitmq_queue_messages > 10000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RabbitMQ queue has too many messages"
+            description: "Queue {{ $labels.queue }} has {{ $value }} messages"
+            
+        - alert: RabbitMQConsumerCountLow
+          expr: rabbitmq_queue_consumers == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "RabbitMQ queue has no consumers"
+            description: "Queue {{ $labels.queue }} has no active consumers"
+            
+        - alert: RabbitMQConnectionsHigh
+          expr: rabbitmq_connections > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RabbitMQ has too many connections"
 ```
 
 ---
 
 ## สรุป
 
-ในบทนี้เราได้เรียนรู้:
-
-1. **Exchange Types** — Direct (exact match), Topic (wildcard), Fanout (broadcast), Headers (attribute-based routing)
-
-2. **Dead Letter Queues** — Route failed messages ไปยัง DLQ เพื่อ inspection และ retry manual
-
-3. **Message TTL** — Queue-level TTL และ Per-message TTL สำหรับ time-sensitive messages
-
-4. **Priority Queues** — Queue ที่ process high-priority messages ก่อน (ใช้กับ VIP customers)
-
-5. **Publisher Confirms** — ยืนยันว่า Broker รับ message แล้วก่อน return success
-
-6. **Consumer Prefetch** — Control flow ด้วย prefetch count เพื่อป้องกัน consumer รับงานมากเกินไป
-
-7. **Work Queue Pattern** — Competing consumers สำหรับ parallel processing
-
-8. **RPC over RabbitMQ** — Request-reply pattern ด้วย correlation ID และ reply queue
-
-**Best Practice:** ตั้งค่า DLQ ทุก queue, ใช้ Publisher Confirms ใน production, และ monitor queue depth อย่างต่อเนื่อง
+| Pattern | ประโยชน์ | Use Case |
+|---------|---------|---------|
+| Direct Exchange | Routing ตาม key ที่แน่นอน | Order processing, routing by type |
+| Fanout Exchange | Broadcast ไปทุก subscriber | Notifications, cache invalidation |
+| Topic Exchange | Pattern matching routing | Event routing แบบ flexible |
+| Headers Exchange | Route ตาม message headers | Complex routing rules |
+| Dead Letter Queue | จัดการ failed messages | Error handling, auditing |
+| Priority Queue | จัดลำดับความสำคัญ | Urgent vs normal requests |
+| RPC Pattern | Request-Reply แบบ async | Cross-service communication |
+| Publisher Confirms | Guaranteed delivery | Critical messages |
+| Competing Consumers | Load balancing | High throughput processing |
+| Message TTL | Auto-expire messages | Session data, real-time events |
