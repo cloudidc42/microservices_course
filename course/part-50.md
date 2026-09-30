@@ -1,4 +1,4 @@
-# Part 50: Microservices Testing ขั้นสูง — TestContainers, Contract Testing, Performance, และ Chaos Engineering
+# Part 50: Configuration Management and Secrets
 
 การจัดการ Configuration และ Secrets เป็นหัวใจสำคัญของ Microservices ที่ทำงานใน Production
 ระบบที่ดีต้องสามารถแยก Configuration ออกจาก Code ได้อย่างสมบูรณ์ และจัดการ Secrets

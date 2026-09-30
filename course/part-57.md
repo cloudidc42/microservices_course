@@ -1,4 +1,4 @@
-# Part 57: Async Communication Patterns — Request-Reply, Outbox Pattern, Inbox Pattern, และ Message Schema Versioning
+# Part 57: Asynchronous Patterns and Event-Driven Architecture
 
 ในบทนี้เราจะเรียนรู้ Async Communication Patterns ขั้นสูงสำหรับ Microservices ครอบคลุม Request-Reply over RabbitMQ, Correlation ID Tracking, Message Ordering, Idempotent Consumer, At-least-once Delivery, Outbox Pattern, Inbox Pattern, และ Message Schema Versioning
 

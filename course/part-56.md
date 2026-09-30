@@ -1,4 +1,4 @@
-# Part 56: RabbitMQ Message Patterns — Dead Letter Queues, Exchange Types, Priority Queues, และ Connection Recovery
+# Part 56: RabbitMQ and Message Broker Patterns
 
 ในบทนี้เราจะเรียนรู้ RabbitMQ Message Patterns ขั้นสูงอย่างละเอียด ครอบคลุม Dead Letter Queues, Exchange types ทั้งหมด, Priority Queues, Consumer Acknowledgment, Publisher Confirms, และ Connection Recovery
 
