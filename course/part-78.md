@@ -1,1306 +1,2714 @@
-# Part 78: Microservices Scalability Patterns
+# Part 78: Service Mesh Advanced
 
 ## บทนำ
 
-Scalability เป็นความสามารถของระบบในการรองรับ load ที่เพิ่มขึ้น บทนี้จะครอบคลุม Horizontal vs Vertical Scaling, Stateless Service Design, Session Management ใน Distributed Systems, Read/Write Splitting, Database Federation, Message Queue Scaling และ Auto-scaling Strategies
+Service Mesh เป็นโครงสร้างพื้นฐานสำหรับการสื่อสารระหว่าง microservices ที่ให้ฟีเจอร์ต่างๆ เช่น mutual TLS, traffic management, observability และ policy enforcement โดยไม่ต้องแก้ไข application code
+
+ในบทนี้เราจะเรียนรู้เกี่ยวกับ Service Mesh ขั้นสูง ครอบคลุม Istio, Linkerd, Consul Connect การตั้งค่า multi-cluster และการ debug
 
 ---
 
-## 1. Horizontal vs Vertical Scaling
+## 78.1 การเปรียบเทียบ Istio vs Linkerd vs Consul Connect
 
-### 1.1 Horizontal Scaling Design Principles
+### ตารางเปรียบเทียบฟีเจอร์
 
-```typescript
-// src/patterns/scalability/stateless-service.ts
-import { createClient } from 'redis';
-import { Pool } from 'pg';
+| ฟีเจอร์ | Istio | Linkerd | Consul Connect |
+|---------|-------|---------|----------------|
+| **Data Plane** | Envoy Proxy | linkerd2-proxy (Rust) | Envoy Proxy |
+| **Control Plane** | istiod | linkerd-controller | Consul Server |
+| **mTLS** | ✅ Auto | ✅ Auto | ✅ Auto |
+| **Traffic Management** | ✅ Full | ✅ Basic | ✅ Medium |
+| **Circuit Breaker** | ✅ Envoy-native | ✅ Built-in | ✅ Envoy-native |
+| **Retry Logic** | ✅ Advanced | ✅ Basic | ✅ Advanced |
+| **Observability** | ✅ Full (Prometheus, Grafana, Jaeger) | ✅ Built-in Dashboard | ✅ Prometheus |
+| **Multi-cluster** | ✅ Primary-Remote | ✅ Multi-cluster | ✅ WAN Federation |
+| **VM Support** | ✅ WorkloadEntry | ❌ Limited | ✅ Full |
+| **WebAssembly** | ✅ Envoy WASM | ❌ | ✅ Envoy WASM |
+| **Memory Usage** | ~200-500MB control plane | ~50MB/pod | ~100-200MB |
+| **CPU Overhead** | 5-10% | 2-4% | 4-8% |
+| **Latency Added** | ~1-3ms | ~0.5-1ms | ~1-2ms |
+| **Complexity** | High | Low-Medium | Medium |
+| **Learning Curve** | Steep | Gentle | Medium |
+| **Community** | Large (CNCF Graduated) | Large (CNCF Graduated) | Large (HashiCorp) |
+| **License** | Apache 2.0 | Apache 2.0 | MPL 2.0 / BSL |
 
-// ✅ Stateless service design - ไม่เก็บ state ใน memory
-export class ProductService {
-  constructor(
-    private db: Pool,
-    private cache: ReturnType<typeof createClient>,
-    private eventBus: EventBus
-  ) {}
+### ตารางเปรียบเทียบ Performance
 
-  // ✅ Each request is independent - ไม่ depend on previous requests
-  async getProduct(id: string, requestContext: RequestContext): Promise<Product> {
-    const cacheKey = `product:${id}:${requestContext.language}`;
-    
-    // Try distributed cache (accessible from all instances)
-    const cached = await this.cache.get(cacheKey);
-    if (cached) {
-      return JSON.parse(cached);
-    }
+| Metric | Istio (Envoy) | Linkerd (Rust Proxy) | Direct (No Mesh) |
+|--------|---------------|---------------------|-----------------|
+| P50 Latency | 1.2ms | 0.6ms | 0.3ms |
+| P99 Latency | 8ms | 2ms | 1ms |
+| Throughput | -8% | -3% | 0% |
+| Memory per pod | ~60MB | ~20MB | 0MB |
+| CPU per pod | ~0.05 core | ~0.02 core | 0 core |
 
-    const { rows } = await this.db.query(
-      `SELECT p.*, 
-        t.title as translated_title,
-        t.description as translated_description
-       FROM products p
-       LEFT JOIN product_translations t ON t.product_id = p.id AND t.language = $2
-       WHERE p.id = $1`,
-      [id, requestContext.language]
-    );
+### เมื่อไหรควรเลือกอะไร
 
-    if (rows.length === 0) {
-      throw new NotFoundError(`Product ${id} not found`);
-    }
+- **Istio**: ต้องการฟีเจอร์ครบถ้วน, enterprise, traffic management ซับซ้อน
+- **Linkerd**: ต้องการ simplicity, performance, ทีมเล็ก
+- **Consul Connect**: ใช้ HashiCorp stack อยู่แล้ว, hybrid cloud, VM support
 
-    const product = this.mapProduct(rows[0]);
-    
-    // Store in distributed cache (TTL = 5 minutes)
-    await this.cache.setEx(cacheKey, 300, JSON.stringify(product));
-    
-    return product;
-  }
+---
 
-  // ✅ Idempotent operations - safe to retry
-  async updateInventory(
-    productId: string,
-    delta: number,
-    idempotencyKey: string
-  ): Promise<InventoryResult> {
-    // Check if operation already processed
-    const existingResult = await this.cache.get(`idempotency:${idempotencyKey}`);
-    if (existingResult) {
-      return JSON.parse(existingResult);
-    }
+## 78.2 Linkerd Installation และ TypeScript Health Check Client
 
-    const client = await this.db.connect();
-    try {
-      await client.query('BEGIN');
+### ติดตั้ง Linkerd
 
-      const { rows } = await client.query(
-        `UPDATE products 
-         SET stock_quantity = stock_quantity + $1,
-             updated_at = NOW()
-         WHERE id = $2 AND (stock_quantity + $1) >= 0
-         RETURNING id, stock_quantity`,
-        [delta, productId]
-      );
+```bash
+# Install Linkerd CLI
+curl --proto '=https' --tlsv1.2 -sSfL https://run.linkerd.io/install | sh
+export PATH=$HOME/.linkerd2/bin:$PATH
 
-      if (rows.length === 0) {
-        await client.query('ROLLBACK');
-        throw new InsufficientStockError(`Insufficient stock for product ${productId}`);
-      }
+# Verify installation
+linkerd version
 
-      await client.query('COMMIT');
+# Pre-flight checks
+linkerd check --pre
 
-      const result: InventoryResult = {
-        productId,
-        newQuantity: rows[0].stock_quantity,
-        delta,
-        timestamp: new Date(),
-      };
+# Install Linkerd CRDs
+linkerd install --crds | kubectl apply -f -
 
-      // Store result for idempotency (24 hours)
-      await this.cache.setEx(`idempotency:${idempotencyKey}`, 86400, JSON.stringify(result));
+# Install Linkerd control plane
+linkerd install | kubectl apply -f -
 
-      await this.eventBus.publish('inventory.updated', result);
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
+# Wait for installation
+linkerd check
 
-  private mapProduct(row: any): Product {
-    return {
-      id: row.id,
-      title: row.translated_title || row.title,
-      description: row.translated_description || row.description,
-      price: parseFloat(row.price),
-      stockQuantity: row.stock_quantity,
-      category: row.category_id,
-      updatedAt: row.updated_at,
-    };
-  }
-}
+# Install Linkerd viz extension (observability)
+linkerd viz install | kubectl apply -f -
+linkerd viz check
+
+# Install Linkerd multicluster extension
+linkerd multicluster install | kubectl apply -f -
 ```
 
----
+### Annotate Namespace สำหรับ Linkerd Injection
 
-## 2. Session Management ใน Distributed Systems
+```yaml
+# namespace-injection.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  annotations:
+    linkerd.io/inject: enabled
+    config.linkerd.io/proxy-cpu-request: "100m"
+    config.linkerd.io/proxy-memory-request: "20Mi"
+    config.linkerd.io/proxy-cpu-limit: "1000m"
+    config.linkerd.io/proxy-memory-limit: "250Mi"
+```
 
-### 2.1 Distributed Session Store
+### TypeScript Health Check Client สำหรับ Linkerd
 
 ```typescript
-// src/session/distributed-session.ts
-import { Redis } from 'ioredis';
-import { createHash, randomBytes } from 'crypto';
-import { Request, Response, NextFunction } from 'express';
+// linkerd-health-client.ts
+import * as http from 'http';
+import * as https from 'https';
 
-interface SessionData {
-  userId: string;
-  roles: string[];
-  permissions: string[];
-  createdAt: number;
-  lastAccessedAt: number;
-  expiresAt: number;
-  metadata: Record<string, any>;
-  csrfToken: string;
+interface ServiceHealth {
+  serviceName: string;
+  namespace: string;
+  healthy: boolean;
+  successRate: number;
+  p99Latency: number;
+  rps: number;
+  lastChecked: Date;
+  meshEnabled: boolean;
+  mtlsEnabled: boolean;
 }
 
-interface SessionConfig {
-  ttlSeconds: number;
-  renewalThresholdSeconds: number;
-  maxSessionsPerUser: number;
-  cookieName: string;
-  cookieSecure: boolean;
-  cookieSameSite: 'strict' | 'lax' | 'none';
+interface LinkerdMetrics {
+  successRate: number;
+  requestsPerSecond: number;
+  p50LatencyMs: number;
+  p95LatencyMs: number;
+  p99LatencyMs: number;
+  tcpConnections: number;
 }
 
-export class DistributedSessionStore {
-  private readonly PREFIX = 'session:';
-  private readonly USER_SESSIONS_PREFIX = 'user:sessions:';
-
-  constructor(
-    private redis: Redis,
-    private config: SessionConfig
-  ) {}
-
-  async create(userId: string, roles: string[], metadata: Record<string, any> = {}): Promise<string> {
-    // Enforce max sessions per user
-    await this.enforceSessionLimit(userId);
-
-    const sessionId = this.generateSessionId();
-    const now = Date.now();
-    const csrfToken = randomBytes(32).toString('hex');
-
-    const session: SessionData = {
-      userId,
-      roles,
-      permissions: this.expandPermissions(roles),
-      createdAt: now,
-      lastAccessedAt: now,
-      expiresAt: now + this.config.ttlSeconds * 1000,
-      metadata,
-      csrfToken,
-    };
-
-    const pipeline = this.redis.pipeline();
-    pipeline.set(
-      `${this.PREFIX}${sessionId}`,
-      JSON.stringify(session),
-      'EX',
-      this.config.ttlSeconds
-    );
-    pipeline.sadd(`${this.USER_SESSIONS_PREFIX}${userId}`, sessionId);
-    pipeline.expire(`${this.USER_SESSIONS_PREFIX}${userId}`, this.config.ttlSeconds * 2);
-    await pipeline.exec();
-
-    return sessionId;
-  }
-
-  async get(sessionId: string): Promise<SessionData | null> {
-    const data = await this.redis.get(`${this.PREFIX}${sessionId}`);
-    if (!data) return null;
-
-    const session: SessionData = JSON.parse(data);
-    const now = Date.now();
-
-    // Check expiry
-    if (session.expiresAt < now) {
-      await this.destroy(sessionId);
-      return null;
-    }
-
-    // Auto-renew if close to expiry
-    const timeToExpiry = session.expiresAt - now;
-    if (timeToExpiry < this.config.renewalThresholdSeconds * 1000) {
-      session.lastAccessedAt = now;
-      session.expiresAt = now + this.config.ttlSeconds * 1000;
-      await this.redis.set(
-        `${this.PREFIX}${sessionId}`,
-        JSON.stringify(session),
-        'EX',
-        this.config.ttlSeconds
-      );
-    }
-
-    return session;
-  }
-
-  async update(sessionId: string, updates: Partial<SessionData>): Promise<void> {
-    const session = await this.get(sessionId);
-    if (!session) throw new Error('Session not found');
-
-    const updated = { ...session, ...updates, lastAccessedAt: Date.now() };
-    const ttl = await this.redis.ttl(`${this.PREFIX}${sessionId}`);
-
-    await this.redis.set(
-      `${this.PREFIX}${sessionId}`,
-      JSON.stringify(updated),
-      'EX',
-      ttl > 0 ? ttl : this.config.ttlSeconds
-    );
-  }
-
-  async destroy(sessionId: string): Promise<void> {
-    const session = await this.get(sessionId);
-    
-    const pipeline = this.redis.pipeline();
-    pipeline.del(`${this.PREFIX}${sessionId}`);
-    if (session) {
-      pipeline.srem(`${this.USER_SESSIONS_PREFIX}${session.userId}`, sessionId);
-    }
-    await pipeline.exec();
-  }
-
-  async destroyAllUserSessions(userId: string): Promise<number> {
-    const sessionIds = await this.redis.smembers(`${this.USER_SESSIONS_PREFIX}${userId}`);
-    
-    const pipeline = this.redis.pipeline();
-    for (const id of sessionIds) {
-      pipeline.del(`${this.PREFIX}${id}`);
-    }
-    pipeline.del(`${this.USER_SESSIONS_PREFIX}${userId}`);
-    await pipeline.exec();
-
-    return sessionIds.length;
-  }
-
-  private async enforceSessionLimit(userId: string): Promise<void> {
-    const sessions = await this.redis.smembers(`${this.USER_SESSIONS_PREFIX}${userId}`);
-    
-    if (sessions.length >= this.config.maxSessionsPerUser) {
-      // Get all sessions and remove oldest
-      const sessionData = await Promise.all(
-        sessions.map(async (id) => {
-          const data = await this.redis.get(`${this.PREFIX}${id}`);
-          return { id, data: data ? JSON.parse(data) : null };
-        })
-      );
-
-      const valid = sessionData.filter((s) => s.data !== null);
-      valid.sort((a, b) => a.data.lastAccessedAt - b.data.lastAccessedAt);
-
-      // Remove oldest sessions
-      const toRemove = valid.slice(0, valid.length - this.config.maxSessionsPerUser + 1);
-      for (const session of toRemove) {
-        await this.destroy(session.id);
-      }
-    }
-  }
-
-  private generateSessionId(): string {
-    return randomBytes(32).toString('base64url');
-  }
-
-  private expandPermissions(roles: string[]): string[] {
-    const rolePermissions: Record<string, string[]> = {
-      admin: ['*'],
-      user: ['products:read', 'orders:read', 'orders:write', 'profile:read', 'profile:write'],
-      premium: ['products:read', 'orders:read', 'orders:write', 'profile:read', 'profile:write', 'analytics:read'],
-    };
-
-    const permissions = new Set<string>();
-    for (const role of roles) {
-      const perms = rolePermissions[role] || [];
-      perms.forEach((p) => permissions.add(p));
-    }
-    return Array.from(permissions);
-  }
-}
-
-// Session Middleware
-export function sessionMiddleware(store: DistributedSessionStore, config: SessionConfig) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const sessionId = req.cookies?.[config.cookieName] ||
-                      req.headers['x-session-id'] as string;
-
-    if (!sessionId) return next();
-
-    const session = await store.get(sessionId);
-    if (!session) {
-      res.clearCookie(config.cookieName);
-      return next();
-    }
-
-    (req as any).session = session;
-    (req as any).sessionId = sessionId;
-    (req as any).user = {
-      id: session.userId,
-      roles: session.roles,
-      permissions: session.permissions,
-    };
-
-    next();
+interface PrometheusQueryResult {
+  status: string;
+  data: {
+    resultType: string;
+    result: Array<{
+      metric: Record<string, string>;
+      value: [number, string];
+    }>;
   };
 }
-```
 
----
-
-## 3. Read/Write Splitting
-
-### 3.1 Database Read/Write Splitter
-
-```typescript
-// src/database/read-write-splitter.ts
-import { Pool, PoolClient } from 'pg';
-import { EventEmitter } from 'events';
-
-interface ReplicaConfig {
-  id: string;
-  host: string;
-  port: number;
-  database: string;
-  user: string;
-  password: string;
-  weight: number;  // Load balancing weight
-  maxConnections: number;
-  readOnly: boolean;
-}
-
-interface SplitterConfig {
-  primary: Omit<ReplicaConfig, 'readOnly' | 'weight'>;
-  replicas: ReplicaConfig[];
-  replicaLagThresholdMs: number;
-  healthCheckIntervalMs: number;
-}
-
-export class ReadWriteSplitter extends EventEmitter {
-  private primaryPool: Pool;
-  private replicaPools: Map<string, { pool: Pool; config: ReplicaConfig; healthy: boolean }> = new Map();
-  private replicaLag: Map<string, number> = new Map();
-  private roundRobinIndex = 0;
-
-  constructor(private config: SplitterConfig) {
-    super();
-    this.primaryPool = this.createPool(config.primary, false);
-    
-    for (const replica of config.replicas) {
-      const pool = this.createPool(replica, true);
-      this.replicaPools.set(replica.id, { pool, config: replica, healthy: true });
-    }
-
-    this.startHealthChecks();
-  }
-
-  // Write operations — always go to primary
-  async write<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.primaryPool.connect();
-    try {
-      const result = await fn(client);
-      return result;
-    } finally {
-      client.release();
-    }
-  }
-
-  // Read operations — route to healthy replica
-  async read<T>(fn: (client: PoolClient) => Promise<T>, options: ReadOptions = {}): Promise<T> {
-    if (options.consistencyRequired) {
-      // Strong consistency: read from primary
-      return this.write(fn);
-    }
-
-    const replica = this.selectReplica(options.preferredRegion);
-    if (!replica) {
-      // Fallback to primary if no healthy replica
-      return this.write(fn);
-    }
-
-    const client = await replica.pool.connect();
-    try {
-      return await fn(client);
-    } catch (error) {
-      // On error, fallback to primary
-      client.release();
-      this.emit('replica:error', { replicaId: replica.config.id, error });
-      return this.write(fn);
-    } finally {
-      try { client.release(); } catch {}
-    }
-  }
-
-  // Transaction — always use primary
-  async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.primaryPool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await fn(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  private selectReplica(preferredRegion?: string): { pool: Pool; config: ReplicaConfig } | null {
-    const healthyReplicas = Array.from(this.replicaPools.values()).filter((r) => {
-      if (!r.healthy) return false;
-      const lag = this.replicaLag.get(r.config.id) || 0;
-      return lag < this.config.replicaLagThresholdMs;
-    });
-
-    if (healthyReplicas.length === 0) return null;
-
-    // Prefer specific region if requested
-    if (preferredRegion) {
-      const regionReplica = healthyReplicas.find(
-        (r) => r.config.id.includes(preferredRegion)
-      );
-      if (regionReplica) return regionReplica;
-    }
-
-    // Weighted round-robin selection
-    const totalWeight = healthyReplicas.reduce((sum, r) => sum + r.config.weight, 0);
-    let random = Math.random() * totalWeight;
-
-    for (const replica of healthyReplicas) {
-      random -= replica.config.weight;
-      if (random <= 0) return replica;
-    }
-
-    return healthyReplicas[this.roundRobinIndex++ % healthyReplicas.length];
-  }
-
-  private async startHealthChecks(): Promise<void> {
-    setInterval(async () => {
-      for (const [id, replica] of this.replicaPools) {
-        try {
-          const start = Date.now();
-          const client = await replica.pool.connect();
-          
-          try {
-            // Check replica lag
-            const { rows } = await client.query(
-              `SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000 AS lag_ms`
-            );
-            const lagMs = parseFloat(rows[0]?.lag_ms || '0');
-            this.replicaLag.set(id, lagMs);
-
-            if (!replica.healthy) {
-              replica.healthy = true;
-              this.emit('replica:recovered', { replicaId: id });
-            }
-          } finally {
-            client.release();
-          }
-        } catch (error) {
-          if (replica.healthy) {
-            replica.healthy = false;
-            this.emit('replica:unhealthy', { replicaId: id, error });
-          }
-        }
-      }
-    }, this.config.healthCheckIntervalMs);
-  }
-
-  private createPool(config: any, readOnly: boolean): Pool {
-    return new Pool({
-      host: config.host,
-      port: config.port || 5432,
-      database: config.database,
-      user: config.user,
-      password: config.password,
-      max: config.maxConnections || 20,
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 5000,
-    });
-  }
-}
-
-interface ReadOptions {
-  consistencyRequired?: boolean;
-  preferredRegion?: string;
-}
-```
-
----
-
-## 4. Database Federation
-
-### 4.1 Database Sharding Strategy
-
-```typescript
-// src/database/sharding/shard-manager.ts
-import { Pool } from 'pg';
-import { createHash } from 'crypto';
-
-interface ShardConfig {
-  id: string;
-  host: string;
-  port: number;
-  database: string;
-  user: string;
-  password: string;
-  rangeStart?: number;
-  rangeEnd?: number;
-  hashMod?: number;
-  region?: string;
-}
-
-type ShardStrategy = 'hash' | 'range' | 'geographic' | 'consistent-hash';
-
-export class ShardManager {
-  private shards: Map<string, Pool> = new Map();
-  private consistentHashRing: ConsistentHashRing;
+class LinkerdHealthClient {
+  private prometheusUrl: string;
+  private linkerdVizUrl: string;
+  private healthThresholds = {
+    minSuccessRate: 0.99,
+    maxP99LatencyMs: 1000,
+    minRps: 0,
+  };
 
   constructor(
-    private shardConfigs: ShardConfig[],
-    private strategy: ShardStrategy = 'consistent-hash'
+    prometheusUrl: string = 'http://prometheus.linkerd-viz.svc.cluster.local:9090',
+    linkerdVizUrl: string = 'http://web.linkerd-viz.svc.cluster.local:8084'
   ) {
-    for (const config of shardConfigs) {
-      this.shards.set(config.id, new Pool({
-        host: config.host,
-        port: config.port,
-        database: config.database,
-        user: config.user,
-        password: config.password,
-        max: 20,
-      }));
-    }
+    this.prometheusUrl = prometheusUrl;
+    this.linkerdVizUrl = linkerdVizUrl;
+  }
 
-    if (strategy === 'consistent-hash') {
-      this.consistentHashRing = new ConsistentHashRing(
-        shardConfigs.map((c) => c.id),
-        150 // virtual nodes per shard
+  private async queryPrometheus(query: string): Promise<PrometheusQueryResult> {
+    const url = new URL(`${this.prometheusUrl}/api/v1/query`);
+    url.searchParams.set('query', query);
+
+    return new Promise((resolve, reject) => {
+      const client = url.protocol === 'https:' ? https : http;
+      
+      const req = client.get(url.toString(), (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (err) {
+            reject(new Error(`Failed to parse Prometheus response: ${err}`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(10000, () => {
+        req.destroy();
+        reject(new Error('Prometheus query timeout'));
+      });
+    });
+  }
+
+  async getServiceMetrics(
+    serviceName: string,
+    namespace: string,
+    windowSeconds: number = 60
+  ): Promise<LinkerdMetrics> {
+    const window = `${windowSeconds}s`;
+    const labelSelector = `service="${serviceName}",namespace="${namespace}"`;
+
+    const [successRateResult, rpsResult, p99Result, p50Result, p95Result] = await Promise.all([
+      // Success rate query
+      this.queryPrometheus(
+        `sum(rate(response_total{${labelSelector},classification="success"}[${window}])) / ` +
+        `sum(rate(response_total{${labelSelector}}[${window}]))`
+      ),
+      // Requests per second
+      this.queryPrometheus(
+        `sum(rate(response_total{${labelSelector}}[${window}]))`
+      ),
+      // P99 latency in ms
+      this.queryPrometheus(
+        `histogram_quantile(0.99, sum(rate(response_latency_ms_bucket{${labelSelector}}[${window}])) by (le))`
+      ),
+      // P50 latency
+      this.queryPrometheus(
+        `histogram_quantile(0.50, sum(rate(response_latency_ms_bucket{${labelSelector}}[${window}])) by (le))`
+      ),
+      // P95 latency
+      this.queryPrometheus(
+        `histogram_quantile(0.95, sum(rate(response_latency_ms_bucket{${labelSelector}}[${window}])) by (le))`
+      ),
+    ]);
+
+    const getValue = (result: PrometheusQueryResult): number => {
+      const val = result.data?.result?.[0]?.value?.[1];
+      return val ? parseFloat(val) : 0;
+    };
+
+    return {
+      successRate: getValue(successRateResult),
+      requestsPerSecond: getValue(rpsResult),
+      p50LatencyMs: getValue(p50Result),
+      p95LatencyMs: getValue(p95Result),
+      p99LatencyMs: getValue(p99Result),
+      tcpConnections: 0, // จะ query แยก
+    };
+  }
+
+  async checkServiceHealth(
+    serviceName: string,
+    namespace: string
+  ): Promise<ServiceHealth> {
+    const metrics = await this.getServiceMetrics(serviceName, namespace);
+    
+    const healthy = 
+      metrics.successRate >= this.healthThresholds.minSuccessRate &&
+      metrics.p99LatencyMs <= this.healthThresholds.maxP99LatencyMs;
+
+    return {
+      serviceName,
+      namespace,
+      healthy,
+      successRate: metrics.successRate,
+      p99Latency: metrics.p99LatencyMs,
+      rps: metrics.requestsPerSecond,
+      lastChecked: new Date(),
+      meshEnabled: true,
+      mtlsEnabled: await this.checkMtlsEnabled(serviceName, namespace),
+    };
+  }
+
+  private async checkMtlsEnabled(
+    serviceName: string,
+    namespace: string
+  ): Promise<boolean> {
+    try {
+      const result = await this.queryPrometheus(
+        `sum(rate(response_total{` +
+        `service="${serviceName}",namespace="${namespace}",` +
+        `tls="true"}[60s]))`
       );
+      
+      const totalResult = await this.queryPrometheus(
+        `sum(rate(response_total{` +
+        `service="${serviceName}",namespace="${namespace}"}[60s]))`
+      );
+
+      const tlsCount = parseFloat(result.data?.result?.[0]?.value?.[1] ?? '0');
+      const totalCount = parseFloat(totalResult.data?.result?.[0]?.value?.[1] ?? '1');
+      
+      return tlsCount / totalCount > 0.95; // 95% ขึ้นไปถือว่า mTLS enabled
+    } catch {
+      return false;
     }
   }
 
-  getShardForKey(key: string): Pool {
-    const shardId = this.resolveShardId(key);
-    const pool = this.shards.get(shardId);
-    if (!pool) {
-      throw new Error(`No shard found for key: ${key} -> shardId: ${shardId}`);
-    }
-    return pool;
-  }
-
-  getShardForRange(value: number): Pool {
-    const config = this.shardConfigs.find(
-      (c) => c.rangeStart !== undefined &&
-             c.rangeEnd !== undefined &&
-             value >= c.rangeStart &&
-             value < c.rangeEnd
-    );
-    if (!config) throw new Error(`No shard for range value: ${value}`);
-    return this.shards.get(config.id)!;
-  }
-
-  getShardForRegion(region: string): Pool {
-    const config = this.shardConfigs.find((c) => c.region === region);
-    if (!config) {
-      // Fallback to default region
-      return this.getShardForKey(region);
-    }
-    return this.shards.get(config.id)!;
-  }
-
-  async executeOnAllShards<T>(
-    fn: (pool: Pool, shardId: string) => Promise<T>
-  ): Promise<Array<{ shardId: string; result: T }>> {
-    const results = await Promise.allSettled(
-      Array.from(this.shards.entries()).map(async ([shardId, pool]) => ({
-        shardId,
-        result: await fn(pool, shardId),
-      }))
+  async checkMultipleServices(
+    services: Array<{ name: string; namespace: string }>
+  ): Promise<ServiceHealth[]> {
+    const checks = services.map(svc => 
+      this.checkServiceHealth(svc.name, svc.namespace).catch(err => ({
+        serviceName: svc.name,
+        namespace: svc.namespace,
+        healthy: false,
+        successRate: 0,
+        p99Latency: 0,
+        rps: 0,
+        lastChecked: new Date(),
+        meshEnabled: false,
+        mtlsEnabled: false,
+        error: err.message,
+      } as ServiceHealth))
     );
 
-    return results
-      .filter((r): r is PromiseFulfilledResult<{ shardId: string; result: T }> =>
-        r.status === 'fulfilled'
-      )
-      .map((r) => r.value);
+    return Promise.all(checks);
   }
 
-  // Cross-shard query (scatter-gather)
-  async scatter<T>(
-    fn: (pool: Pool) => Promise<T[]>,
-    merge: (results: T[][]) => T[]
-  ): Promise<T[]> {
-    const shardResults = await this.executeOnAllShards((pool) => fn(pool));
-    return merge(shardResults.map((r) => r.result));
-  }
+  printHealthReport(healthResults: ServiceHealth[]): void {
+    console.log('\n=== Linkerd Service Health Report ===\n');
+    console.log(new Date().toISOString());
+    console.log('');
 
-  private resolveShardId(key: string): string {
-    switch (this.strategy) {
-      case 'hash':
-        return this.hashShard(key);
-      case 'consistent-hash':
-        return this.consistentHashRing.getNode(key);
-      default:
-        return this.hashShard(key);
+    const healthy = healthResults.filter(r => r.healthy);
+    const unhealthy = healthResults.filter(r => !r.healthy);
+
+    console.log(`Overall: ${healthy.length}/${healthResults.length} services healthy\n`);
+
+    if (unhealthy.length > 0) {
+      console.log('UNHEALTHY SERVICES:');
+      unhealthy.forEach(svc => {
+        console.log(`  [FAIL] ${svc.namespace}/${svc.serviceName}`);
+        console.log(`    Success Rate: ${(svc.successRate * 100).toFixed(2)}%`);
+        console.log(`    P99 Latency: ${svc.p99Latency.toFixed(1)}ms`);
+        console.log(`    RPS: ${svc.rps.toFixed(1)}`);
+        console.log(`    mTLS: ${svc.mtlsEnabled ? 'enabled' : 'DISABLED'}`);
+      });
+      console.log('');
     }
-  }
 
-  private hashShard(key: string): string {
-    const hash = createHash('md5').update(key).digest('hex');
-    const num = parseInt(hash.substring(0, 8), 16);
-    const index = num % this.shardConfigs.length;
-    return this.shardConfigs[index].id;
+    console.log('HEALTHY SERVICES:');
+    healthy.forEach(svc => {
+      console.log(`  [OK] ${svc.namespace}/${svc.serviceName}`);
+      console.log(`    Success Rate: ${(svc.successRate * 100).toFixed(2)}%`);
+      console.log(`    P99 Latency: ${svc.p99Latency.toFixed(1)}ms`);
+      console.log(`    RPS: ${svc.rps.toFixed(1)}`);
+      console.log(`    mTLS: ${svc.mtlsEnabled ? 'enabled' : 'disabled'}`);
+    });
   }
 }
 
-// Consistent Hash Ring
-class ConsistentHashRing {
-  private ring: Map<number, string> = new Map();
-  private sortedKeys: number[] = [];
+// การใช้งาน
+async function main() {
+  const client = new LinkerdHealthClient(
+    process.env.PROMETHEUS_URL,
+    process.env.LINKERD_VIZ_URL
+  );
 
-  constructor(nodes: string[], virtualNodes: number = 150) {
-    for (const node of nodes) {
-      for (let i = 0; i < virtualNodes; i++) {
-        const key = this.hash(`${node}:${i}`);
-        this.ring.set(key, node);
-      }
-    }
-    this.sortedKeys = Array.from(this.ring.keys()).sort((a, b) => a - b);
-  }
+  const services = [
+    { name: 'api-gateway', namespace: 'production' },
+    { name: 'user-service', namespace: 'production' },
+    { name: 'order-service', namespace: 'production' },
+    { name: 'payment-service', namespace: 'production' },
+    { name: 'notification-service', namespace: 'production' },
+  ];
 
-  getNode(key: string): string {
-    if (this.sortedKeys.length === 0) throw new Error('Empty ring');
-    
-    const hash = this.hash(key);
-    
-    // Find first key >= hash (clockwise)
-    const idx = this.sortedKeys.findIndex((k) => k >= hash);
-    const ringKey = idx === -1 ? this.sortedKeys[0] : this.sortedKeys[idx];
-    
-    return this.ring.get(ringKey)!;
-  }
+  const healthResults = await client.checkMultipleServices(services);
+  client.printHealthReport(healthResults);
 
-  private hash(key: string): number {
-    const h = createHash('md5').update(key).digest('hex');
-    return parseInt(h.substring(0, 8), 16);
-  }
+  // Exit with error code if any service is unhealthy
+  const hasUnhealthy = healthResults.some(r => !r.healthy);
+  process.exit(hasUnhealthy ? 1 : 0);
 }
+
+main().catch(console.error);
 ```
 
 ---
 
-## 5. Message Queue Scaling
+## 78.3 Traffic Splitting YAML (90/10 Canary) และ TypeScript Canary Controller
 
-### 5.1 Kafka Consumer Group Scaling
+### Linkerd TrafficSplit YAML
+
+```yaml
+# traffic-split-canary.yaml
+apiVersion: split.smi-spec.io/v1alpha2
+kind: TrafficSplit
+metadata:
+  name: order-service-canary
+  namespace: production
+spec:
+  service: order-service
+  backends:
+    - service: order-service-stable
+      weight: "900m"   # 90% traffic
+    - service: order-service-canary
+      weight: "100m"   # 10% traffic
+---
+# order-service-stable deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-stable
+  namespace: production
+  labels:
+    app: order-service
+    version: stable
+    track: stable
+spec:
+  replicas: 9
+  selector:
+    matchLabels:
+      app: order-service
+      track: stable
+  template:
+    metadata:
+      labels:
+        app: order-service
+        version: stable
+        track: stable
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      containers:
+        - name: order-service
+          image: myregistry/order-service:v1.2.3
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+# order-service-canary deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-canary
+  namespace: production
+  labels:
+    app: order-service
+    version: canary
+    track: canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: order-service
+        version: canary
+        track: canary
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      containers:
+        - name: order-service
+          image: myregistry/order-service:v1.3.0-rc1
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  selector:
+    app: order-service
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service-stable
+  namespace: production
+spec:
+  selector:
+    app: order-service
+    track: stable
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service-canary
+  namespace: production
+spec:
+  selector:
+    app: order-service
+    track: canary
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+### TypeScript Canary Controller
 
 ```typescript
-// src/messaging/kafka/scalable-consumer.ts
-import { Kafka, Consumer, EachMessagePayload } from 'kafkajs';
-import { Redis } from 'ioredis';
+// canary-controller.ts
+import * as k8s from '@kubernetes/client-node';
 
-interface ConsumerConfig {
-  topic: string;
-  groupId: string;
-  concurrency: number;
-  maxBatchSize: number;
-  processingTimeoutMs: number;
-  retryDelays: number[];
-  deadLetterTopic: string;
+interface CanaryConfig {
+  serviceName: string;
+  namespace: string;
+  stableVersion: string;
+  canaryVersion: string;
+  initialCanaryWeight: number;    // เริ่มที่ 10%
+  incrementStep: number;          // เพิ่มทีละ 10%
+  intervalMinutes: number;        // interval ระหว่าง step
+  successRateThreshold: number;   // minimum success rate ก่อน promote
+  maxP99LatencyMs: number;        // max p99 latency ก่อน rollback
+  prometheusUrl: string;
 }
 
-interface ProcessingResult {
+interface CanaryMetrics {
+  canarySuccessRate: number;
+  stableSuccessRate: number;
+  canaryP99LatencyMs: number;
+  stableP99LatencyMs: number;
+  canaryRps: number;
+}
+
+type CanaryAction = 'promote' | 'rollback' | 'continue' | 'pause';
+
+class CanaryController {
+  private k8sCustomApi: k8s.CustomObjectsApi;
+  private prometheusUrl: string;
+
+  constructor(prometheusUrl: string) {
+    const kc = new k8s.KubeConfig();
+    kc.loadFromDefault();
+    this.k8sCustomApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    this.prometheusUrl = prometheusUrl;
+  }
+
+  private async getTrafficSplit(
+    name: string,
+    namespace: string
+  ): Promise<any> {
+    const response = await this.k8sCustomApi.getNamespacedCustomObject(
+      'split.smi-spec.io',
+      'v1alpha2',
+      namespace,
+      'trafficsplits',
+      name
+    );
+    return response.body;
+  }
+
+  private async updateTrafficSplit(
+    name: string,
+    namespace: string,
+    stableWeight: number,
+    canaryWeight: number
+  ): Promise<void> {
+    const patch = {
+      spec: {
+        backends: [
+          {
+            service: `${name}-stable`,
+            weight: `${stableWeight * 10}m`,
+          },
+          {
+            service: `${name}-canary`,
+            weight: `${canaryWeight * 10}m`,
+          },
+        ],
+      },
+    };
+
+    await this.k8sCustomApi.patchNamespacedCustomObject(
+      'split.smi-spec.io',
+      'v1alpha2',
+      namespace,
+      'trafficsplits',
+      name,
+      patch,
+      undefined,
+      undefined,
+      undefined,
+      {
+        headers: { 'Content-Type': 'application/merge-patch+json' },
+      }
+    );
+
+    console.log(
+      `Updated traffic split: stable=${stableWeight}%, canary=${canaryWeight}%`
+    );
+  }
+
+  private async queryMetric(query: string): Promise<number> {
+    const url = new URL(`${this.prometheusUrl}/api/v1/query`);
+    url.searchParams.set('query', query);
+
+    const response = await fetch(url.toString());
+    const data = await response.json();
+    
+    const value = data.data?.result?.[0]?.value?.[1];
+    return value ? parseFloat(value) : 0;
+  }
+
+  async getCanaryMetrics(
+    config: CanaryConfig,
+    windowSeconds: number = 120
+  ): Promise<CanaryMetrics> {
+    const window = `${windowSeconds}s`;
+    const ns = config.namespace;
+
+    const [
+      canarySuccessRate,
+      stableSuccessRate,
+      canaryP99,
+      stableP99,
+      canaryRps,
+    ] = await Promise.all([
+      this.queryMetric(
+        `sum(rate(response_total{namespace="${ns}",service="${config.serviceName}-canary",classification="success"}[${window}])) / ` +
+        `sum(rate(response_total{namespace="${ns}",service="${config.serviceName}-canary"}[${window}]))`
+      ),
+      this.queryMetric(
+        `sum(rate(response_total{namespace="${ns}",service="${config.serviceName}-stable",classification="success"}[${window}])) / ` +
+        `sum(rate(response_total{namespace="${ns}",service="${config.serviceName}-stable"}[${window}]))`
+      ),
+      this.queryMetric(
+        `histogram_quantile(0.99, sum(rate(response_latency_ms_bucket{namespace="${ns}",service="${config.serviceName}-canary"}[${window}])) by (le))`
+      ),
+      this.queryMetric(
+        `histogram_quantile(0.99, sum(rate(response_latency_ms_bucket{namespace="${ns}",service="${config.serviceName}-stable"}[${window}])) by (le))`
+      ),
+      this.queryMetric(
+        `sum(rate(response_total{namespace="${ns}",service="${config.serviceName}-canary"}[${window}]))`
+      ),
+    ]);
+
+    return {
+      canarySuccessRate,
+      stableSuccessRate,
+      canaryP99LatencyMs: canaryP99,
+      stableP99LatencyMs: stableP99,
+      canaryRps,
+    };
+  }
+
+  analyzeMetrics(
+    metrics: CanaryMetrics,
+    config: CanaryConfig,
+    currentCanaryWeight: number
+  ): CanaryAction {
+    // ถ้า success rate ต่ำกว่า threshold ให้ rollback
+    if (metrics.canarySuccessRate < config.successRateThreshold) {
+      console.log(
+        `[ROLLBACK] Canary success rate ${(metrics.canarySuccessRate * 100).toFixed(2)}% < ` +
+        `threshold ${(config.successRateThreshold * 100)}%`
+      );
+      return 'rollback';
+    }
+
+    // ถ้า p99 latency สูงเกิน threshold ให้ rollback
+    if (metrics.canaryP99LatencyMs > config.maxP99LatencyMs) {
+      console.log(
+        `[ROLLBACK] Canary P99 latency ${metrics.canaryP99LatencyMs.toFixed(1)}ms > ` +
+        `threshold ${config.maxP99LatencyMs}ms`
+      );
+      return 'rollback';
+    }
+
+    // ถ้า canary weight ถึง 100% แล้วให้ promote
+    if (currentCanaryWeight >= 100) {
+      console.log('[PROMOTE] Canary has reached 100% traffic, promoting to stable');
+      return 'promote';
+    }
+
+    // ถ้าทุกอย่างดีให้ continue เพิ่ม traffic
+    console.log(
+      `[CONTINUE] Canary metrics OK: ` +
+      `success_rate=${(metrics.canarySuccessRate * 100).toFixed(2)}%, ` +
+      `p99=${metrics.canaryP99LatencyMs.toFixed(1)}ms`
+    );
+    return 'continue';
+  }
+
+  async runCanaryDeployment(config: CanaryConfig): Promise<void> {
+    console.log(`Starting canary deployment for ${config.serviceName}`);
+    console.log(`Version: ${config.stableVersion} -> ${config.canaryVersion}`);
+    console.log(`Strategy: ${config.initialCanaryWeight}% initial, +${config.incrementStep}% every ${config.intervalMinutes}min\n`);
+
+    let currentCanaryWeight = config.initialCanaryWeight;
+    
+    // ตั้ง initial traffic split
+    await this.updateTrafficSplit(
+      config.serviceName,
+      config.namespace,
+      100 - currentCanaryWeight,
+      currentCanaryWeight
+    );
+
+    while (currentCanaryWeight <= 100) {
+      // รอ metrics ให้ stable
+      console.log(`\nWaiting ${config.intervalMinutes} minutes before analysis...`);
+      await this.sleep(config.intervalMinutes * 60 * 1000);
+
+      // ดึง metrics
+      const metrics = await this.getCanaryMetrics(config);
+      this.logMetrics(metrics, currentCanaryWeight);
+
+      // วิเคราะห์ว่าจะทำอะไรต่อ
+      const action = this.analyzeMetrics(metrics, config, currentCanaryWeight);
+
+      switch (action) {
+        case 'rollback':
+          await this.rollback(config);
+          return;
+
+        case 'promote':
+          await this.promote(config);
+          return;
+
+        case 'continue':
+          currentCanaryWeight = Math.min(
+            currentCanaryWeight + config.incrementStep,
+            100
+          );
+          await this.updateTrafficSplit(
+            config.serviceName,
+            config.namespace,
+            100 - currentCanaryWeight,
+            currentCanaryWeight
+          );
+          break;
+
+        case 'pause':
+          console.log('Canary deployment paused. Manual intervention required.');
+          return;
+      }
+    }
+  }
+
+  private async rollback(config: CanaryConfig): Promise<void> {
+    console.log(`\n[ROLLBACK] Rolling back ${config.serviceName} to stable version`);
+    await this.updateTrafficSplit(
+      config.serviceName,
+      config.namespace,
+      100,
+      0
+    );
+    console.log('Rollback complete. 100% traffic restored to stable.');
+  }
+
+  private async promote(config: CanaryConfig): Promise<void> {
+    console.log(`\n[PROMOTE] Promoting canary version ${config.canaryVersion} to stable`);
+    // ใน real scenario จะต้อง update stable deployment image และลบ canary
+    await this.updateTrafficSplit(
+      config.serviceName,
+      config.namespace,
+      100,
+      0
+    );
+    console.log(`Promotion complete. ${config.canaryVersion} is now stable.`);
+  }
+
+  private logMetrics(metrics: CanaryMetrics, canaryWeight: number): void {
+    console.log(`\n--- Metrics Analysis (canary=${canaryWeight}%) ---`);
+    console.log(`Canary:  success=${(metrics.canarySuccessRate * 100).toFixed(2)}%, p99=${metrics.canaryP99LatencyMs.toFixed(1)}ms, rps=${metrics.canaryRps.toFixed(1)}`);
+    console.log(`Stable:  success=${(metrics.stableSuccessRate * 100).toFixed(2)}%, p99=${metrics.stableP99LatencyMs.toFixed(1)}ms`);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const controller = new CanaryController(
+    process.env.PROMETHEUS_URL || 'http://prometheus.linkerd-viz.svc:9090'
+  );
+
+  const config: CanaryConfig = {
+    serviceName: 'order-service',
+    namespace: 'production',
+    stableVersion: 'v1.2.3',
+    canaryVersion: 'v1.3.0',
+    initialCanaryWeight: 10,
+    incrementStep: 10,
+    intervalMinutes: 10,
+    successRateThreshold: 0.99,
+    maxP99LatencyMs: 500,
+    prometheusUrl: process.env.PROMETHEUS_URL || 'http://prometheus.linkerd-viz.svc:9090',
+  };
+
+  await controller.runCanaryDeployment(config);
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 78.4 Service Mesh Observability: Golden Signals Dashboard
+
+### Golden Signals คืออะไร
+
+ตาม Google SRE Book, Golden Signals ประกอบด้วย 4 อย่าง:
+1. **Latency** - เวลาที่ใช้ในการตอบ request
+2. **Traffic** - จำนวน requests ต่อวินาที
+3. **Errors** - อัตราส่วนของ requests ที่ fail
+4. **Saturation** - ความเต็มของ resource
+
+### Prometheus Recording Rules
+
+```yaml
+# linkerd-recording-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: linkerd-golden-signals
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: prometheus
+spec:
+  groups:
+    - name: linkerd.golden_signals
+      interval: 30s
+      rules:
+        # Success Rate (1 - Error Rate)
+        - record: namespace_service:success_rate:ratio_rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(response_total{classification="success"}[5m])
+            )
+            /
+            sum by (namespace, service) (
+              rate(response_total{}[5m])
+            )
+
+        # Error Rate
+        - record: namespace_service:error_rate:ratio_rate5m
+          expr: |
+            1 - namespace_service:success_rate:ratio_rate5m
+
+        # Request Rate (Traffic)
+        - record: namespace_service:request_rate:sum_rate5m
+          expr: |
+            sum by (namespace, service) (
+              rate(response_total{}[5m])
+            )
+
+        # P50 Latency
+        - record: namespace_service:latency_p50:histogram_quantile5m
+          expr: |
+            histogram_quantile(0.50,
+              sum by (namespace, service, le) (
+                rate(response_latency_ms_bucket{}[5m])
+              )
+            )
+
+        # P95 Latency
+        - record: namespace_service:latency_p95:histogram_quantile5m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (namespace, service, le) (
+                rate(response_latency_ms_bucket{}[5m])
+              )
+            )
+
+        # P99 Latency
+        - record: namespace_service:latency_p99:histogram_quantile5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (namespace, service, le) (
+                rate(response_latency_ms_bucket{}[5m])
+              )
+            )
+
+        # Saturation: TCP connection utilization
+        - record: namespace_service:tcp_saturation:ratio
+          expr: |
+            sum by (namespace, service) (
+              tcp_open_total{}
+            )
+            /
+            sum by (namespace, service) (
+              tcp_open_total{} + tcp_open_total{} * 0.2
+            )
+---
+# Alerting Rules
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: linkerd-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: linkerd.alerts
+      rules:
+        - alert: ServiceHighErrorRate
+          expr: |
+            namespace_service:error_rate:ratio_rate5m > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High error rate for {{ $labels.service }}"
+            description: "Service {{ $labels.namespace }}/{{ $labels.service }} has error rate {{ $value | humanizePercentage }} for 5 minutes"
+
+        - alert: ServiceVeryHighErrorRate
+          expr: |
+            namespace_service:error_rate:ratio_rate5m > 0.20
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Critical error rate for {{ $labels.service }}"
+            description: "Service {{ $labels.namespace }}/{{ $labels.service }} has error rate {{ $value | humanizePercentage }}"
+
+        - alert: ServiceHighLatency
+          expr: |
+            namespace_service:latency_p99:histogram_quantile5m > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High P99 latency for {{ $labels.service }}"
+            description: "P99 latency is {{ $value | humanizeDuration }}"
+```
+
+### TypeScript Golden Signals Dashboard
+
+```typescript
+// golden-signals-dashboard.ts
+interface GoldenSignals {
+  service: string;
+  namespace: string;
+  timestamp: Date;
+  latency: {
+    p50Ms: number;
+    p95Ms: number;
+    p99Ms: number;
+  };
+  traffic: {
+    requestsPerSecond: number;
+    bytesPerSecond?: number;
+  };
+  errors: {
+    rate: number;           // 0.0 - 1.0
+    count5m: number;
+    types: Record<string, number>;
+  };
+  saturation: {
+    cpuUtilization: number; // 0.0 - 1.0
+    memoryUtilization: number;
+    tcpConnections: number;
+  };
+}
+
+interface SLOConfig {
+  errorRateTarget: number;      // e.g., 0.01 = 1% error budget
+  latencyP99TargetMs: number;   // e.g., 500ms
+  availabilityTarget: number;   // e.g., 0.999 = 99.9%
+}
+
+interface SLOStatus {
+  service: string;
+  namespace: string;
+  withinSLO: boolean;
+  errorBudgetRemaining: number; // percentage
+  violations: string[];
+}
+
+class GoldenSignalsDashboard {
+  private prometheusUrl: string;
+  private sloConfigs: Map<string, SLOConfig>;
+
+  constructor(prometheusUrl: string) {
+    this.prometheusUrl = prometheusUrl;
+    this.sloConfigs = new Map();
+  }
+
+  registerSLO(service: string, namespace: string, config: SLOConfig): void {
+    this.sloConfigs.set(`${namespace}/${service}`, config);
+  }
+
+  private async query(promql: string): Promise<number> {
+    const url = `${this.prometheusUrl}/api/v1/query?query=${encodeURIComponent(promql)}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    return parseFloat(data.data?.result?.[0]?.value?.[1] ?? '0');
+  }
+
+  async collectGoldenSignals(
+    service: string,
+    namespace: string
+  ): Promise<GoldenSignals> {
+    const label = `service="${service}",namespace="${namespace}"`;
+    const window = '5m';
+
+    const [p50, p95, p99, rps, errorRate, tcpConns] = await Promise.all([
+      this.query(`histogram_quantile(0.50, sum(rate(response_latency_ms_bucket{${label}}[${window}])) by (le))`),
+      this.query(`histogram_quantile(0.95, sum(rate(response_latency_ms_bucket{${label}}[${window}])) by (le))`),
+      this.query(`histogram_quantile(0.99, sum(rate(response_latency_ms_bucket{${label}}[${window}])) by (le))`),
+      this.query(`sum(rate(response_total{${label}}[${window}]))`),
+      this.query(
+        `1 - (sum(rate(response_total{${label},classification="success"}[${window}])) / ` +
+        `sum(rate(response_total{${label}}[${window}])))`
+      ),
+      this.query(`sum(tcp_open_total{${label}})`),
+    ]);
+
+    return {
+      service,
+      namespace,
+      timestamp: new Date(),
+      latency: { p50Ms: p50, p95Ms: p95, p99Ms: p99 },
+      traffic: { requestsPerSecond: rps },
+      errors: {
+        rate: errorRate,
+        count5m: 0,
+        types: {},
+      },
+      saturation: {
+        cpuUtilization: 0,
+        memoryUtilization: 0,
+        tcpConnections: tcpConns,
+      },
+    };
+  }
+
+  checkSLO(signals: GoldenSignals): SLOStatus {
+    const key = `${signals.namespace}/${signals.service}`;
+    const sloConfig = this.sloConfigs.get(key);
+
+    if (!sloConfig) {
+      return {
+        service: signals.service,
+        namespace: signals.namespace,
+        withinSLO: true,
+        errorBudgetRemaining: 100,
+        violations: [],
+      };
+    }
+
+    const violations: string[] = [];
+
+    if (signals.errors.rate > sloConfig.errorRateTarget) {
+      violations.push(
+        `Error rate ${(signals.errors.rate * 100).toFixed(3)}% exceeds target ${(sloConfig.errorRateTarget * 100)}%`
+      );
+    }
+
+    if (signals.latency.p99Ms > sloConfig.latencyP99TargetMs) {
+      violations.push(
+        `P99 latency ${signals.latency.p99Ms.toFixed(1)}ms exceeds target ${sloConfig.latencyP99TargetMs}ms`
+      );
+    }
+
+    const errorBudgetUsed = signals.errors.rate / sloConfig.errorRateTarget;
+    const errorBudgetRemaining = Math.max(0, (1 - errorBudgetUsed) * 100);
+
+    return {
+      service: signals.service,
+      namespace: signals.namespace,
+      withinSLO: violations.length === 0,
+      errorBudgetRemaining,
+      violations,
+    };
+  }
+
+  renderDashboard(
+    signalsArray: GoldenSignals[],
+    sloStatuses: SLOStatus[]
+  ): string {
+    const lines: string[] = [];
+    
+    lines.push('╔══════════════════════════════════════════════════════════════╗');
+    lines.push('║           SERVICE MESH GOLDEN SIGNALS DASHBOARD             ║');
+    lines.push(`║  Updated: ${new Date().toISOString()}           ║`);
+    lines.push('╚══════════════════════════════════════════════════════════════╝');
+    lines.push('');
+
+    for (const signals of signalsArray) {
+      const slo = sloStatuses.find(
+        s => s.service === signals.service && s.namespace === signals.namespace
+      );
+      
+      const statusIcon = slo?.withinSLO ? '✅' : '❌';
+      const budgetBar = this.renderProgressBar(slo?.errorBudgetRemaining ?? 100, 20);
+
+      lines.push(`${statusIcon} ${signals.namespace}/${signals.service}`);
+      lines.push(`  LATENCY:    P50=${signals.latency.p50Ms.toFixed(1)}ms  P95=${signals.latency.p95Ms.toFixed(1)}ms  P99=${signals.latency.p99Ms.toFixed(1)}ms`);
+      lines.push(`  TRAFFIC:    ${signals.traffic.requestsPerSecond.toFixed(1)} req/s`);
+      lines.push(`  ERRORS:     ${(signals.errors.rate * 100).toFixed(3)}%`);
+      lines.push(`  SAT TCP:    ${signals.saturation.tcpConnections} connections`);
+      lines.push(`  ERR BUDGET: [${budgetBar}] ${slo?.errorBudgetRemaining.toFixed(1)}% remaining`);
+      
+      if (slo?.violations && slo.violations.length > 0) {
+        lines.push('  VIOLATIONS:');
+        slo.violations.forEach(v => lines.push(`    ⚠️  ${v}`));
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  private renderProgressBar(percentage: number, width: number): string {
+    const filled = Math.round((percentage / 100) * width);
+    const empty = width - filled;
+    const color = percentage > 50 ? '█' : percentage > 20 ? '▓' : '░';
+    return color.repeat(filled) + '░'.repeat(empty);
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function runDashboard() {
+  const dashboard = new GoldenSignalsDashboard(
+    process.env.PROMETHEUS_URL || 'http://prometheus.monitoring.svc:9090'
+  );
+
+  // ลงทะเบียน SLO targets
+  const services = ['api-gateway', 'user-service', 'order-service', 'payment-service'];
+  const namespace = 'production';
+
+  services.forEach(service => {
+    dashboard.registerSLO(service, namespace, {
+      errorRateTarget: 0.01,
+      latencyP99TargetMs: 500,
+      availabilityTarget: 0.999,
+    });
+  });
+
+  // Collect metrics
+  const signalsArray = await Promise.all(
+    services.map(service => dashboard.collectGoldenSignals(service, namespace))
+  );
+
+  const sloStatuses = signalsArray.map(s => dashboard.checkSLO(s));
+
+  // Render dashboard
+  console.clear();
+  console.log(dashboard.renderDashboard(signalsArray, sloStatuses));
+
+  // Refresh every 30 seconds
+  setInterval(async () => {
+    const freshSignals = await Promise.all(
+      services.map(service => dashboard.collectGoldenSignals(service, namespace))
+    );
+    const freshSLOs = freshSignals.map(s => dashboard.checkSLO(s));
+    console.clear();
+    console.log(dashboard.renderDashboard(freshSignals, freshSLOs));
+  }, 30000);
+}
+
+runDashboard().catch(console.error);
+```
+
+---
+
+## 78.5 mTLS Certificate Rotation Automation
+
+### ทำไมต้อง Rotate mTLS Certificates?
+
+- ลดความเสี่ยงจาก certificate ที่ถูก compromise
+- Compliance requirements (PCI DSS, SOC2)
+- Best practice สำหรับ zero-trust security
+
+### TypeScript mTLS Certificate Rotation Script
+
+```typescript
+// mtls-cert-rotation.ts
+import * as k8s from '@kubernetes/client-node';
+import * as forge from 'node-forge';
+import { execSync } from 'child_process';
+
+interface CertificateInfo {
+  subject: string;
+  issuer: string;
+  notBefore: Date;
+  notAfter: Date;
+  daysUntilExpiry: number;
+  fingerprint: string;
+  isExpired: boolean;
+  willExpireSoon: boolean;
+}
+
+interface RotationResult {
+  service: string;
+  namespace: string;
   success: boolean;
-  retryable: boolean;
+  oldCertFingerprint: string;
+  newCertFingerprint: string;
   error?: string;
 }
 
-export class ScalableKafkaConsumer {
-  private consumer: Consumer;
-  private processing = false;
-  private inflightCount = 0;
-  private processingQueue: Promise<void>[] = [];
+interface MtlsRotationConfig {
+  expiryWarningDays: number;       // เตือนก่อน N วัน
+  forcedRotationDays: number;      // บังคับ rotate ก่อน expiry N วัน
+  certValidityDays: number;        // certificate ใหม่ valid กี่วัน
+  rootCASecret: string;            // K8s secret ที่เก็บ root CA
+  rootCANamespace: string;
+}
 
-  constructor(
-    private kafka: Kafka,
-    private config: ConsumerConfig,
-    private redis: Redis,
-    private messageHandler: (message: any) => Promise<ProcessingResult>
-  ) {
-    this.consumer = kafka.consumer({
-      groupId: config.groupId,
-      maxInFlightRequests: config.concurrency,
-      sessionTimeout: 30000,
-      heartbeatInterval: 3000,
-      rebalanceTimeout: 60000,
-    });
+class MtlsCertRotationManager {
+  private k8sApi: k8s.CoreV1Api;
+  private config: MtlsRotationConfig;
+
+  constructor(config: MtlsRotationConfig) {
+    const kc = new k8s.KubeConfig();
+    kc.loadFromDefault();
+    this.k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+    this.config = config;
   }
 
-  async start(): Promise<void> {
-    await this.consumer.connect();
-    await this.consumer.subscribe({
-      topic: this.config.topic,
-      fromBeginning: false,
-    });
+  parseCertificate(certPem: string): CertificateInfo {
+    const cert = forge.pki.certificateFromPem(certPem);
+    
+    const notAfter = cert.validity.notAfter;
+    const now = new Date();
+    const daysUntilExpiry = Math.floor(
+      (notAfter.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)
+    );
 
-    this.processing = true;
+    const md = forge.md.sha256.create();
+    md.update(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes());
 
-    await this.consumer.run({
-      autoCommit: false,
-      partitionsConsumedConcurrently: this.config.concurrency,
-      eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning }) => {
-        const messages = batch.messages;
-        const batchPromises: Promise<void>[] = [];
+    return {
+      subject: cert.subject.attributes.map(a => `${a.shortName}=${a.value}`).join(','),
+      issuer: cert.issuer.attributes.map(a => `${a.shortName}=${a.value}`).join(','),
+      notBefore: cert.validity.notBefore,
+      notAfter,
+      daysUntilExpiry,
+      fingerprint: md.digest().toHex(),
+      isExpired: daysUntilExpiry < 0,
+      willExpireSoon: daysUntilExpiry < this.config.expiryWarningDays,
+    };
+  }
 
-        for (const message of messages) {
-          if (!isRunning()) break;
+  async generateNewCertificate(
+    serviceName: string,
+    namespace: string,
+    rootCACert: string,
+    rootCAKey: string
+  ): Promise<{ cert: string; key: string }> {
+    const keys = forge.pki.rsa.generateKeyPair(2048);
+    const cert = forge.pki.createCertificate();
 
-          const promise = this.processWithRetry(message, batch.partition)
-            .then(() => {
-              resolveOffset(message.offset);
-            });
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = forge.util.bytesToHex(forge.random.getBytesSync(16));
+    
+    const now = new Date();
+    cert.validity.notBefore = now;
+    cert.validity.notAfter = new Date(
+      now.getTime() + this.config.certValidityDays * 24 * 60 * 60 * 1000
+    );
 
-          batchPromises.push(promise);
+    const attrs = [
+      { name: 'commonName', value: `${serviceName}.${namespace}.svc.cluster.local` },
+      { name: 'organizationName', value: 'cluster.local' },
+    ];
+    cert.setSubject(attrs);
 
-          // Limit concurrency
-          if (batchPromises.length >= this.config.concurrency) {
-            await Promise.all(batchPromises.splice(0, this.config.concurrency));
-            await heartbeat();
-          }
-        }
+    // Set issuer from root CA
+    const caCert = forge.pki.certificateFromPem(rootCACert);
+    cert.setIssuer(caCert.subject.attributes);
 
-        await Promise.all(batchPromises);
-
-        // Commit after processing batch
-        await this.consumer.commitOffsets([{
-          topic: this.config.topic,
-          partition: batch.partition,
-          offset: (parseInt(batch.lastOffset()) + 1).toString(),
-        }]);
+    // Extensions
+    cert.setExtensions([
+      { name: 'basicConstraints', cA: false },
+      { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
+      { name: 'extKeyUsage', serverAuth: true, clientAuth: true },
+      {
+        name: 'subjectAltName',
+        altNames: [
+          { type: 2, value: `${serviceName}.${namespace}.svc.cluster.local` },
+          { type: 2, value: `${serviceName}.${namespace}.svc` },
+          { type: 2, value: `${serviceName}.${namespace}` },
+          { type: 2, value: serviceName },
+        ],
       },
-    });
+    ]);
+
+    // Sign with root CA key
+    const caKey = forge.pki.privateKeyFromPem(rootCAKey);
+    cert.sign(caKey, forge.md.sha256.create());
+
+    return {
+      cert: forge.pki.certificateToPem(cert),
+      key: forge.pki.privateKeyToPem(keys.privateKey),
+    };
   }
 
-  private async processWithRetry(
-    message: any,
-    partition: number
+  async getRootCA(): Promise<{ cert: string; key: string }> {
+    const secret = await this.k8sApi.readNamespacedSecret(
+      this.config.rootCASecret,
+      this.config.rootCANamespace
+    );
+
+    const data = secret.body.data;
+    if (!data?.['tls.crt'] || !data?.['tls.key']) {
+      throw new Error('Root CA secret missing tls.crt or tls.key');
+    }
+
+    return {
+      cert: Buffer.from(data['tls.crt'], 'base64').toString('utf8'),
+      key: Buffer.from(data['tls.key'], 'base64').toString('utf8'),
+    };
+  }
+
+  async updateCertificateSecret(
+    secretName: string,
+    namespace: string,
+    certPem: string,
+    keyPem: string
   ): Promise<void> {
-    const key = message.key?.toString();
-    const value = message.value ? JSON.parse(message.value.toString()) : null;
-    const retryCount = parseInt(message.headers?.['x-retry-count']?.toString() || '0');
+    const secretData = {
+      'tls.crt': Buffer.from(certPem).toString('base64'),
+      'tls.key': Buffer.from(keyPem).toString('base64'),
+    };
 
     try {
-      const result = await this.withTimeout(
-        this.messageHandler(value),
-        this.config.processingTimeoutMs
+      // Try to update existing secret
+      await this.k8sApi.patchNamespacedSecret(
+        secretName,
+        namespace,
+        { data: secretData },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/merge-patch+json' } }
       );
-
-      if (!result.success && result.retryable && retryCount < this.config.retryDelays.length) {
-        await this.scheduleRetry(key, value, retryCount + 1);
-      } else if (!result.success) {
-        await this.sendToDeadLetter(key, value, result.error || 'Max retries exceeded');
-      }
-    } catch (error: any) {
-      if (retryCount < this.config.retryDelays.length) {
-        await this.scheduleRetry(key, value, retryCount + 1);
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        // Create new secret
+        await this.k8sApi.createNamespacedSecret(namespace, {
+          metadata: { name: secretName, namespace },
+          type: 'kubernetes.io/tls',
+          data: secretData,
+        });
       } else {
-        await this.sendToDeadLetter(key, value, error.message);
+        throw err;
       }
     }
   }
 
-  private async scheduleRetry(key: string | undefined, value: any, retryCount: number): Promise<void> {
-    const delay = this.config.retryDelays[retryCount - 1] || 60000;
-    
-    // Use Redis sorted set as delay queue
-    const executeAt = Date.now() + delay;
-    await this.redis.zadd(
-      `retry:${this.config.topic}`,
-      executeAt,
-      JSON.stringify({ key, value, retryCount, topic: this.config.topic })
+  async checkAndRotateCertificate(
+    serviceName: string,
+    namespace: string,
+    secretName: string
+  ): Promise<RotationResult> {
+    console.log(`Checking certificate for ${namespace}/${serviceName}...`);
+
+    let needsRotation = false;
+    let oldFingerprint = '';
+
+    try {
+      const secret = await this.k8sApi.readNamespacedSecret(secretName, namespace);
+      const certData = secret.body.data?.['tls.crt'];
+      
+      if (certData) {
+        const certPem = Buffer.from(certData, 'base64').toString('utf8');
+        const certInfo = this.parseCertificate(certPem);
+        oldFingerprint = certInfo.fingerprint;
+        
+        console.log(`  Current cert expires in ${certInfo.daysUntilExpiry} days`);
+        
+        if (certInfo.isExpired || certInfo.daysUntilExpiry < this.config.forcedRotationDays) {
+          console.log(`  Rotation required: ${certInfo.isExpired ? 'EXPIRED' : `expires in ${certInfo.daysUntilExpiry} days`}`);
+          needsRotation = true;
+        }
+      } else {
+        needsRotation = true;
+      }
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        needsRotation = true;
+      } else {
+        throw err;
+      }
+    }
+
+    if (!needsRotation) {
+      console.log(`  Certificate OK, no rotation needed`);
+      return {
+        service: serviceName,
+        namespace,
+        success: true,
+        oldCertFingerprint: oldFingerprint,
+        newCertFingerprint: oldFingerprint,
+      };
+    }
+
+    // Rotate certificate
+    try {
+      const rootCA = await this.getRootCA();
+      const newCert = await this.generateNewCertificate(
+        serviceName,
+        namespace,
+        rootCA.cert,
+        rootCA.key
+      );
+
+      await this.updateCertificateSecret(secretName, namespace, newCert.cert, newCert.key);
+      
+      const newCertInfo = this.parseCertificate(newCert.cert);
+      
+      console.log(`  Certificate rotated successfully. New cert expires in ${newCertInfo.daysUntilExpiry} days`);
+
+      return {
+        service: serviceName,
+        namespace,
+        success: true,
+        oldCertFingerprint: oldFingerprint,
+        newCertFingerprint: newCertInfo.fingerprint,
+      };
+    } catch (err: any) {
+      console.error(`  Rotation FAILED: ${err.message}`);
+      return {
+        service: serviceName,
+        namespace,
+        success: false,
+        oldCertFingerprint: oldFingerprint,
+        newCertFingerprint: '',
+        error: err.message,
+      };
+    }
+  }
+
+  async rotateAll(
+    services: Array<{ name: string; namespace: string; secretName: string }>
+  ): Promise<RotationResult[]> {
+    console.log(`\n=== mTLS Certificate Rotation ===`);
+    console.log(`Time: ${new Date().toISOString()}\n`);
+
+    const results = await Promise.all(
+      services.map(svc => 
+        this.checkAndRotateCertificate(svc.name, svc.namespace, svc.secretName)
+      )
     );
-  }
 
-  private async sendToDeadLetter(key: string | undefined, value: any, error: string): Promise<void> {
-    const producer = this.kafka.producer();
-    await producer.connect();
-    await producer.send({
-      topic: this.config.deadLetterTopic,
-      messages: [{
-        key: key || null,
-        value: JSON.stringify({
-          originalMessage: value,
-          error,
-          failedAt: new Date().toISOString(),
-          originalTopic: this.config.topic,
-        }),
-        headers: {
-          'x-original-topic': this.config.topic,
-          'x-failure-reason': error,
-        },
-      }],
-    });
-    await producer.disconnect();
-  }
+    const succeeded = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
 
-  private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((_, reject) =>
-        setTimeout(() => reject(new Error(`Processing timeout after ${ms}ms`)), ms)
-      ),
-    ]);
-  }
+    console.log(`\n=== Summary ===`);
+    console.log(`Total: ${results.length}, Success: ${succeeded}, Failed: ${failed}`);
+    
+    if (failed > 0) {
+      console.log('\nFailed rotations:');
+      results.filter(r => !r.success).forEach(r => {
+        console.log(`  ${r.namespace}/${r.service}: ${r.error}`);
+      });
+    }
 
-  async stop(): Promise<void> {
-    this.processing = false;
-    await this.consumer.stop();
-    await this.consumer.disconnect();
+    return results;
   }
 }
+
+// การใช้งาน - ทำงานเป็น CronJob ทุกวัน
+async function main() {
+  const manager = new MtlsCertRotationManager({
+    expiryWarningDays: 30,
+    forcedRotationDays: 7,
+    certValidityDays: 90,
+    rootCASecret: 'linkerd-identity-issuer',
+    rootCANamespace: 'linkerd',
+  });
+
+  const services = [
+    { name: 'api-gateway', namespace: 'production', secretName: 'api-gateway-mtls' },
+    { name: 'user-service', namespace: 'production', secretName: 'user-service-mtls' },
+    { name: 'order-service', namespace: 'production', secretName: 'order-service-mtls' },
+    { name: 'payment-service', namespace: 'production', secretName: 'payment-service-mtls' },
+  ];
+
+  const results = await manager.rotateAll(services);
+  
+  // Exit with error if any rotation failed
+  process.exit(results.some(r => !r.success) ? 1 : 0);
+}
+
+main().catch(console.error);
 ```
 
 ---
 
-## 6. Auto-scaling Triggers และ Strategies
+## 78.6 Performance Overhead Benchmarking
 
-### 6.1 Custom Metrics Auto-scaling
-
-```yaml
-# kubernetes/custom-hpa.yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: product-service-hpa
-  namespace: production
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: product-service
-  minReplicas: 3
-  maxReplicas: 50
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 60   # Wait 60s before scaling up more
-      policies:
-        - type: Percent
-          value: 100                   # Double pods
-          periodSeconds: 60
-        - type: Pods
-          value: 5                     # Max 5 pods per scaling event
-          periodSeconds: 60
-      selectPolicy: Max                # Use policy that results in more pods
-    scaleDown:
-      stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling down
-      policies:
-        - type: Percent
-          value: 10                    # Remove max 10% per period
-          periodSeconds: 60
-      selectPolicy: Min                # Conservative scale down
-  metrics:
-    # CPU-based scaling
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 60
-    
-    # Memory-based scaling
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 70
-
-    # Custom metric: Request rate
-    - type: Pods
-      pods:
-        metric:
-          name: http_requests_per_second
-        target:
-          type: AverageValue
-          averageValue: "100"
-
-    # External metric: Queue depth
-    - type: External
-      external:
-        metric:
-          name: kafka_consumer_lag
-          selector:
-            matchLabels:
-              topic: product-events
-              consumer-group: product-service
-        target:
-          type: Value
-          value: "1000"  # Scale up if lag > 1000 messages
-
-    # Custom metric: Response time P95
-    - type: Pods
-      pods:
-        metric:
-          name: http_request_duration_p95_ms
-        target:
-          type: AverageValue
-          averageValue: "500"   # Scale if P95 > 500ms
----
-# KEDA ScaledObject for advanced scaling
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: product-service-keda
-  namespace: production
-spec:
-  scaleTargetRef:
-    name: product-service
-  minReplicaCount: 3
-  maxReplicaCount: 50
-  cooldownPeriod: 300
-  pollingInterval: 30
-  triggers:
-    # Scale based on Kafka consumer lag
-    - type: kafka
-      metadata:
-        bootstrapServers: kafka-broker:9092
-        consumerGroup: product-service
-        topic: product-events
-        lagThreshold: "500"
-        activationLagThreshold: "100"
-      authenticationRef:
-        name: kafka-trigger-auth
-
-    # Scale based on Redis queue length
-    - type: redis
-      metadata:
-        address: redis:6379
-        listName: product-processing-queue
-        listLength: "100"
-        activationListLength: "50"
-      authenticationRef:
-        name: redis-trigger-auth
-
-    # Scale based on Prometheus metric
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus:9090
-        metricName: http_requests_pending
-        query: sum(rate(http_server_requests_total{service="product-service"}[2m]))
-        threshold: "200"
-        activationThreshold: "50"
-
-    # Schedule-based scaling (ช่วงเวลา peak)
-    - type: cron
-      metadata:
-        timezone: Asia/Bangkok
-        start: "0 9 * * 1-5"    # 09:00 Monday-Friday
-        end: "0 22 * * 1-5"     # 22:00 Monday-Friday
-        desiredReplicas: "10"
-```
-
-### 6.2 Predictive Auto-scaling Service
-
-```python
-# src/scaling/predictive_scaler.py
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
-from datetime import datetime, timedelta
-import boto3
-import logging
-from typing import List, Tuple
-
-logger = logging.getLogger(__name__)
-
-class PredictiveScaler:
-    def __init__(self, service_name: str, k8s_client):
-        self.service_name = service_name
-        self.k8s_client = k8s_client
-        self.cloudwatch = boto3.client('cloudwatch')
-        self.model = None
-        self.poly_features = PolynomialFeatures(degree=3)
-
-    def train(self, historical_data: pd.DataFrame) -> None:
-        """Train prediction model on historical metrics"""
-        # Features: hour_of_day, day_of_week, is_weekend, month
-        X = pd.DataFrame({
-            'hour': historical_data['timestamp'].dt.hour,
-            'day_of_week': historical_data['timestamp'].dt.dayofweek,
-            'is_weekend': (historical_data['timestamp'].dt.dayofweek >= 5).astype(int),
-            'month': historical_data['timestamp'].dt.month,
-            'day_of_month': historical_data['timestamp'].dt.day,
-        })
-
-        y = historical_data['replicas']
-
-        X_poly = self.poly_features.fit_transform(X)
-        self.model = LinearRegression()
-        self.model.fit(X_poly, y)
-        
-        score = self.model.score(X_poly, y)
-        logger.info(f"Model trained with R² score: {score:.3f}")
-
-    def predict_replicas(self, future_time: datetime) -> int:
-        """Predict required replicas for a future time"""
-        if self.model is None:
-            raise RuntimeError("Model not trained")
-
-        X = pd.DataFrame([{
-            'hour': future_time.hour,
-            'day_of_week': future_time.weekday(),
-            'is_weekend': int(future_time.weekday() >= 5),
-            'month': future_time.month,
-            'day_of_month': future_time.day,
-        }])
-
-        X_poly = self.poly_features.transform(X)
-        predicted = self.model.predict(X_poly)[0]
-        
-        # Add safety buffer (10%)
-        return max(3, int(np.ceil(predicted * 1.1)))
-
-    def get_scaling_schedule(
-        self,
-        hours_ahead: int = 24
-    ) -> List[Tuple[datetime, int]]:
-        """Generate scaling schedule for the next N hours"""
-        schedule = []
-        now = datetime.now()
-        
-        for hour in range(hours_ahead):
-            future_time = now + timedelta(hours=hour)
-            replicas = self.predict_replicas(future_time)
-            schedule.append((future_time, replicas))
-        
-        return schedule
-
-    def apply_predictive_scaling(self) -> None:
-        """Pre-emptively scale up before predicted traffic spike"""
-        now = datetime.now()
-        
-        # Look 15 minutes ahead
-        future_time = now + timedelta(minutes=15)
-        predicted_replicas = self.predict_replicas(future_time)
-        
-        current_replicas = self.get_current_replicas()
-        
-        if predicted_replicas > current_replicas * 1.2:  # Need 20% more replicas
-            logger.info(
-                f"Pre-emptive scale up: {current_replicas} -> {predicted_replicas} "
-                f"for predicted load at {future_time}"
-            )
-            self.scale_to(predicted_replicas)
-            
-            # Record metric
-            self.cloudwatch.put_metric_data(
-                Namespace='CustomMetrics/Scaling',
-                MetricData=[{
-                    'MetricName': 'PredictiveScaleUp',
-                    'Value': predicted_replicas - current_replicas,
-                    'Unit': 'Count',
-                    'Dimensions': [
-                        {'Name': 'Service', 'Value': self.service_name},
-                    ],
-                }]
-            )
-
-    def get_current_replicas(self) -> int:
-        deployment = self.k8s_client.AppsV1Api().read_namespaced_deployment(
-            name=self.service_name,
-            namespace='production'
-        )
-        return deployment.spec.replicas or 1
-
-    def scale_to(self, replicas: int) -> None:
-        from kubernetes import client as k8s
-        apps_v1 = k8s.AppsV1Api()
-        
-        body = {'spec': {'replicas': replicas}}
-        apps_v1.patch_namespaced_deployment_scale(
-            name=self.service_name,
-            namespace='production',
-            body=body
-        )
-```
-
----
-
-## 7. Connection Pool Scaling
-
-### 7.1 PgBouncer Configuration
-
-```ini
-# pgbouncer/pgbouncer.ini
-[databases]
-production_db = host=postgres-primary port=5432 dbname=production_db pool_size=50
-staging_db = host=postgres-replica1 port=5432 dbname=production_db pool_size=20
-
-[pgbouncer]
-# Connection mode
-pool_mode = transaction         # Best for microservices
-
-# Limits
-max_client_conn = 5000          # Max connections from clients
-default_pool_size = 50          # Pool size per (db, user) pair
-min_pool_size = 10              # Minimum idle connections
-reserve_pool_size = 10          # Emergency reserve pool
-reserve_pool_timeout = 3.0      # Seconds before using reserve pool
-
-# Timeouts
-server_connect_timeout = 5      # Timeout for new backend connections
-server_idle_timeout = 600       # Close idle backend connections after N seconds
-client_idle_timeout = 60        # Close idle client connections after N seconds
-server_lifetime = 3600          # Max backend connection age in seconds
-client_login_timeout = 60       # Max time for client to login
-
-# Logging
-log_connections = 1
-log_disconnections = 1
-log_pooler_errors = 1
-stats_period = 60
-
-# Monitoring
-stats_users = pgbouncer_monitor
-
-# Authentication
-auth_type = md5
-auth_file = /etc/pgbouncer/userlist.txt
-
-# Network
-listen_addr = 0.0.0.0
-listen_port = 6432
-
-# TLS
-server_tls_sslmode = require
-server_tls_ca_file = /etc/ssl/certs/ca-certificates.crt
-client_tls_sslmode = require
-client_tls_key_file = /etc/ssl/private/server.key
-client_tls_cert_file = /etc/ssl/certs/server.crt
-```
-
----
-
-## 8. Cache Scaling Patterns
-
-### 8.1 Redis Cluster Configuration
+### TypeScript Benchmark: Direct vs Mesh Calls
 
 ```typescript
-// src/cache/redis-cluster.ts
-import { Cluster, ClusterOptions } from 'ioredis';
+// mesh-benchmark.ts
+import * as http from 'http';
+import * as https from 'https';
 
-const clusterOptions: ClusterOptions = {
-  clusterRetryStrategy: (times) => Math.min(100 + times * 2, 2000),
-  enableOfflineQueue: false,
-  enableReadyCheck: true,
-  scaleReads: 'slave',  // Route reads to replicas
-  maxRedirections: 16,
-  retryDelayOnClusterDown: 300,
-  retryDelayOnFailover: 1000,
-  retryDelayOnTryAgain: 100,
-  slotsRefreshTimeout: 10000,
-  slotsRefreshInterval: 5000,
-  
-  redisOptions: {
-    connectTimeout: 10000,
-    commandTimeout: 5000,
-    maxRetriesPerRequest: 3,
-    enableAutoPipelining: true,   // Batch commands automatically
-    lazyConnect: true,
-  },
-};
+interface BenchmarkConfig {
+  targetUrl: string;
+  concurrency: number;
+  totalRequests: number;
+  warmupRequests: number;
+  requestTimeoutMs: number;
+}
 
-const CLUSTER_NODES = [
-  { host: 'redis-cluster-0.redis-cluster.production.svc', port: 6379 },
-  { host: 'redis-cluster-1.redis-cluster.production.svc', port: 6379 },
-  { host: 'redis-cluster-2.redis-cluster.production.svc', port: 6379 },
-  { host: 'redis-cluster-3.redis-cluster.production.svc', port: 6379 },
-  { host: 'redis-cluster-4.redis-cluster.production.svc', port: 6379 },
-  { host: 'redis-cluster-5.redis-cluster.production.svc', port: 6379 },
-];
+interface RequestResult {
+  durationMs: number;
+  statusCode: number;
+  success: boolean;
+  error?: string;
+}
 
-export class RedisClusterManager {
-  private cluster: Cluster;
-  private stats = { hits: 0, misses: 0, errors: 0 };
+interface BenchmarkStats {
+  totalRequests: number;
+  successRequests: number;
+  failedRequests: number;
+  successRate: number;
+  throughputRps: number;
+  latency: {
+    min: number;
+    max: number;
+    mean: number;
+    median: number;
+    p75: number;
+    p95: number;
+    p99: number;
+    p999: number;
+  };
+  totalDurationMs: number;
+}
 
-  constructor() {
-    this.cluster = new Cluster(CLUSTER_NODES, clusterOptions);
-    this.cluster.on('error', (err) => {
-      this.stats.errors++;
-      console.error('Redis cluster error:', err.message);
-    });
-    this.cluster.on('node error', (err, address) => {
-      console.error(`Redis node ${address} error:`, err.message);
+class ServiceMeshBenchmark {
+  async makeRequest(url: string, timeoutMs: number): Promise<RequestResult> {
+    const startTime = process.hrtime.bigint();
+
+    return new Promise((resolve) => {
+      const parsedUrl = new URL(url);
+      const client = parsedUrl.protocol === 'https:' ? https : http;
+
+      const options: http.RequestOptions = {
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'GET',
+        timeout: timeoutMs,
+        headers: {
+          'Connection': 'keep-alive',
+          'Accept': 'application/json',
+        },
+      };
+
+      const req = client.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          const endTime = process.hrtime.bigint();
+          const durationMs = Number(endTime - startTime) / 1_000_000;
+          resolve({
+            durationMs,
+            statusCode: res.statusCode ?? 0,
+            success: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 400,
+          });
+        });
+      });
+
+      req.on('error', (err) => {
+        const endTime = process.hrtime.bigint();
+        const durationMs = Number(endTime - startTime) / 1_000_000;
+        resolve({
+          durationMs,
+          statusCode: 0,
+          success: false,
+          error: err.message,
+        });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({
+          durationMs: timeoutMs,
+          statusCode: 0,
+          success: false,
+          error: 'Request timeout',
+        });
+      });
+
+      req.end();
     });
   }
 
-  async get<T>(key: string): Promise<T | null> {
-    try {
-      const value = await this.cluster.get(key);
-      if (value === null) {
-        this.stats.misses++;
-        return null;
+  async runBatch(
+    url: string,
+    count: number,
+    concurrency: number,
+    timeoutMs: number
+  ): Promise<RequestResult[]> {
+    const results: RequestResult[] = [];
+    let completed = 0;
+
+    // ใช้ semaphore สำหรับ concurrency control
+    const semaphore = new Semaphore(concurrency);
+
+    const makeRequest = async () => {
+      await semaphore.acquire();
+      try {
+        const result = await this.makeRequest(url, timeoutMs);
+        results.push(result);
+        completed++;
+        
+        if (completed % 100 === 0) {
+          process.stdout.write(`\r  Progress: ${completed}/${count}`);
+        }
+      } finally {
+        semaphore.release();
       }
-      this.stats.hits++;
-      return JSON.parse(value);
-    } catch (error) {
-      this.stats.errors++;
+    };
+
+    const promises: Promise<void>[] = [];
+    for (let i = 0; i < count; i++) {
+      promises.push(makeRequest());
+    }
+
+    await Promise.all(promises);
+    process.stdout.write(`\r  Progress: ${completed}/${count}\n`);
+
+    return results;
+  }
+
+  calculateStats(results: RequestResult[], totalDurationMs: number): BenchmarkStats {
+    const successful = results.filter(r => r.success);
+    const durations = successful.map(r => r.durationMs).sort((a, b) => a - b);
+
+    const percentile = (p: number): number => {
+      if (durations.length === 0) return 0;
+      const index = Math.ceil((p / 100) * durations.length) - 1;
+      return durations[Math.max(0, index)];
+    };
+
+    const mean = durations.length > 0
+      ? durations.reduce((a, b) => a + b, 0) / durations.length
+      : 0;
+
+    return {
+      totalRequests: results.length,
+      successRequests: successful.length,
+      failedRequests: results.length - successful.length,
+      successRate: successful.length / results.length,
+      throughputRps: (results.length / totalDurationMs) * 1000,
+      latency: {
+        min: durations[0] ?? 0,
+        max: durations[durations.length - 1] ?? 0,
+        mean,
+        median: percentile(50),
+        p75: percentile(75),
+        p95: percentile(95),
+        p99: percentile(99),
+        p999: percentile(99.9),
+      },
+      totalDurationMs,
+    };
+  }
+
+  async runBenchmark(
+    name: string,
+    config: BenchmarkConfig
+  ): Promise<BenchmarkStats> {
+    console.log(`\n--- Benchmark: ${name} ---`);
+    console.log(`URL: ${config.targetUrl}`);
+    console.log(`Requests: ${config.totalRequests}, Concurrency: ${config.concurrency}`);
+
+    // Warmup
+    if (config.warmupRequests > 0) {
+      console.log(`\nWarming up (${config.warmupRequests} requests)...`);
+      await this.runBatch(
+        config.targetUrl,
+        config.warmupRequests,
+        config.concurrency,
+        config.requestTimeoutMs
+      );
+    }
+
+    // Benchmark
+    console.log(`\nRunning benchmark...`);
+    const startTime = Date.now();
+    const results = await this.runBatch(
+      config.targetUrl,
+      config.totalRequests,
+      config.concurrency,
+      config.requestTimeoutMs
+    );
+    const totalDurationMs = Date.now() - startTime;
+
+    return this.calculateStats(results, totalDurationMs);
+  }
+
+  compareResults(
+    directStats: BenchmarkStats,
+    meshStats: BenchmarkStats
+  ): void {
+    console.log('\n╔══════════════════════════════════════════════════════════╗');
+    console.log('║          BENCHMARK COMPARISON: Direct vs Mesh           ║');
+    console.log('╚══════════════════════════════════════════════════════════╝\n');
+
+    const formatMs = (ms: number) => `${ms.toFixed(2)}ms`;
+    const formatOverhead = (direct: number, mesh: number) => {
+      const overhead = ((mesh - direct) / direct * 100);
+      const sign = overhead >= 0 ? '+' : '';
+      return `${sign}${overhead.toFixed(1)}%`;
+    };
+
+    console.log('THROUGHPUT:');
+    console.log(`  Direct:  ${directStats.throughputRps.toFixed(1)} req/s`);
+    console.log(`  Mesh:    ${meshStats.throughputRps.toFixed(1)} req/s`);
+    console.log(`  Overhead: ${formatOverhead(directStats.throughputRps, meshStats.throughputRps)} (negative = worse)`);
+
+    console.log('\nLATENCY:');
+    const metrics: Array<[string, keyof BenchmarkStats['latency']]> = [
+      ['Min', 'min'],
+      ['Mean', 'mean'],
+      ['Median (P50)', 'median'],
+      ['P75', 'p75'],
+      ['P95', 'p95'],
+      ['P99', 'p99'],
+      ['P99.9', 'p999'],
+      ['Max', 'max'],
+    ];
+
+    metrics.forEach(([label, key]) => {
+      const direct = directStats.latency[key];
+      const mesh = meshStats.latency[key];
+      console.log(
+        `  ${label.padEnd(15)} Direct=${formatMs(direct).padEnd(10)} Mesh=${formatMs(mesh).padEnd(10)} Overhead=${formatOverhead(direct, mesh)}`
+      );
+    });
+
+    console.log('\nSUCCESS RATE:');
+    console.log(`  Direct:  ${(directStats.successRate * 100).toFixed(3)}%`);
+    console.log(`  Mesh:    ${(meshStats.successRate * 100).toFixed(3)}%`);
+  }
+}
+
+class Semaphore {
+  private permits: number;
+  private waiting: Array<() => void> = [];
+
+  constructor(permits: number) {
+    this.permits = permits;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.permits > 0) {
+      this.permits--;
+      return;
+    }
+    await new Promise<void>(resolve => this.waiting.push(resolve));
+  }
+
+  release(): void {
+    if (this.waiting.length > 0) {
+      const next = this.waiting.shift()!;
+      next();
+    } else {
+      this.permits++;
+    }
+  }
+}
+
+// การใช้งาน
+async function main() {
+  const benchmark = new ServiceMeshBenchmark();
+
+  const commonConfig = {
+    concurrency: 50,
+    totalRequests: 10000,
+    warmupRequests: 1000,
+    requestTimeoutMs: 5000,
+  };
+
+  // Benchmark direct access (no mesh proxy)
+  const directStats = await benchmark.runBenchmark('Direct (No Mesh)', {
+    ...commonConfig,
+    targetUrl: process.env.DIRECT_URL || 'http://order-service-direct:8080/api/orders',
+  });
+
+  // Benchmark through service mesh
+  const meshStats = await benchmark.runBenchmark('Through Linkerd Mesh', {
+    ...commonConfig,
+    targetUrl: process.env.MESH_URL || 'http://order-service:8080/api/orders',
+  });
+
+  // Print comparison
+  benchmark.compareResults(directStats, meshStats);
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 78.7 Multi-cluster Istio Setup
+
+### ServiceEntry และ Cross-cluster VirtualService
+
+```yaml
+# multi-cluster-istio.yaml
+# ====================================================
+# Cluster 1 (Primary) - us-east-1
+# ====================================================
+
+# ServiceEntry สำหรับ remote service ใน cluster 2
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: order-service-cluster2
+  namespace: production
+spec:
+  hosts:
+    - order-service.cluster2.global
+  location: MESH_INTERNAL
+  ports:
+    - number: 80
+      name: http
+      protocol: HTTP
+    - number: 443
+      name: https
+      protocol: HTTPS
+  resolution: DNS
+  addresses:
+    - 240.0.0.2    # Virtual IP สำหรับ cross-cluster routing
+  endpoints:
+    - address: east-west-gateway.cluster2.example.com
+      ports:
+        http: 15443  # Istio east-west gateway port
+      labels:
+        topology.istio.io/cluster: cluster2
+        topology.istio.io/region: ap-southeast-1
+---
+# VirtualService สำหรับ cross-cluster traffic management
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service-global
+  namespace: production
+spec:
+  hosts:
+    - order-service
+    - order-service.production.svc.cluster.local
+  http:
+    - name: "canary-cluster2"
+      match:
+        - headers:
+            x-region:
+              exact: "ap-southeast-1"
+      route:
+        - destination:
+            host: order-service.cluster2.global
+            port:
+              number: 80
+          weight: 100
+    - name: "locality-aware-routing"
+      route:
+        - destination:
+            host: order-service.production.svc.cluster.local
+            port:
+              number: 80
+          weight: 80
+          headers:
+            request:
+              set:
+                x-forwarded-cluster: cluster1
+        - destination:
+            host: order-service.cluster2.global
+            port:
+              number: 80
+          weight: 20
+          headers:
+            request:
+              set:
+                x-forwarded-cluster: cluster2
+      retries:
+        attempts: 3
+        perTryTimeout: 5s
+        retryOn: "gateway-error,connect-failure,retriable-4xx"
+      timeout: 30s
+---
+# DestinationRule สำหรับ multi-cluster
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: order-service-global-dr
+  namespace: production
+spec:
+  host: order-service
+  trafficPolicy:
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        distribute:
+          - from: "us-east-1/*"
+            to:
+              "us-east-1/*": 80
+              "ap-southeast-1/*": 20
+          - from: "ap-southeast-1/*"
+            to:
+              "ap-southeast-1/*": 80
+              "us-east-1/*": 20
+        failover:
+          - from: us-east-1
+            to: ap-southeast-1
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 100
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  subsets:
+    - name: cluster1
+      labels:
+        topology.istio.io/cluster: cluster1
+    - name: cluster2
+      labels:
+        topology.istio.io/cluster: cluster2
+---
+# East-West Gateway สำหรับ cross-cluster traffic
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: east-west-gateway
+  namespace: istio-system
+  labels:
+    topology.istio.io/network: network1
+spec:
+  selector:
+    istio: eastwestgateway
+    app: istio-eastwestgateway
+  servers:
+    - port:
+        number: 15443
+        name: tls
+        protocol: TLS
+      tls:
+        mode: AUTO_PASSTHROUGH
+      hosts:
+        - "*.local"
+---
+# IstioOperator สำหรับ multi-cluster east-west gateway
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: eastwest
+  namespace: istio-system
+spec:
+  revision: ""
+  profile: empty
+  components:
+    ingressGateways:
+      - name: istio-eastwestgateway
+        label:
+          istio: eastwestgateway
+          app: istio-eastwestgateway
+          topology.istio.io/network: network1
+        enabled: true
+        k8s:
+          env:
+            - name: ISTIO_META_REQUESTED_NETWORK_VIEW
+              value: network1
+          service:
+            ports:
+              - name: status-port
+                port: 15021
+                targetPort: 15021
+              - name: tls
+                port: 15443
+                targetPort: 15443
+              - name: tls-istiod
+                port: 15012
+                targetPort: 15012
+              - name: tls-webhook
+                port: 15017
+                targetPort: 15017
+  values:
+    gateways:
+      istio-ingressgateway:
+        injectionTemplate: gateway
+    global:
+      network: network1
+```
+
+---
+
+## 78.8 Service Mesh Migration Strategy
+
+### Gradual Opt-in with Namespace Injection
+
+```yaml
+# migration-strategy.yaml
+
+# Phase 1: Enable injection per namespace (opt-in)
+# เริ่มจาก non-critical namespace ก่อน
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    istio-injection: enabled       # Enable Istio injection
+    # linkerd.io/inject: enabled   # หรือ Linkerd injection
+  annotations:
+    mesh.phase: "1"
+    mesh.migrated-at: "2024-01-15"
+---
+# Phase 2: Production namespace injection
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    istio-injection: enabled
+  annotations:
+    mesh.phase: "2"
+    mesh.migrated-at: "2024-02-01"
+---
+# PeerAuthentication: เริ่มจาก PERMISSIVE ก่อน
+# ยอมรับทั้ง mTLS และ plaintext ระหว่าง migration
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: PERMISSIVE   # Phase 1: PERMISSIVE
+    # mode: STRICT     # Phase 2: STRICT (หลัง migration เสร็จ)
+---
+# AuthorizationPolicy: เริ่มจาก ALLOW_ALL ก่อน
+# ค่อยๆ เพิ่ม restrictive policy
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-all-during-migration
+  namespace: production
+spec:
+  {} # Empty spec = allow all
+  # หลัง migration เสร็จให้เปลี่ยนเป็น restrictive policy:
+  # rules:
+  # - from:
+  #   - source:
+  #       principals: ["cluster.local/ns/production/sa/*"]
+---
+# DestinationRule สำหรับ gradual mTLS
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: order-service-migration
+  namespace: production
+spec:
+  host: order-service
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL     # Use Istio-managed mTLS
+  # subsets แยก migrated vs non-migrated pods
+  subsets:
+    - name: v1-with-mesh
+      labels:
+        mesh: enabled
+      trafficPolicy:
+        tls:
+          mode: ISTIO_MUTUAL
+    - name: v1-no-mesh
+      labels:
+        mesh: disabled
+      trafficPolicy:
+        tls:
+          mode: DISABLE
+```
+
+### TypeScript Migration Tracker
+
+```typescript
+// migration-tracker.ts
+import * as k8s from '@kubernetes/client-node';
+
+interface MigrationStatus {
+  namespace: string;
+  phase: number;
+  injectionEnabled: boolean;
+  mtlsMode: 'PERMISSIVE' | 'STRICT' | 'DISABLE' | 'UNKNOWN';
+  totalPods: number;
+  meshedPods: number;
+  meshPercentage: number;
+  readyForNextPhase: boolean;
+}
+
+class MeshMigrationTracker {
+  private k8sCoreApi: k8s.CoreV1Api;
+  private k8sCustomApi: k8s.CustomObjectsApi;
+
+  constructor() {
+    const kc = new k8s.KubeConfig();
+    kc.loadFromDefault();
+    this.k8sCoreApi = kc.makeApiClient(k8s.CoreV1Api);
+    this.k8sCustomApi = kc.makeApiClient(k8s.CustomObjectsApi);
+  }
+
+  async getNamespaceMigrationStatus(namespace: string): Promise<MigrationStatus> {
+    const [nsInfo, pods, peerAuth] = await Promise.all([
+      this.k8sCoreApi.readNamespace(namespace),
+      this.k8sCoreApi.listNamespacedPod(namespace),
+      this.getPeerAuthentication(namespace),
+    ]);
+
+    const labels = nsInfo.body.metadata?.labels ?? {};
+    const annotations = nsInfo.body.metadata?.annotations ?? {};
+
+    const injectionEnabled = labels['istio-injection'] === 'enabled' ||
+      labels['linkerd.io/inject'] === 'enabled';
+
+    const totalPods = pods.body.items.length;
+    const meshedPods = pods.body.items.filter(pod => {
+      const podAnnotations = pod.metadata?.annotations ?? {};
+      // Istio สร้าง container 'istio-proxy'; Linkerd สร้าง 'linkerd-proxy'
+      const containers = pod.spec?.initContainers?.map(c => c.name) ?? [];
+      return containers.includes('istio-init') || containers.includes('linkerd-init');
+    }).length;
+
+    const meshPercentage = totalPods > 0 ? (meshedPods / totalPods) * 100 : 0;
+
+    return {
+      namespace,
+      phase: parseInt(annotations['mesh.phase'] ?? '0'),
+      injectionEnabled,
+      mtlsMode: peerAuth ?? 'UNKNOWN',
+      totalPods,
+      meshedPods,
+      meshPercentage,
+      readyForNextPhase: meshPercentage >= 95,
+    };
+  }
+
+  private async getPeerAuthentication(
+    namespace: string
+  ): Promise<'PERMISSIVE' | 'STRICT' | 'DISABLE' | null> {
+    try {
+      const result = await this.k8sCustomApi.getNamespacedCustomObject(
+        'security.istio.io',
+        'v1beta1',
+        namespace,
+        'peerauthentications',
+        'default'
+      ) as any;
+
+      return result.body?.spec?.mtls?.mode ?? null;
+    } catch {
       return null;
     }
   }
 
-  async set(key: string, value: any, ttlSeconds?: number): Promise<void> {
-    const serialized = JSON.stringify(value);
-    if (ttlSeconds) {
-      await this.cluster.setex(key, ttlSeconds, serialized);
-    } else {
-      await this.cluster.set(key, serialized);
-    }
-  }
+  async reportMigrationStatus(namespaces: string[]): Promise<void> {
+    console.log('\n=== Service Mesh Migration Status ===\n');
 
-  // Multi-get for batch operations
-  async mget<T>(keys: string[]): Promise<Array<T | null>> {
-    if (keys.length === 0) return [];
-    
-    try {
-      const values = await this.cluster.mget(...keys);
-      return values.map((v) => (v ? JSON.parse(v) : null));
-    } catch {
-      return keys.map(() => null);
-    }
-  }
+    const statuses = await Promise.all(
+      namespaces.map(ns => this.getNamespaceMigrationStatus(ns))
+    );
 
-  // Pipeline for batch writes
-  async mset(entries: Array<{ key: string; value: any; ttl?: number }>): Promise<void> {
-    const pipeline = this.cluster.pipeline();
-    for (const entry of entries) {
-      if (entry.ttl) {
-        pipeline.setex(entry.key, entry.ttl, JSON.stringify(entry.value));
-      } else {
-        pipeline.set(entry.key, JSON.stringify(entry.value));
-      }
-    }
-    await pipeline.exec();
-  }
-
-  getStats(): typeof this.stats & { hitRate: number } {
-    const total = this.stats.hits + this.stats.misses;
-    return {
-      ...this.stats,
-      hitRate: total > 0 ? this.stats.hits / total : 0,
-    };
+    statuses.forEach(status => {
+      const pct = status.meshPercentage.toFixed(0);
+      const bar = '█'.repeat(Math.floor(status.meshPercentage / 5)).padEnd(20, '░');
+      const ready = status.readyForNextPhase ? '✅' : '⏳';
+      
+      console.log(`Namespace: ${status.namespace} (Phase ${status.phase}) ${ready}`);
+      console.log(`  Injection: ${status.injectionEnabled ? 'enabled' : 'disabled'}`);
+      console.log(`  mTLS Mode: ${status.mtlsMode}`);
+      console.log(`  Meshed Pods: ${status.meshedPods}/${status.totalPods}`);
+      console.log(`  Progress: [${bar}] ${pct}%`);
+      console.log('');
+    });
   }
 }
+
+async function main() {
+  const tracker = new MeshMigrationTracker();
+  await tracker.reportMigrationStatus([
+    'development',
+    'staging',
+    'production',
+  ]);
+}
+
+main().catch(console.error);
 ```
 
 ---
 
-## สรุป
+## 78.9 Hybrid Mesh: VM WorkloadEntry
 
-บทนี้ครอบคลุม Microservices Scalability Patterns อย่างครบถ้วน:
+### WorkloadEntry สำหรับ VM Registration
 
-1. **Horizontal Scaling** - Stateless service design, idempotent operations
-2. **Session Management** - Distributed session store ด้วย Redis, session limit enforcement
-3. **Read/Write Splitting** - Weighted round-robin replica selection, lag monitoring
-4. **Database Federation** - Consistent hash ring, scatter-gather pattern
-5. **Message Queue Scaling** - Kafka consumer groups, retry queues, dead letter topics
-6. **Auto-scaling** - HPA, KEDA with custom metrics, predictive scaling
-7. **Connection Pooling** - PgBouncer transaction mode สำหรับ microservices
-8. **Cache Scaling** - Redis Cluster with read replica routing
+```yaml
+# vm-workload.yaml
+# สำหรับ VM ที่อยู่นอก Kubernetes cluster
 
-Key Takeaways:
-- Stateless services คือ prerequisite สำหรับ horizontal scaling
-- ใช้ session store แบบ distributed ไม่ใช่ sticky sessions
-- Read/write splitting ช่วยให้ database scale ได้โดยไม่แตะ schema
-- Predictive scaling ช่วยลด response time ช่วง traffic spike
-- KEDA ให้ event-driven scaling ที่ละเอียดกว่า standard HPA
-- Connection pooling ด้วย PgBouncer เป็น must-have สำหรับ microservices ขนาดใหญ่
+# WorkloadEntry ลงทะเบียน VM ใน mesh
+apiVersion: networking.istio.io/v1beta1
+kind: WorkloadEntry
+metadata:
+  name: legacy-db-server
+  namespace: production
+  annotations:
+    # VM's IP address
+    proxy.istio.io/config: |
+      holdApplicationUntilProxyStarts: true
+spec:
+  address: 10.0.0.50          # VM's private IP
+  labels:
+    app: legacy-db
+    version: v1
+    instance: vm-us-east-1a
+    topology.istio.io/network: vm-network
+  serviceAccount: legacy-db-sa
+  network: vm-network
+  locality: us-east-1a
+  ports:
+    mysql:
+      number: 3306
+      protocol: TCP
+    redis:
+      number: 6379
+      protocol: TCP
+---
+# ServiceEntry สร้าง mesh representation สำหรับ VM
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: legacy-db-service
+  namespace: production
+spec:
+  hosts:
+    - legacy-db.production.svc.cluster.local
+  ports:
+    - number: 3306
+      name: mysql
+      protocol: TCP
+    - number: 6379
+      name: redis
+      protocol: TCP
+  location: MESH_INTERNAL
+  resolution: STATIC
+  workloadSelector:
+    labels:
+      app: legacy-db
+---
+# Sidecar resource สำหรับ VM
+# กำหนด traffic scope สำหรับ VM proxy
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: legacy-db-sidecar
+  namespace: production
+spec:
+  workloadSelector:
+    labels:
+      app: legacy-db
+  ingress:
+    - port:
+        number: 3306
+        protocol: TCP
+        name: mysql
+      defaultEndpoint: "127.0.0.1:3306"
+    - port:
+        number: 6379
+        protocol: TCP
+        name: redis
+      defaultEndpoint: "127.0.0.1:6379"
+  egress:
+    - hosts:
+        - "production/*"
+        - "istio-system/*"
+---
+# WorkloadGroup ใช้สำหรับ auto-registration ของ VM fleet
+apiVersion: networking.istio.io/v1beta1
+kind: WorkloadGroup
+metadata:
+  name: legacy-db-group
+  namespace: production
+spec:
+  metadata:
+    labels:
+      app: legacy-db
+      version: v1
+    annotations:
+      proxy.istio.io/config: |
+        concurrency: 2
+  template:
+    ports:
+      mysql:
+        number: 3306
+        protocol: TCP
+    serviceAccount: legacy-db-sa
+    network: vm-network
+  probe:
+    initialDelaySeconds: 5
+    timeoutSeconds: 3
+    periodSeconds: 30
+    successThreshold: 1
+    failureThreshold: 3
+    tcpSocket:
+      port: 3306
+```
+
+### Script ติดตั้ง Istio Proxy บน VM
+
+```bash
+#!/bin/bash
+# install-vm-proxy.sh
+# รันบน VM ที่ต้องการเข้า mesh
+
+set -euo pipefail
+
+ISTIO_VERSION="1.20.0"
+CLUSTER_NAME="production"
+CLUSTER_NETWORK="vm-network"
+ISTIO_NAMESPACE="istio-system"
+SERVICE_NAMESPACE="production"
+SERVICE_ACCOUNT="legacy-db-sa"
+
+echo "=== Installing Istio Proxy on VM ==="
+
+# 1. ดาวน์โหลด Istio
+curl -L https://istio.io/downloadIstio | ISTIO_VERSION=${ISTIO_VERSION} sh -
+export PATH=$PWD/istio-${ISTIO_VERSION}/bin:$PATH
+
+# 2. สร้าง token สำหรับ VM authentication
+kubectl create token ${SERVICE_ACCOUNT} \
+  --namespace ${SERVICE_NAMESPACE} \
+  --duration=8760h \
+  > /tmp/vm-token.txt
+
+# 3. ดึง root certificate
+kubectl -n ${ISTIO_NAMESPACE} get configmap istio-ca-root-cert \
+  -o jsonpath='{.data.root-cert\.pem}' > /tmp/root-cert.pem
+
+# 4. สร้าง cluster env file
+cat > /tmp/cluster.env << EOF
+ISTIO_SERVICE_NAMESPACE=${SERVICE_NAMESPACE}
+ISTIO_SERVICE=legacy-db
+ISTIO_PILOT_AGENT_OPTS="--domain ${SERVICE_NAMESPACE}.svc.cluster.local"
+CLUSTER_ENV_CLUSTER=${CLUSTER_NAME}
+EOF
+
+# 5. ติดตั้ง proxy
+sudo mkdir -p /etc/istio/proxy /etc/certs /var/lib/istio/envoy
+
+# Copy files
+sudo cp /tmp/root-cert.pem /etc/certs/root-cert.pem
+sudo cp /tmp/vm-token.txt /var/lib/istio/envoy/sds-grpc.token
+sudo cp /tmp/cluster.env /etc/istio/proxy/cluster.env
+
+# 6. ติดตั้ง Debian package
+curl -LO https://storage.googleapis.com/istio-release/releases/${ISTIO_VERSION}/deb/istio-sidecar.deb
+sudo dpkg -i istio-sidecar.deb
+
+# 7. เริ่ม istio.service
+sudo systemctl enable istio
+sudo systemctl start istio
+
+echo "VM proxy installed and started successfully"
+sudo systemctl status istio
+```
+
+---
+
+## 78.10 Debugging with istioctl
+
+### คำสั่ง Debug ที่สำคัญ
+
+```bash
+# ============================================
+# istioctl analyze - ตรวจสอบ mesh configuration
+# ============================================
+
+# วิเคราะห์ namespace เดียว
+istioctl analyze --namespace production
+
+# วิเคราะห์ทั้ง cluster
+istioctl analyze --all-namespaces
+
+# วิเคราะห์ไฟล์ YAML ก่อน apply
+istioctl analyze -f my-virtualservice.yaml
+
+# Output แบบ JSON
+istioctl analyze --namespace production -o json
+
+# ============================================
+# proxy-status - ดู sync status ของ proxy
+# ============================================
+
+# ดู sync status ทั้งหมด
+istioctl proxy-status
+
+# ดู specific pod
+istioctl proxy-status <pod-name>.<namespace>
+
+# ============================================
+# proxy-config - ดู Envoy configuration
+# ============================================
+
+# ดู listeners ของ pod
+istioctl proxy-config listeners <pod-name> -n <namespace>
+
+# ดู routes
+istioctl proxy-config routes <pod-name> -n <namespace>
+
+# ดู clusters
+istioctl proxy-config clusters <pod-name> -n <namespace>
+
+# ดู endpoints
+istioctl proxy-config endpoints <pod-name> -n <namespace>
+
+# ดู secrets (mTLS certs)
+istioctl proxy-config secret <pod-name> -n <namespace>
+
+# ดู bootstrap config
+istioctl proxy-config bootstrap <pod-name> -n <namespace>
+
+# ============================================
+# xtoproxy-status - ดู xDS sync
+# ============================================
+istioctl experimental proxy-status
+
+# ============================================
+# debug - ดู debug info
+# ============================================
+istioctl debug <pod-name> -n <namespace> --port 15000
+
+# ============================================
+# Envoy admin API โดยตรง
+# ============================================
+
+# Port-forward Envoy admin
+kubectl port-forward <pod-name> 15000:15000 -n <namespace>
+
+# ดู stats
+curl http://localhost:15000/stats
+
+# ดู config_dump
+curl http://localhost:15000/config_dump | jq .
+
+# ดู clusters
+curl http://localhost:15000/clusters
+
+# ดู server info
+curl http://localhost:15000/server_info
+
+# Reset stats counter
+curl -X POST http://localhost:15000/reset_counters
+```
+
+### TypeScript Istio Debug Client
+
+```typescript
+// istio-debug-client.ts
+import { execSync, ExecSyncOptionsWithStringEncoding } from 'child_process';
+
+interface ProxyStatus {
+  name: string;
+  namespace: string;
+  clustersStatus: string;
+  listenersStatus: string;
+  routesStatus: string;
+  endpointsStatus: string;
+  version: string;
+}
+
+interface AnalysisMessage {
+  code: string;
+  level: 'Error' | 'Warning' | 'Info';
+  message: string;
+  origin?: string;
+  reference?: string;
+}
+
+interface AnalysisResult {
+  messages: AnalysisMessage[];
+  errors: AnalysisMessage[];
+  warnings: AnalysisMessage[];
+}
+
+class IstioctlDebugClient {
+  private execOptions: ExecSyncOptionsWithStringEncoding = {
+    encoding: 'utf8',
+    timeout: 30000,
+  };
+
+  private exec(command: string): string {
+    try {
+      return execSync(command, this.execOptions).trim();
+    } catch (err: any) {
+      throw new Error(`Command failed: ${command}\n${err.stderr ?? err.message}`);
+    }
+  }
+
+  analyzeNamespace(namespace: string): AnalysisResult {
+    const output = this.exec(
+      `istioctl analyze --namespace ${namespace} -o json 2>/dev/null`
+    );
+    
+    let messages: AnalysisMessage[] = [];
+    try {
+      const parsed = JSON.parse(output);
+      messages = (parsed.messages ?? []).map((m: any) => ({
+        code: m.code,
+        level: m.level,
+        message: m.message,
+        origin: m.origin,
+        reference: m.reference,
+      }));
+    } catch {
+      // Parse failed, try line by line
+    }
+
+    return {
+      messages,
+      errors: messages.filter(m => m.level === 'Error'),
+      warnings: messages.filter(m => m.level === 'Warning'),
+    };
+  }
+
+  getProxyStatus(podName?: string, namespace?: string): ProxyStatus[] {
+    const cmd = podName
+      ? `istioctl proxy-status ${podName}.${namespace ?? 'default'} -o json`
+      : `istioctl proxy-status -o json`;
+
+    const output = this.exec(cmd);
+    
+    try {
+      const data = JSON.parse(output);
+      return (Array.isArray(data) ? data : [data]).map((item: any) => ({
+        name: item.name ?? item.podName ?? '',
+        namespace: item.namespace ?? '',
+        clustersStatus: item.clusters ?? 'UNKNOWN',
+        listenersStatus: item.listeners ?? 'UNKNOWN',
+        routesStatus: item.routes ?? 'UNKNOWN',
+        endpointsStatus: item.endpoints ?? 'UNKNOWN',
+        version: item.version ?? '',
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  getProxyListeners(podName: string, namespace: string): any[] {
+    const output = this.exec(
+      `istioctl proxy-config listeners ${podName}.${namespace} -o json`
+    );
+    
+    try {
+      return JSON.parse(output);
+    } catch {
+      return [];
+    }
+  }
+
+  getProxyClusters(podName: string, namespace: string): any[] {
+    const output = this.exec(
+      `istioctl proxy-config clusters ${podName}.${namespace} -o json`
+    );
+    
+    try {
+      return JSON.parse(output);
+    } catch {
+      return [];
+    }
+  }
+
+  getProxyEndpoints(podName: string, namespace: string): any[] {
+    const output = this.exec(
+      `istioctl proxy-config endpoints ${podName}.${namespace} -o json`
+    );
+    
+    try {
+      return JSON.parse(output);
+    } catch {
+      return [];
+    }
+  }
+
+  checkMtlsStatus(
+    sourcePod: string,
+    sourceNs: string,
+    destinationService: string,
+    destinationNs: string
+  ): string {
+    return this.exec(
+      `istioctl authn tls-check ${sourcePod}.${sourceNs} ` +
+      `${destinationService}.${destinationNs}.svc.cluster.local`
+    );
+  }
+
+  runDiagnostics(namespace: string): void {
+    console.log(`\n=== Istio Diagnostics for namespace: ${namespace} ===\n`);
+
+    // 1. Analyze
+    console.log('1. Configuration Analysis:');
+    try {
+      const analysis = this.analyzeNamespace(namespace);
+      if (analysis.errors.length === 0 && analysis.warnings.length === 0) {
+        console.log('   No issues found');
+      } else {
+        analysis.errors.forEach(e => 
+          console.log(`   [ERROR] ${e.code}: ${e.message}`)
+        );
+        analysis.warnings.forEach(w => 
+          console.log(`   [WARN] ${w.code}: ${w.message}`)
+        );
+      }
+    } catch (err) {
+      console.log(`   Failed: ${err}`);
+    }
+
+    // 2. Proxy sync status
+    console.log('\n2. Proxy Sync Status:');
+    try {
+      const statuses = this.getProxyStatus();
+      const nsStatuses = statuses.filter(s => s.namespace === namespace);
+      
+      if (nsStatuses.length === 0) {
+        console.log('   No proxies found');
+      } else {
+        nsStatuses.forEach(s => {
+          const allSynced = [
+            s.clustersStatus,
+            s.listenersStatus,
+            s.routesStatus,
+            s.endpointsStatus,
+          ].every(status => status === 'SYNCED');
+          
+          const icon = allSynced ? '✅' : '❌';
+          console.log(`   ${icon} ${s.name}`);
+          if (!allSynced) {
+            console.log(`      Clusters: ${s.clustersStatus}`);
+            console.log(`      Listeners: ${s.listenersStatus}`);
+            console.log(`      Routes: ${s.routesStatus}`);
+            console.log(`      Endpoints: ${s.endpointsStatus}`);
+          }
+        });
+      }
+    } catch (err) {
+      console.log(`   Failed: ${err}`);
+    }
+
+    console.log('\n=== Diagnostics Complete ===');
+  }
+}
+
+// การใช้งาน
+async function main() {
+  const client = new IstioctlDebugClient();
+  
+  const namespace = process.argv[2] || 'production';
+  client.runDiagnostics(namespace);
+}
+
+main().catch(console.error);
+```
+
+---
+
+## สรุปบทที่ 78
+
+| หัวข้อ | สิ่งที่เรียนรู้ |
+|--------|----------------|
+| Service Mesh Comparison | Istio vs Linkerd vs Consul Connect - feature, performance, complexity |
+| Linkerd Setup | Installation, namespace injection, TypeScript health check client |
+| Canary Deployment | TrafficSplit YAML 90/10, TypeScript canary controller |
+| Golden Signals | Error rate, latency, traffic, saturation dashboard |
+| mTLS Rotation | Certificate lifecycle, auto-rotation TypeScript script |
+| Performance Benchmark | Direct vs mesh overhead measurement |
+| Multi-cluster Istio | ServiceEntry, cross-cluster VirtualService, east-west gateway |
+| Migration Strategy | Gradual opt-in, PERMISSIVE → STRICT mTLS |
+| VM Integration | WorkloadEntry, WorkloadGroup, VM proxy install |
+| Debugging | istioctl analyze, proxy-status, proxy-config |
+
+### Key Takeaways
+
+1. **เลือก Service Mesh ให้เหมาะกับทีม**: Linkerd สำหรับ simplicity, Istio สำหรับ enterprise features
+2. **ทำ Canary Deployment ด้วย TrafficSplit**: ลด risk ของ deployment ใหม่
+3. **Monitor Golden Signals เสมอ**: Latency, Traffic, Errors, Saturation
+4. **Rotate mTLS Certificates อัตโนมัติ**: ลด security risk
+5. **Migration ควรทำแบบ Gradual**: PERMISSIVE ก่อน STRICT
+6. **Debug ด้วย istioctl**: analyze, proxy-status, proxy-config เป็นเครื่องมือหลัก
+
+---
+
+*Part 78 จบแล้ว - ต่อไปบทที่ 79: Scalability Patterns*

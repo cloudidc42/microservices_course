@@ -1,963 +1,420 @@
-# Part 63: Microservices Migration Strategies
+# Part 63: Database Migration Strategies
 
 ## บทนำ
 
-การ Migrate จาก Monolith ไปสู่ Microservices เป็นกระบวนการที่ต้องทำอย่างระมัดระวัง ไม่สามารถทำได้ในครั้งเดียว บทนี้จะครอบคลุม Patterns ที่ใช้จริงในองค์กรต่างๆ เช่น Strangler Fig Pattern, Anti-Corruption Layer, Branch by Abstraction, Parallel Run Pattern และกลยุทธ์การ Migrate ฐานข้อมูล
+Database Migration เป็นหนึ่งในส่วนที่ยากที่สุดของ Microservices เพราะต้องทำ
+โดยไม่ให้ระบบหยุดทำงาน (Zero-Downtime) บทนี้จะครอบคลุมกลยุทธ์และเครื่องมือ
+ที่ใช้จริงใน Production
 
-## 1. Strangler Fig Pattern
+---
 
-Strangler Fig Pattern ค่อยๆ แทนที่ Monolith ทีละส่วน โดยเริ่มจาก Feature ที่เป็น High Value หรือ High Change Rate
+## 1. หลักการ Zero-Downtime Migration
 
-### 1.1 API Gateway เป็น Traffic Router
+### ปัญหาที่เกิดขึ้นบ่อย
+
+```
+ปัญหา Schema Migration แบบ Naive:
+1. Stop application
+2. Run ALTER TABLE
+3. Start application
+→ Downtime!
+
+ปัญหาของ Schema ที่เข้ากันไม่ได้:
+Old code: SELECT name FROM users
+New schema: column "name" ได้เปลี่ยนเป็น "full_name"
+→ Error!
+```
+
+### Expand-Contract Pattern
+
+```
+Phase 1: EXPAND (เพิ่ม column ใหม่)
+  - Add column full_name (nullable)
+  - Deploy code ที่ write ทั้ง name และ full_name
+  - ทำ backfill: full_name = name
+
+Phase 2: CONTRACT (ลบ column เก่า)
+  - Deploy code ที่ read/write แค่ full_name
+  - Drop column name (หลังจาก verify ว่าทุกอย่างโอเค)
+```
+
+---
+
+## 2. node-pg-migrate
+
+### การติดตั้งและตั้งค่า
+
+```bash
+npm install node-pg-migrate pg
+npm install --save-dev @types/pg
+
+# เพิ่ม scripts ใน package.json
+```
+
+```json
+{
+  "scripts": {
+    "migrate:up": "node-pg-migrate up",
+    "migrate:down": "node-pg-migrate down",
+    "migrate:create": "node-pg-migrate create",
+    "migrate:status": "node-pg-migrate status",
+    "migrate:redo": "node-pg-migrate redo",
+    "migrate:up:prod": "DATABASE_URL=$DATABASE_URL node-pg-migrate up"
+  }
+}
+```
+
+```javascript
+// database.json (config file สำหรับ node-pg-migrate)
+{
+  "development": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "orders_dev",
+    "user": "postgres",
+    "password": "password"
+  },
+  "test": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "orders_test",
+    "user": "postgres",
+    "password": "password"
+  },
+  "production": {
+    "connectionString": {
+      "ENV": "DATABASE_URL"
+    },
+    "ssl": {
+      "rejectUnauthorized": false
+    }
+  }
+}
+```
+
+### Migration Files
 
 ```typescript
-// src/gateway/strangler-fig-proxy.ts
-import express, { Request, Response } from 'express';
-import { createProxyMiddleware, Options } from 'http-proxy-middleware';
-import { FeatureFlagService } from '../feature-flags/feature-flag-service';
-import { logger } from '../utils/logger';
-import { MetricsCollector } from '../monitoring/metrics';
+// migrations/20240101000001_create_orders_table.ts
+import { MigrationBuilder, ColumnDefinitions } from 'node-pg-migrate';
 
-interface RouteConfig {
-  path: string;
-  method?: string;
-  target: 'monolith' | 'microservice';
-  microserviceUrl?: string;
-  featureFlag?: string;
-  trafficPercentage?: number;  // 0-100 สำหรับ Progressive Migration
-}
+export const shorthands: ColumnDefinitions | undefined = undefined;
 
-export class StranglerFigProxy {
-  private routes: RouteConfig[] = [];
+export async function up(pgm: MigrationBuilder): Promise<void> {
+  pgm.createTable('orders', {
+    id: {
+      type: 'uuid',
+      primaryKey: true,
+      default: pgm.func('gen_random_uuid()'),
+    },
+    customer_id: {
+      type: 'uuid',
+      notNull: true,
+    },
+    status: {
+      type: 'varchar(50)',
+      notNull: true,
+      default: 'pending',
+      check: "status IN ('pending', 'processing', 'completed', 'cancelled')",
+    },
+    total_amount: {
+      type: 'decimal(10, 2)',
+      notNull: true,
+    },
+    currency: {
+      type: 'varchar(3)',
+      notNull: true,
+      default: 'THB',
+    },
+    created_at: {
+      type: 'timestamptz',
+      notNull: true,
+      default: pgm.func('NOW()'),
+    },
+    updated_at: {
+      type: 'timestamptz',
+      notNull: true,
+      default: pgm.func('NOW()'),
+    },
+    deleted_at: {
+      type: 'timestamptz',
+    },
+  });
 
-  constructor(
-    private monolithUrl: string,
-    private featureFlags: FeatureFlagService,
-    private metrics: MetricsCollector
-  ) {}
+  pgm.createIndex('orders', 'customer_id', {
+    name: 'idx_orders_customer_id',
+  });
 
-  addRoute(config: RouteConfig): void {
-    this.routes.push(config);
-  }
+  pgm.createIndex('orders', 'status', {
+    name: 'idx_orders_status',
+  });
 
-  createMiddleware() {
-    return async (req: Request, res: Response, next: express.NextFunction) => {
-      const route = this.findMatchingRoute(req);
+  pgm.createIndex('orders', ['created_at', 'status'], {
+    name: 'idx_orders_created_at_status',
+  });
 
-      if (!route) {
-        return next();
-      }
-
-      const target = await this.determineTarget(req, route);
-      const targetUrl = target === 'microservice' && route.microserviceUrl
-        ? route.microserviceUrl
-        : this.monolithUrl;
-
-      logger.info('Routing request', {
-        path: req.path,
-        method: req.method,
-        target,
-        targetUrl,
-      });
-
-      this.metrics.increment('migration.request', {
-        path: route.path,
-        target,
-        method: req.method,
-      });
-
-      createProxyMiddleware({
-        target: targetUrl,
-        changeOrigin: true,
-        pathRewrite: target === 'microservice' ? this.getPathRewrite(route) : undefined,
-        on: {
-          error: (err, req, res) => {
-            logger.error('Proxy error', { err, path: req.url });
-            this.metrics.increment('migration.proxy_error', { target });
-          },
-        },
-      })(req, res, next);
-    };
-  }
-
-  private findMatchingRoute(req: Request): RouteConfig | null {
-    return this.routes.find(route => {
-      const pathMatch = req.path.startsWith(route.path);
-      const methodMatch = !route.method || route.method === req.method;
-      return pathMatch && methodMatch;
-    }) ?? null;
-  }
-
-  private async determineTarget(
-    req: Request,
-    route: RouteConfig
-  ): Promise<'monolith' | 'microservice'> {
-    // ถ้าไม่มี Microservice URL ยังคงส่งไป Monolith
-    if (!route.microserviceUrl) {
-      return 'monolith';
-    }
-
-    // ตรวจสอบ Feature Flag
-    if (route.featureFlag) {
-      const userId = (req as any).user?.id ?? req.ip ?? 'anonymous';
-      const flagEnabled = await this.featureFlags.isEnabled(
-        route.featureFlag,
-        { userId }
-      );
-
-      if (!flagEnabled) {
-        return 'monolith';
-      }
-    }
-
-    // Traffic Percentage Splitting
-    if (route.trafficPercentage !== undefined && route.trafficPercentage < 100) {
-      const random = Math.random() * 100;
-      return random < route.trafficPercentage ? 'microservice' : 'monolith';
-    }
-
-    return route.target;
-  }
-
-  private getPathRewrite(route: RouteConfig): Record<string, string> | undefined {
-    if (!route.microserviceUrl) return undefined;
-    // เช่น /api/orders/* -> /* ใน Order Microservice
-    return { [`^${route.path}`]: '' };
-  }
-}
-
-// ตัวอย่าง Migration Plan สำหรับ Thai E-commerce Monolith
-function setupStranglerFig(
-  featureFlags: FeatureFlagService,
-  metrics: MetricsCollector
-): StranglerFigProxy {
-  const proxy = new StranglerFigProxy(
-    'http://monolith.internal:8080',
-    featureFlags,
-    metrics
+  // Trigger สำหรับ auto-update updated_at
+  pgm.createFunction(
+    'update_updated_at_column',
+    [],
+    {
+      returns: 'trigger',
+      language: 'plpgsql',
+    },
+    `
+    BEGIN
+      NEW.updated_at = NOW();
+      RETURN NEW;
+    END;
+    `
   );
 
-  // Phase 1: Product Catalog (Low Risk, High Value)
-  proxy.addRoute({
-    path: '/api/products',
-    target: 'microservice',
-    microserviceUrl: 'http://product-service.internal:3001',
-    featureFlag: 'use_product_microservice',
-    trafficPercentage: 100, // Migration เสร็จแล้ว
+  pgm.createTrigger('orders', 'update_orders_updated_at', {
+    when: 'BEFORE',
+    operation: 'UPDATE',
+    function: 'update_updated_at_column',
+    level: 'ROW',
   });
+}
 
-  // Phase 2: User Profiles (กำลัง Migrate อยู่)
-  proxy.addRoute({
-    path: '/api/users',
-    target: 'microservice',
-    microserviceUrl: 'http://user-service.internal:3002',
-    featureFlag: 'use_user_microservice',
-    trafficPercentage: 50, // 50% Traffic ไปที่ Microservice
-  });
-
-  // Phase 3: Orders (เริ่ม Migrate)
-  proxy.addRoute({
-    path: '/api/orders',
-    target: 'microservice',
-    microserviceUrl: 'http://order-service.internal:3003',
-    featureFlag: 'use_order_microservice',
-    trafficPercentage: 10, // 10% Traffic ไปทดสอบ
-  });
-
-  // Phase 4: Payment (ยังอยู่ใน Monolith)
-  proxy.addRoute({
-    path: '/api/payments',
-    target: 'monolith',
-    // ยังไม่ Migrate เนื่องจาก High Risk
-  });
-
-  return proxy;
+export async function down(pgm: MigrationBuilder): Promise<void> {
+  pgm.dropTrigger('orders', 'update_orders_updated_at');
+  pgm.dropFunction('update_updated_at_column', []);
+  pgm.dropTable('orders');
 }
 ```
 
-## 2. Anti-Corruption Layer (ACL)
+```typescript
+// migrations/20240115000001_add_shipping_address.ts
+// Phase 1: EXPAND - เพิ่ม column ใหม่
+import { MigrationBuilder } from 'node-pg-migrate';
 
-ACL แปลง Interface ของ Monolith เก่าให้เข้ากับ Domain Model ใหม่
+export async function up(pgm: MigrationBuilder): Promise<void> {
+  // เพิ่ม shipping address columns ใหม่ (nullable เพื่อ backward compatibility)
+  pgm.addColumns('orders', {
+    shipping_address_street: {
+      type: 'varchar(255)',
+    },
+    shipping_address_city: {
+      type: 'varchar(100)',
+    },
+    shipping_address_postal_code: {
+      type: 'varchar(20)',
+    },
+    shipping_address_country: {
+      type: 'varchar(100)',
+    },
+  });
 
-### 2.1 Anti-Corruption Layer Implementation
+  // สร้าง index สำหรับ city เพื่อ analytics
+  pgm.createIndex('orders', 'shipping_address_city', {
+    name: 'idx_orders_shipping_city',
+    where: 'shipping_address_city IS NOT NULL',
+  });
+}
+
+export async function down(pgm: MigrationBuilder): Promise<void> {
+  pgm.dropIndex('orders', 'shipping_address_city', {
+    name: 'idx_orders_shipping_city',
+  });
+  pgm.dropColumns('orders', [
+    'shipping_address_street',
+    'shipping_address_city',
+    'shipping_address_postal_code',
+    'shipping_address_country',
+  ]);
+}
+```
 
 ```typescript
-// src/acl/monolith-adapter.ts
+// migrations/20240215000001_rename_customer_name.ts
+// Zero-downtime rename: ใช้ Expand-Contract Pattern
 
-// Domain Models (ใหม่)
-interface NewOrderModel {
-  id: string;
-  customerId: string;
-  items: Array<{
-    productId: string;
-    quantity: number;
-    unitPrice: number;
-    subtotal: number;
-  }>;
-  status: 'pending' | 'confirmed' | 'shipped' | 'delivered' | 'cancelled';
-  totalAmount: number;
-  currency: string;
-  shippingAddress: Address;
-  createdAt: Date;
-  updatedAt: Date;
+export async function up(pgm: MigrationBuilder): Promise<void> {
+  // Phase 1: Add new column
+  pgm.addColumn('customers', {
+    full_name: {
+      type: 'varchar(255)',
+    },
+  });
+
+  // Phase 2: Backfill data (ใน migration เดียวกัน)
+  pgm.sql('UPDATE customers SET full_name = name WHERE full_name IS NULL');
+
+  // Phase 3: Add NOT NULL constraint หลัง backfill
+  // (ทำหลังจาก deploy code ที่ write full_name ด้วย)
 }
 
-interface Address {
-  street: string;
-  district: string;
-  province: string;
-  postalCode: string;
-  country: string;
+export async function down(pgm: MigrationBuilder): Promise<void> {
+  pgm.dropColumn('customers', 'full_name');
+}
+```
+
+---
+
+## 3. Blue-Green Database Migration
+
+### Architecture
+
+```yaml
+# blue-green-migration.yaml
+# Blue = Old version, Green = New version
+
+# Stage 1: เตรียม Green database
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prepare-green-db
+spec:
+  template:
+    spec:
+      containers:
+        - name: db-migrator
+          image: registry.company.com/db-migrator:latest
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://user:pass@postgres-green:5432/orders"
+            - name: MIGRATION_DIRECTION
+              value: "up"
+          command: ["npm", "run", "migrate:up:prod"]
+      restartPolicy: Never
+```
+
+```typescript
+// src/database/blue-green-migration.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+
+interface MigrationPlan {
+  phase: 'expand' | 'migrate' | 'contract';
+  steps: string[];
+  canRollback: boolean;
 }
 
-// Legacy Monolith Models (เก่า)
-interface LegacyOrder {
-  order_id: string;
-  cust_id: string;
-  order_date: string;
-  total_price: number;
-  status_code: number; // 1=pending, 2=confirmed, 3=shipped, 4=delivered, 5=cancelled
-  items: string; // JSON string ของ items
-  ship_addr: string;
-  ship_city: string;
-  ship_zip: string;
-}
+@Injectable()
+export class BlueGreenMigrationService {
+  private readonly logger = new Logger(BlueGreenMigrationService.name);
 
-// Anti-Corruption Layer
-export class OrderAntiCorruptionLayer {
-  private statusMap: Record<number, NewOrderModel['status']> = {
-    1: 'pending',
-    2: 'confirmed',
-    3: 'shipped',
-    4: 'delivered',
-    5: 'cancelled',
-  };
+  async executeMigration(plan: MigrationPlan): Promise<void> {
+    this.logger.log(`Starting ${plan.phase} phase migration`);
 
-  private reverseStatusMap: Record<string, number> = {
-    pending: 1,
-    confirmed: 2,
-    shipped: 3,
-    delivered: 4,
-    cancelled: 5,
-  };
-
-  translateToNewModel(legacy: LegacyOrder): NewOrderModel {
-    let items: any[] = [];
-    
-    try {
-      const rawItems = JSON.parse(legacy.items);
-      items = rawItems.map((item: any) => ({
-        productId: item.prod_id,
-        quantity: parseInt(item.qty),
-        unitPrice: parseFloat(item.price),
-        subtotal: parseInt(item.qty) * parseFloat(item.price),
-      }));
-    } catch (error) {
-      items = [];
+    for (const step of plan.steps) {
+      this.logger.log(`Executing step: ${step}`);
+      await this.executeStep(step);
     }
 
-    // แปลง Address จาก Legacy Format
-    const addressParts = legacy.ship_addr?.split(',') ?? [];
-    const address: Address = {
-      street: addressParts[0]?.trim() ?? '',
-      district: addressParts[1]?.trim() ?? '',
-      province: legacy.ship_city ?? '',
-      postalCode: legacy.ship_zip ?? '',
-      country: 'TH',
-    };
+    this.logger.log(`${plan.phase} phase completed`);
+  }
+
+  private async executeStep(step: string): Promise<void> {
+    // Execute migration step
+    this.logger.debug(`Step: ${step}`);
+  }
+
+  // Validate ว่า new version compatible กับ old schema
+  async validateCompatibility(
+    oldSchemaVersion: string,
+    newSchemaVersion: string
+  ): Promise<{ compatible: boolean; issues: string[] }> {
+    const issues: string[] = [];
+
+    // ตรวจสอบ breaking changes
+    // ตัวอย่าง: ลบ column ที่ยังมี old code ใช้อยู่
+    const breakingChanges = await this.detectBreakingChanges(
+      oldSchemaVersion,
+      newSchemaVersion
+    );
+
+    issues.push(...breakingChanges);
 
     return {
-      id: legacy.order_id,
-      customerId: legacy.cust_id,
-      items,
-      status: this.statusMap[legacy.status_code] ?? 'pending',
-      totalAmount: legacy.total_price,
-      currency: 'THB',
-      shippingAddress: address,
-      createdAt: new Date(legacy.order_date),
-      updatedAt: new Date(legacy.order_date),
+      compatible: issues.length === 0,
+      issues,
     };
   }
 
-  translateToLegacyModel(order: NewOrderModel): Partial<LegacyOrder> {
-    return {
-      order_id: order.id,
-      cust_id: order.customerId,
-      order_date: order.createdAt.toISOString(),
-      total_price: order.totalAmount,
-      status_code: this.reverseStatusMap[order.status] ?? 1,
-      items: JSON.stringify(
-        order.items.map(item => ({
-          prod_id: item.productId,
-          qty: item.quantity.toString(),
-          price: item.unitPrice.toString(),
-        }))
-      ),
-      ship_addr: `${order.shippingAddress.street}, ${order.shippingAddress.district}`,
-      ship_city: order.shippingAddress.province,
-      ship_zip: order.shippingAddress.postalCode,
-    };
-  }
-}
-
-// ACL Service ที่ Wrap Legacy API
-export class LegacyOrderServiceACL {
-  private acl: OrderAntiCorruptionLayer;
-
-  constructor(
-    private legacyApiUrl: string,
-    private httpClient: any
-  ) {
-    this.acl = new OrderAntiCorruptionLayer();
-  }
-
-  async getOrder(orderId: string): Promise<NewOrderModel> {
-    // เรียก Legacy API
-    const response = await this.httpClient.get(
-      `${this.legacyApiUrl}/orders/${orderId}`
-    );
-    
-    const legacyOrder: LegacyOrder = response.data;
-    
-    // แปลงเป็น New Domain Model
-    return this.acl.translateToNewModel(legacyOrder);
-  }
-
-  async createOrder(order: Omit<NewOrderModel, 'id' | 'createdAt' | 'updatedAt'>): Promise<NewOrderModel> {
-    // แปลงเป็น Legacy Format
-    const legacyData = this.acl.translateToLegacyModel({
-      ...order,
-      id: '',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-
-    // ส่งไป Legacy API
-    const response = await this.httpClient.post(
-      `${this.legacyApiUrl}/orders`,
-      legacyData
-    );
-    
-    return this.acl.translateToNewModel(response.data);
-  }
-
-  async updateOrderStatus(
-    orderId: string,
-    status: NewOrderModel['status']
-  ): Promise<void> {
-    const legacyStatusCode = this.acl['reverseStatusMap'][status];
-    
-    await this.httpClient.patch(
-      `${this.legacyApiUrl}/orders/${orderId}`,
-      { status_code: legacyStatusCode }
-    );
+  private async detectBreakingChanges(
+    oldVersion: string,
+    newVersion: string
+  ): Promise<string[]> {
+    // Logic ตรวจสอบ breaking changes
+    return [];
   }
 }
 ```
 
-## 3. Branch by Abstraction
+---
 
-Branch by Abstraction ช่วยให้ Refactor Code ใน Monolith ก่อน Extract ออกเป็น Microservice
-
-### 3.1 Abstract Interface
+## 4. Rolling Migration
 
 ```typescript
-// src/abstractions/notification-service.ts
+// src/database/rolling-migration.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 
-// Step 1: สร้าง Abstract Interface
-export interface NotificationService {
-  sendSMS(phoneNumber: string, message: string): Promise<void>;
-  sendEmail(email: string, subject: string, body: string): Promise<void>;
-  sendPushNotification(userId: string, title: string, body: string): Promise<void>;
-  sendLineNotification(lineUserId: string, message: string): Promise<void>;
-}
+@Injectable()
+export class RollingMigrationService {
+  private readonly logger = new Logger(RollingMigrationService.name);
 
-// Step 2: Legacy Implementation (Monolith Code)
-export class LegacyNotificationService implements NotificationService {
-  async sendSMS(phoneNumber: string, message: string): Promise<void> {
-    // Legacy SMS implementation
-    console.log(`Legacy SMS to ${phoneNumber}: ${message}`);
-    // await legacyDb.insertNotification(...)
-  }
+  constructor(private readonly dataSource: DataSource) {}
 
-  async sendEmail(email: string, subject: string, body: string): Promise<void> {
-    // Legacy Email implementation
-    console.log(`Legacy Email to ${email}: ${subject}`);
-  }
+  // ทำ backfill แบบ batch เพื่อไม่ lock ทั้ง table
+  async batchBackfill(
+    tableName: string,
+    updateQuery: string,
+    batchSize = 1000,
+    delayMs = 100
+  ): Promise<{ totalUpdated: number }> {
+    let totalUpdated = 0;
+    let hasMore = true;
 
-  async sendPushNotification(userId: string, title: string, body: string): Promise<void> {
-    // Legacy Push implementation
-    console.log(`Legacy Push to ${userId}: ${title}`);
-  }
+    this.logger.log(`Starting batch backfill on ${tableName}`);
 
-  async sendLineNotification(lineUserId: string, message: string): Promise<void> {
-    // Legacy Line implementation  
-    console.log(`Legacy Line to ${lineUserId}: ${message}`);
-  }
-}
-
-// Step 3: New Microservice Implementation
-export class NotificationMicroserviceClient implements NotificationService {
-  constructor(
-    private baseUrl: string,
-    private apiKey: string
-  ) {}
-
-  async sendSMS(phoneNumber: string, message: string): Promise<void> {
-    await fetch(`${this.baseUrl}/sms`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.apiKey,
-      },
-      body: JSON.stringify({ phoneNumber, message }),
-    });
-  }
-
-  async sendEmail(email: string, subject: string, body: string): Promise<void> {
-    await fetch(`${this.baseUrl}/email`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.apiKey,
-      },
-      body: JSON.stringify({ email, subject, body }),
-    });
-  }
-
-  async sendPushNotification(userId: string, title: string, body: string): Promise<void> {
-    await fetch(`${this.baseUrl}/push`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.apiKey,
-      },
-      body: JSON.stringify({ userId, title, body }),
-    });
-  }
-
-  async sendLineNotification(lineUserId: string, message: string): Promise<void> {
-    await fetch(`${this.baseUrl}/line`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.apiKey,
-      },
-      body: JSON.stringify({ lineUserId, message }),
-    });
-  }
-}
-
-// Step 4: Factory ที่เลือก Implementation ตาม Feature Flag
-export class NotificationServiceFactory {
-  static create(
-    featureFlags: any,
-    config: {
-      microserviceUrl?: string;
-      apiKey?: string;
-    }
-  ): NotificationService {
-    const useMicroservice = process.env.USE_NOTIFICATION_MICROSERVICE === 'true';
-    
-    if (useMicroservice && config.microserviceUrl && config.apiKey) {
-      return new NotificationMicroserviceClient(
-        config.microserviceUrl,
-        config.apiKey
-      );
-    }
-    
-    return new LegacyNotificationService();
-  }
-}
-```
-
-## 4. Parallel Run Pattern
-
-Parallel Run เรียกทั้ง Old และ New Implementation พร้อมกัน แล้วเปรียบเทียบผลลัพธ์
-
-### 4.1 Parallel Run Framework
-
-```typescript
-// src/migration/parallel-run.ts
-import { logger } from '../utils/logger';
-import { MetricsCollector } from '../monitoring/metrics';
-
-interface ParallelRunResult<T> {
-  primaryResult: T;
-  secondaryResult?: T;
-  matched: boolean;
-  primaryDurationMs: number;
-  secondaryDurationMs?: number;
-  discrepancies?: string[];
-}
-
-interface ParallelRunConfig {
-  enabled: boolean;
-  recordDiscrepancies: boolean;
-  alertOnDiscrepancy: boolean;
-  secondaryTimeoutMs: number;
-}
-
-export class ParallelRunner<T> {
-  constructor(
-    private name: string,
-    private primaryFn: () => Promise<T>,
-    private secondaryFn: () => Promise<T>,
-    private compareFn: (primary: T, secondary: T) => { matched: boolean; discrepancies?: string[] },
-    private config: ParallelRunConfig,
-    private metrics: MetricsCollector
-  ) {}
-
-  async run(): Promise<T> {
-    const primaryStart = Date.now();
-    let primaryResult: T;
-    
-    try {
-      primaryResult = await this.primaryFn();
-    } catch (error) {
-      this.metrics.increment('parallel_run.primary_error', { name: this.name });
-      throw error;
-    }
-    
-    const primaryDurationMs = Date.now() - primaryStart;
-    
-    // ถ้า Parallel Run ไม่เปิดใช้งาน Return Primary Result ทันที
-    if (!this.config.enabled) {
-      return primaryResult;
-    }
-
-    // รัน Secondary ใน Background (ไม่ Block Primary)
-    this.runSecondary(primaryResult, primaryDurationMs).catch(error => {
-      logger.error('Parallel run secondary error', { name: this.name, error });
-    });
-
-    return primaryResult;
-  }
-
-  private async runSecondary(
-    primaryResult: T,
-    primaryDurationMs: number
-  ): Promise<void> {
-    const secondaryStart = Date.now();
-    
-    try {
-      const secondaryResult = await Promise.race([
-        this.secondaryFn(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error('Secondary timeout')),
-            this.config.secondaryTimeoutMs
-          )
-        ),
-      ]);
-      
-      const secondaryDurationMs = Date.now() - secondaryStart;
-      
-      const comparison = this.compareFn(primaryResult, secondaryResult);
-      
-      const result: ParallelRunResult<T> = {
-        primaryResult,
-        secondaryResult,
-        matched: comparison.matched,
-        primaryDurationMs,
-        secondaryDurationMs,
-        discrepancies: comparison.discrepancies,
-      };
-
-      this.metrics.increment('parallel_run.comparison', {
-        name: this.name,
-        matched: comparison.matched.toString(),
-      });
-
-      this.metrics.histogram('parallel_run.latency_diff', 
-        secondaryDurationMs - primaryDurationMs,
-        { name: this.name }
+    while (hasMore) {
+      const result = await this.dataSource.query(
+        `${updateQuery} LIMIT ${batchSize}`
       );
 
-      if (!comparison.matched) {
-        if (this.config.recordDiscrepancies) {
-          logger.warn('Parallel run discrepancy detected', {
-            name: this.name,
-            discrepancies: comparison.discrepancies,
-          });
-        }
+      const updated = result.rowCount || 0;
+      totalUpdated += updated;
 
-        if (this.config.alertOnDiscrepancy) {
-          // ส่ง Alert
-          logger.error('CRITICAL: Parallel run discrepancy', {
-            name: this.name,
-            discrepancies: comparison.discrepancies,
-          });
-        }
+      this.logger.log(`Updated ${totalUpdated} rows so far...`);
+
+      if (updated < batchSize) {
+        hasMore = false;
       } else {
-        logger.debug('Parallel run matched', {
-          name: this.name,
-          primaryDurationMs,
-          secondaryDurationMs,
-        });
+        // Pause เพื่อลด load บน database
+        await this.sleep(delayMs);
       }
-      
-    } catch (error) {
-      this.metrics.increment('parallel_run.secondary_error', { name: this.name });
-      logger.error('Secondary function failed in parallel run', {
-        name: this.name,
-        error,
-      });
-    }
-  }
-}
-
-// ตัวอย่าง: Parallel Run สำหรับ Order Price Calculation
-interface OrderTotal {
-  subtotal: number;
-  discount: number;
-  shipping: number;
-  tax: number;
-  total: number;
-}
-
-class OrderPricingParallelRun {
-  private runner: ParallelRunner<OrderTotal>;
-
-  constructor(
-    private legacyPricingService: any,
-    private newPricingService: any,
-    metrics: MetricsCollector
-  ) {
-    this.runner = new ParallelRunner(
-      'order_pricing',
-      () => this.legacyPricingService.calculate(),
-      () => this.newPricingService.calculate(),
-      (primary, secondary) => {
-        const discrepancies: string[] = [];
-        
-        const tolerance = 0.01; // 1 สตางค์ tolerance
-        
-        if (Math.abs(primary.subtotal - secondary.subtotal) > tolerance) {
-          discrepancies.push(
-            `Subtotal mismatch: ${primary.subtotal} vs ${secondary.subtotal}`
-          );
-        }
-        
-        if (Math.abs(primary.total - secondary.total) > tolerance) {
-          discrepancies.push(
-            `Total mismatch: ${primary.total} vs ${secondary.total}`
-          );
-        }
-        
-        return {
-          matched: discrepancies.length === 0,
-          discrepancies,
-        };
-      },
-      {
-        enabled: true,
-        recordDiscrepancies: true,
-        alertOnDiscrepancy: true,
-        secondaryTimeoutMs: 5000,
-      },
-      metrics
-    );
-  }
-
-  async calculateOrderTotal(orderId: string): Promise<OrderTotal> {
-    return this.runner.run();
-  }
-}
-```
-
-## 5. Database Decomposition Strategies
-
-### 5.1 Dual-Write Pattern สำหรับ Database Migration
-
-```typescript
-// src/migration/dual-write.ts
-import { logger } from '../utils/logger';
-import { MetricsCollector } from '../monitoring/metrics';
-
-interface WriteResult {
-  success: boolean;
-  error?: Error;
-  durationMs: number;
-}
-
-export class DualWriteService<T> {
-  constructor(
-    private primaryWriter: (data: T) => Promise<void>,
-    private secondaryWriter: (data: T) => Promise<void>,
-    private metrics: MetricsCollector,
-    private options: {
-      requireBothSuccess: boolean;
-      logDiscrepancies: boolean;
-    } = { requireBothSuccess: false, logDiscrepancies: true }
-  ) {}
-
-  async write(data: T): Promise<void> {
-    const [primaryResult, secondaryResult] = await Promise.allSettled([
-      this.writeWithMetrics('primary', () => this.primaryWriter(data)),
-      this.writeWithMetrics('secondary', () => this.secondaryWriter(data)),
-    ]);
-
-    const primarySuccess = primaryResult.status === 'fulfilled';
-    const secondarySuccess = secondaryResult.status === 'fulfilled';
-
-    this.metrics.increment('dual_write.result', {
-      primary: primarySuccess ? 'success' : 'failure',
-      secondary: secondarySuccess ? 'success' : 'failure',
-    });
-
-    if (!primarySuccess) {
-      const error = (primaryResult as PromiseRejectedResult).reason;
-      logger.error('Primary write failed', { error });
-      throw error;
     }
 
-    if (!secondarySuccess) {
-      const error = (secondaryResult as PromiseRejectedResult).reason;
-      
-      if (this.options.requireBothSuccess) {
-        logger.error('Secondary write failed (required)', { error });
-        // TODO: Rollback primary write
-        throw error;
-      }
-      
-      logger.warn('Secondary write failed (non-critical)', { error });
-    }
+    this.logger.log(`Backfill complete: ${totalUpdated} rows updated`);
+    return { totalUpdated };
   }
 
-  private async writeWithMetrics(
-    target: string,
-    fn: () => Promise<void>
-  ): Promise<WriteResult> {
-    const start = Date.now();
-    
-    try {
-      await fn();
-      return { success: true, durationMs: Date.now() - start };
-    } catch (error) {
-      return {
-        success: false,
-        error: error as Error,
-        durationMs: Date.now() - start,
-      };
-    }
-  }
-}
+  // เพิ่ม Index แบบ CONCURRENTLY (ไม่ lock table)
+  async addIndexConcurrently(
+    tableName: string,
+    indexName: string,
+    columns: string[],
+    options: { unique?: boolean; where?: string } = {}
+  ): Promise<void> {
+    const uniqueStr = options.unique ? 'UNIQUE' : '';
+    const whereStr = options.where ? `WHERE ${options.where}` : '';
+    const columnsStr = columns.join(', ');
 
-// ตัวอย่าง: Migrate Customer Data จาก MySQL Monolith ไปยัง PostgreSQL Microservice
-class CustomerDataMigration {
-  private dualWrite: DualWriteService<Customer>;
+    const sql = `
+      CREATE ${uniqueStr} INDEX CONCURRENTLY IF NOT EXISTS ${indexName}
+      ON ${tableName} (${columnsStr})
+      ${whereStr}
+    `;
 
-  constructor(
-    private legacyDb: any,
-    private newDb: any,
-    metrics: MetricsCollector
-  ) {
-    this.dualWrite = new DualWriteService<Customer>(
-      // Primary: Legacy MySQL
-      async (customer) => {
-        await legacyDb.query(
-          'INSERT INTO customers (id, name, email, phone, created_at) VALUES (?, ?, ?, ?, ?)',
-          [customer.id, customer.name, customer.email, customer.phone, customer.createdAt]
-        );
-      },
-      // Secondary: New PostgreSQL Microservice
-      async (customer) => {
-        await newDb.query(
-          `INSERT INTO customers (id, full_name, email_address, phone_number, created_at)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (id) DO UPDATE SET
-             full_name = EXCLUDED.full_name,
-             email_address = EXCLUDED.email_address,
-             phone_number = EXCLUDED.phone_number`,
-          [customer.id, customer.name, customer.email, customer.phone, customer.createdAt]
-        );
-      },
-      metrics,
-      {
-        requireBothSuccess: false, // ถ้า Secondary ล้มเหลว ยังคง Continue
-        logDiscrepancies: true,
-      }
-    );
-  }
+    this.logger.log(`Creating index concurrently: ${indexName}`);
 
-  async createCustomer(customer: Customer): Promise<Customer> {
-    await this.dualWrite.write(customer);
-    return customer;
-  }
-}
+    // CONCURRENTLY ไม่สามารถทำใน transaction ได้
+    await this.dataSource.query(sql);
 
-interface Customer {
-  id: string;
-  name: string;
-  email: string;
-  phone: string;
-  createdAt: Date;
-}
-```
-
-## 6. Data Migration Pipeline
-
-### 6.1 Incremental Data Migration
-
-```typescript
-// src/migration/data-migration-pipeline.ts
-import { Pool } from 'pg';
-import { logger } from '../utils/logger';
-import { MetricsCollector } from '../monitoring/metrics';
-
-interface MigrationCheckpoint {
-  lastProcessedId: string;
-  processedCount: number;
-  errorCount: number;
-  startedAt: Date;
-  lastRunAt: Date;
-}
-
-interface MigrationConfig {
-  batchSize: number;
-  delayBetweenBatchesMs: number;
-  maxRetries: number;
-  checkpointTable: string;
-}
-
-export class DataMigrationPipeline<TSource, TTarget> {
-  constructor(
-    private sourceDb: Pool,
-    private targetDb: Pool,
-    private config: MigrationConfig,
-    private metrics: MetricsCollector,
-    private transformer: (source: TSource) => TTarget,
-    private migrationName: string
-  ) {}
-
-  async run(): Promise<void> {
-    logger.info(`Starting migration: ${this.migrationName}`);
-    
-    const checkpoint = await this.loadCheckpoint();
-    let processedCount = checkpoint?.processedCount ?? 0;
-    let lastId = checkpoint?.lastProcessedId ?? '0';
-    
-    while (true) {
-      const batch = await this.fetchBatch(lastId);
-      
-      if (batch.length === 0) {
-        logger.info(`Migration complete: ${this.migrationName}`, {
-          totalProcessed: processedCount,
-        });
-        break;
-      }
-
-      await this.processBatch(batch);
-      
-      processedCount += batch.length;
-      lastId = (batch[batch.length - 1] as any).id;
-      
-      await this.saveCheckpoint({
-        lastProcessedId: lastId,
-        processedCount,
-        errorCount: 0,
-        startedAt: checkpoint?.startedAt ?? new Date(),
-        lastRunAt: new Date(),
-      });
-
-      this.metrics.increment('migration.batch_processed', {
-        migration: this.migrationName,
-        batchSize: batch.length.toString(),
-      });
-
-      logger.info(`Migration progress: ${this.migrationName}`, {
-        processed: processedCount,
-        lastId,
-      });
-
-      if (batch.length < this.config.batchSize) {
-        logger.info('Reached end of data');
-        break;
-      }
-
-      await this.sleep(this.config.delayBetweenBatchesMs);
-    }
-  }
-
-  private async fetchBatch(lastId: string): Promise<TSource[]> {
-    const result = await this.sourceDb.query(
-      `SELECT * FROM source_table WHERE id > $1 ORDER BY id LIMIT $2`,
-      [lastId, this.config.batchSize]
-    );
-    return result.rows as TSource[];
-  }
-
-  private async processBatch(batch: TSource[]): Promise<void> {
-    const transformed = batch.map(item => this.transformer(item));
-    
-    // Upsert ข้อมูลใน Batch
-    const client = await this.targetDb.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      for (const item of transformed) {
-        await this.upsertItem(client, item);
-      }
-      
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  private async upsertItem(client: any, item: TTarget): Promise<void> {
-    // Generic upsert - ต้อง Override ใน Subclass
-    const keys = Object.keys(item as any);
-    const values = Object.values(item as any);
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-    const updateSet = keys
-      .filter(k => k !== 'id')
-      .map((k, i) => `${k} = $${i + 2}`)
-      .join(', ');
-
-    await client.query(
-      `INSERT INTO target_table (${keys.join(', ')}) VALUES (${placeholders})
-       ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
-      values
-    );
-  }
-
-  private async loadCheckpoint(): Promise<MigrationCheckpoint | null> {
-    try {
-      const result = await this.sourceDb.query(
-        `SELECT * FROM ${this.config.checkpointTable} WHERE migration_name = $1`,
-        [this.migrationName]
-      );
-      return result.rows[0] ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  private async saveCheckpoint(checkpoint: MigrationCheckpoint): Promise<void> {
-    await this.sourceDb.query(
-      `INSERT INTO ${this.config.checkpointTable} 
-         (migration_name, last_processed_id, processed_count, error_count, started_at, last_run_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (migration_name) DO UPDATE SET
-         last_processed_id = $2,
-         processed_count = $3,
-         error_count = $4,
-         last_run_at = $6`,
-      [
-        this.migrationName,
-        checkpoint.lastProcessedId,
-        checkpoint.processedCount,
-        checkpoint.errorCount,
-        checkpoint.startedAt,
-        checkpoint.lastRunAt,
-      ]
-    );
+    this.logger.log(`Index ${indexName} created successfully`);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -966,164 +423,538 @@ export class DataMigrationPipeline<TSource, TTarget> {
 }
 ```
 
-## 7. Migration Verification
+---
 
-### 7.1 Data Consistency Verifier
+## 5. Migration Pipeline ใน CI/CD
+
+```yaml
+# .github/workflows/database-migration.yml
+name: Database Migration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'package.json'
+
+jobs:
+  validate-migrations:
+    name: Validate Migration Files
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run migrations (up)
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: npm run migrate:up
+        
+      - name: Verify migration state
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: npm run migrate:status
+        
+      - name: Test rollback
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: npm run migrate:down -- --count 1
+        
+      - name: Re-apply after rollback
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+        run: npm run migrate:up
+        
+  deploy-migrations-staging:
+    name: Deploy to Staging
+    needs: validate-migrations
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" > ~/.kube/config
+          
+      - name: Create migration job
+        run: |
+          kubectl apply -f k8s/jobs/migration-job.yaml -n staging
+          kubectl wait --for=condition=complete job/db-migration \
+            --timeout=300s -n staging
+          
+      - name: Check migration logs
+        run: |
+          kubectl logs job/db-migration -n staging
+          
+  deploy-migrations-production:
+    name: Deploy to Production
+    needs: deploy-migrations-staging
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" > ~/.kube/config
+          
+      - name: Take database backup
+        run: |
+          kubectl create job --from=cronjob/db-backup manual-backup-$(date +%Y%m%d) \
+            -n production
+          kubectl wait --for=condition=complete job/manual-backup-$(date +%Y%m%d) \
+            --timeout=600s -n production
+          
+      - name: Run migration
+        run: |
+          kubectl apply -f k8s/jobs/migration-job.yaml -n production
+          kubectl wait --for=condition=complete job/db-migration \
+            --timeout=300s -n production
+```
+
+---
+
+## 6. Kubernetes Migration Job
+
+```yaml
+# k8s/jobs/migration-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: production
+  labels:
+    app: db-migration
+    version: "{{ .Values.appVersion }}"
+spec:
+  backoffLimit: 0  # ไม่ retry ถ้า fail
+  ttlSecondsAfterFinished: 3600  # ลบ job หลัง 1 ชั่วโมง
+  template:
+    metadata:
+      labels:
+        app: db-migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: migration-sa
+      
+      initContainers:
+        - name: wait-for-db
+          image: postgres:15-alpine
+          command: ['sh', '-c']
+          args:
+            - |
+              until pg_isready -h $DATABASE_HOST -p $DATABASE_PORT -U $DATABASE_USER; do
+                echo "Waiting for database..."
+                sleep 2
+              done
+              echo "Database is ready!"
+          env:
+            - name: DATABASE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: host
+            - name: DATABASE_PORT
+              value: "5432"
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: username
+                  
+      containers:
+        - name: migrator
+          image: registry.company.com/order-service:{{ .Values.appVersion }}
+          command: ["node", "dist/migrate.js"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: url
+            - name: NODE_ENV
+              value: production
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+```
+
+---
+
+## 7. Multi-Tenant Migration
 
 ```typescript
-// src/migration/consistency-verifier.ts
-import { Pool } from 'pg';
-import { logger } from '../utils/logger';
+// src/database/multi-tenant-migration.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 
-interface VerificationResult {
-  tableName: string;
-  sourceCount: number;
-  targetCount: number;
-  countMatch: boolean;
-  sampleMismatches: any[];
-  checksumMatch?: boolean;
+interface Tenant {
+  id: string;
+  schema: string;
+  connectionString: string;
 }
 
-export class MigrationVerifier {
-  constructor(
-    private sourceDb: Pool,
-    private targetDb: Pool
-  ) {}
+@Injectable()
+export class MultiTenantMigrationService {
+  private readonly logger = new Logger(MultiTenantMigrationService.name);
 
-  async verifyMigration(
-    sourceTable: string,
-    targetTable: string,
-    keyColumn: string,
-    sampleSize: number = 100
-  ): Promise<VerificationResult> {
-    logger.info(`Verifying migration: ${sourceTable} -> ${targetTable}`);
+  constructor(private readonly masterDataSource: DataSource) {}
 
-    // ตรวจสอบจำนวน Records
-    const [sourceCount, targetCount] = await Promise.all([
-      this.getCount(this.sourceDb, sourceTable),
-      this.getCount(this.targetDb, targetTable),
-    ]);
-
-    // Spot Check ตัวอย่าง Records
-    const sampleIds = await this.getSampleIds(sourceTable, keyColumn, sampleSize);
-    const mismatches = await this.checkSampleRecords(
-      sourceTable,
-      targetTable,
-      keyColumn,
-      sampleIds
-    );
-
-    const result: VerificationResult = {
-      tableName: sourceTable,
-      sourceCount,
-      targetCount,
-      countMatch: sourceCount === targetCount,
-      sampleMismatches: mismatches,
-    };
-
-    if (!result.countMatch) {
-      logger.error('Count mismatch detected', {
-        table: sourceTable,
-        sourceCount,
-        targetCount,
-        difference: sourceCount - targetCount,
-      });
-    }
-
-    if (mismatches.length > 0) {
-      logger.error('Data mismatches detected', {
-        table: sourceTable,
-        mismatchCount: mismatches.length,
-        examples: mismatches.slice(0, 3),
-      });
-    }
-
-    return result;
-  }
-
-  private async getCount(db: Pool, tableName: string): Promise<number> {
-    const result = await db.query(`SELECT COUNT(*) as count FROM ${tableName}`);
-    return parseInt(result.rows[0].count);
-  }
-
-  private async getSampleIds(
-    tableName: string,
-    keyColumn: string,
-    sampleSize: number
-  ): Promise<string[]> {
-    const result = await this.sourceDb.query(
-      `SELECT ${keyColumn} FROM ${tableName} ORDER BY RANDOM() LIMIT $1`,
-      [sampleSize]
-    );
-    return result.rows.map(row => row[keyColumn]);
-  }
-
-  private async checkSampleRecords(
-    sourceTable: string,
-    targetTable: string,
-    keyColumn: string,
-    ids: string[]
-  ): Promise<any[]> {
-    const mismatches: any[] = [];
+  async runMigrationsForAllTenants(): Promise<void> {
+    const tenants = await this.getAllTenants();
     
-    for (const id of ids) {
-      const [sourceRecord, targetRecord] = await Promise.all([
-        this.sourceDb.query(
-          `SELECT * FROM ${sourceTable} WHERE ${keyColumn} = $1`,
-          [id]
-        ),
-        this.targetDb.query(
-          `SELECT * FROM ${targetTable} WHERE ${keyColumn} = $1`,
-          [id]
-        ),
-      ]);
-
-      if (sourceRecord.rows.length === 0 && targetRecord.rows.length === 0) {
-        continue;
-      }
-
-      if (sourceRecord.rows.length === 0 || targetRecord.rows.length === 0) {
-        mismatches.push({
-          id,
-          issue: 'Record exists in one database but not the other',
-          inSource: sourceRecord.rows.length > 0,
-          inTarget: targetRecord.rows.length > 0,
-        });
-        continue;
-      }
-
-      // เปรียบเทียบ Fields ที่สำคัญ
-      const source = sourceRecord.rows[0];
-      const target = targetRecord.rows[0];
-      
-      const differences: string[] = [];
-      
-      // ตรวจสอบ Fields หลัก
-      for (const field of Object.keys(source)) {
-        if (JSON.stringify(source[field]) !== JSON.stringify(target[field])) {
-          differences.push(`${field}: "${source[field]}" vs "${target[field]}"`);
-        }
-      }
-      
-      if (differences.length > 0) {
-        mismatches.push({ id, differences });
-      }
+    this.logger.log(`Running migrations for ${tenants.length} tenants`);
+    
+    const results = await Promise.allSettled(
+      tenants.map(tenant => this.runMigrationForTenant(tenant))
+    );
+    
+    const failed = results.filter(r => r.status === 'rejected');
+    if (failed.length > 0) {
+      this.logger.error(`${failed.length} tenant migrations failed`);
     }
     
-    return mismatches;
+    this.logger.log(`Migrations complete: ${results.length - failed.length}/${results.length} successful`);
+  }
+
+  private async runMigrationForTenant(tenant: Tenant): Promise<void> {
+    this.logger.log(`Migrating tenant: ${tenant.id}`);
+    
+    const tenantDataSource = new DataSource({
+      type: 'postgres',
+      url: tenant.connectionString,
+      schema: tenant.schema,
+      migrations: ['migrations/*.ts'],
+      migrationsRun: false,
+    });
+
+    try {
+      await tenantDataSource.initialize();
+      await tenantDataSource.runMigrations({ transaction: 'each' });
+      this.logger.log(`Tenant ${tenant.id} migrated successfully`);
+    } finally {
+      await tenantDataSource.destroy();
+    }
+  }
+
+  private async createTenantSchema(tenantId: string): Promise<void> {
+    const schemaName = `tenant_${tenantId}`;
+    
+    await this.masterDataSource.transaction(async (manager) => {
+      await manager.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`);
+      
+      // Copy template schema
+      await manager.query(`
+        SELECT clone_schema('tenant_template', '${schemaName}')
+      `);
+    });
+  }
+
+  private async getAllTenants(): Promise<Tenant[]> {
+    // ดึงรายชื่อ tenants ทั้งหมดจาก master database
+    const results = await this.masterDataSource.query(
+      'SELECT id, schema_name, connection_string FROM tenants WHERE active = true'
+    );
+    
+    return results.map((r: { id: string; schema_name: string; connection_string: string }) => ({
+      id: r.id,
+      schema: r.schema_name,
+      connectionString: r.connection_string,
+    }));
   }
 }
 ```
 
+---
+
+## 8. Rollback Strategies
+
+```typescript
+// src/database/migration-rollback.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+
+interface MigrationSnapshot {
+  version: string;
+  takenAt: Date;
+  backupLocation: string;
+}
+
+@Injectable()
+export class MigrationRollbackService {
+  private readonly logger = new Logger(MigrationRollbackService.name);
+
+  constructor(private readonly dataSource: DataSource) {}
+
+  // Snapshot-based rollback
+  async takeSnapshot(version: string): Promise<MigrationSnapshot> {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFile = `backup_${version}_${timestamp}.sql`;
+    
+    this.logger.log(`Taking snapshot for version ${version}`);
+    
+    // Execute pg_dump (ใน production จะ run เป็น Job แยกต่างหาก)
+    const snapshot: MigrationSnapshot = {
+      version,
+      takenAt: new Date(),
+      backupLocation: `s3://backups/migrations/${backupFile}`,
+    };
+    
+    return snapshot;
+  }
+
+  async rollbackToSnapshot(snapshot: MigrationSnapshot): Promise<void> {
+    this.logger.log(`Rolling back to snapshot: ${snapshot.version}`);
+    
+    // 1. Stop traffic (อาจใช้ feature flag หรือ maintenance mode)
+    await this.enableMaintenanceMode();
+    
+    try {
+      // 2. Restore from backup
+      await this.restoreFromBackup(snapshot.backupLocation);
+      
+      // 3. Rollback migration files
+      const currentVersion = await this.getCurrentMigrationVersion();
+      const stepsToRollback = await this.calculateRollbackSteps(
+        snapshot.version,
+        currentVersion
+      );
+      
+      for (let i = 0; i < stepsToRollback; i++) {
+        await this.dataSource.undoLastMigration({ transaction: 'all' });
+      }
+      
+      this.logger.log(`Rollback to ${snapshot.version} completed`);
+    } finally {
+      // 4. Re-enable traffic
+      await this.disableMaintenanceMode();
+    }
+  }
+
+  private async enableMaintenanceMode(): Promise<void> {
+    this.logger.log('Enabling maintenance mode');
+  }
+
+  private async disableMaintenanceMode(): Promise<void> {
+    this.logger.log('Disabling maintenance mode');
+  }
+
+  private async restoreFromBackup(backupLocation: string): Promise<void> {
+    this.logger.log(`Restoring from: ${backupLocation}`);
+  }
+
+  private async getCurrentMigrationVersion(): Promise<string> {
+    const result = await this.dataSource.query(
+      'SELECT id FROM migrations ORDER BY run_on DESC LIMIT 1'
+    );
+    return result[0]?.id || '0';
+  }
+
+  private async calculateRollbackSteps(
+    targetVersion: string,
+    currentVersion: string
+  ): Promise<number> {
+    const migrations = await this.dataSource.showMigrations();
+    return migrations.length; // simplified
+  }
+}
+```
+
+---
+
+## 9. Database Version Control
+
+```typescript
+// src/database/version-control.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+
+interface SchemaVersion {
+  version: string;
+  appliedAt: Date;
+  checksum: string;
+  executionTime: number;
+  success: boolean;
+}
+
+@Injectable()
+export class DatabaseVersionControlService {
+  private readonly logger = new Logger(DatabaseVersionControlService.name);
+
+  constructor(private readonly dataSource: DataSource) {}
+
+  async getCurrentVersion(): Promise<string> {
+    try {
+      const result = await this.dataSource.query(
+        'SELECT version FROM schema_version ORDER BY applied_at DESC LIMIT 1'
+      );
+      return result[0]?.version || '0.0.0';
+    } catch {
+      return '0.0.0';
+    }
+  }
+
+  async getAppliedMigrations(): Promise<SchemaVersion[]> {
+    return this.dataSource.query(
+      'SELECT * FROM schema_version ORDER BY applied_at ASC'
+    );
+  }
+
+  async recordMigration(migration: Omit<SchemaVersion, 'appliedAt'>): Promise<void> {
+    await this.dataSource.query(
+      `INSERT INTO schema_version (version, applied_at, checksum, execution_time, success)
+       VALUES ($1, NOW(), $2, $3, $4)`,
+      [migration.version, migration.checksum, migration.executionTime, migration.success]
+    );
+  }
+
+  async verifyChecksums(): Promise<{ valid: boolean; issues: string[] }> {
+    const issues: string[] = [];
+    const appliedMigrations = await this.getAppliedMigrations();
+    
+    for (const migration of appliedMigrations) {
+      const currentChecksum = await this.calculateChecksum(migration.version);
+      
+      if (currentChecksum !== migration.checksum) {
+        issues.push(`Migration ${migration.version}: checksum mismatch`);
+      }
+    }
+    
+    return { valid: issues.length === 0, issues };
+  }
+
+  private async calculateChecksum(version: string): Promise<string> {
+    const crypto = await import('crypto');
+    const content = `migration_${version}`;
+    return crypto.createHash('md5').update(content).digest('hex');
+  }
+}
+```
+
+---
+
+## 10. TypeORM Migration ตัวอย่าง
+
+```typescript
+// migrations/1706745600000-CreateOrdersTable.ts
+import { MigrationInterface, QueryRunner, Table, Index } from 'typeorm';
+
+export class CreateOrdersTable1706745600000 implements MigrationInterface {
+  name = 'CreateOrdersTable1706745600000';
+
+  async up(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.createTable(
+      new Table({
+        name: 'orders',
+        columns: [
+          {
+            name: 'id',
+            type: 'uuid',
+            isPrimary: true,
+            generationStrategy: 'uuid',
+            default: 'gen_random_uuid()',
+          },
+          {
+            name: 'customer_id',
+            type: 'uuid',
+            isNullable: false,
+          },
+          {
+            name: 'status',
+            type: 'varchar',
+            length: '50',
+            default: "'pending'",
+          },
+          {
+            name: 'total_amount',
+            type: 'decimal',
+            precision: 10,
+            scale: 2,
+          },
+          {
+            name: 'created_at',
+            type: 'timestamptz',
+            default: 'NOW()',
+          },
+          {
+            name: 'updated_at',
+            type: 'timestamptz',
+            default: 'NOW()',
+          },
+        ],
+      }),
+      true
+    );
+
+    await queryRunner.createIndex(
+      'orders',
+      new Index({
+        name: 'idx_orders_customer_id',
+        columnNames: ['customer_id'],
+      })
+    );
+  }
+
+  async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.dropIndex('orders', 'idx_orders_customer_id');
+    await queryRunner.dropTable('orders');
+  }
+}
+```
+
+---
+
 ## สรุป
 
-| Pattern | เหมาะกับ | ความเสี่ยง | ระยะเวลา |
-|---------|---------|----------|---------|
-| Strangler Fig | Extract Feature-by-Feature | ต่ำ | ยาว (3-12 เดือน) |
-| Anti-Corruption Layer | Domain Model ต่างกันมาก | ต่ำ | ปานกลาง |
-| Branch by Abstraction | Refactor ก่อน Extract | ต่ำ | ปานกลาง |
-| Parallel Run | Validate ความถูกต้อง | ต่ำมาก | สั้น (สำหรับ Validation) |
-| Dual Write | Database Migration | ปานกลาง | ปานกลาง |
-| Data Pipeline | Batch Data Migration | ปานกลาง | ขึ้นกับขนาดข้อมูล |
-
-กุญแจสำคัญในการ Migrate สำเร็จคือการทำ Incremental Migration ไม่ควร Big Bang ระบบ E-commerce ไทยที่มี Transaction สูงควรเริ่มจาก Service ที่ไม่ได้มี Strong Coupling กับส่วนอื่นก่อน เช่น Product Catalog หรือ Notification Service แล้วค่อยๆ ย้าย Order และ Payment ซึ่งมี Dependency ซับซ้อน
+| กลยุทธ์ | เมื่อใช้ | ข้อดี | ข้อควรระวัง |
+|---------|---------|-------|------------|
+| Expand-Contract | Rename/Split columns | Zero-downtime | ต้อง deploy 2 ครั้ง |
+| Blue-Green DB | Major schema changes | Quick rollback | ต้องการ 2x storage |
+| Rolling Migration | Column backfill | ไม่ lock table | ช้ากว่า direct update |
+| Batch Backfill | Large table updates | ลด DB load | ใช้เวลานานกว่า |
+| CONCURRENT Index | Add index to live table | No table lock | ใช้เวลานานกว่า |
+| Schema per Tenant | Multi-tenant apps | Isolation | Migration complexity |
+| Migration Job (K8s) | CI/CD pipeline | Automated | Must handle failures |
+| Snapshot Rollback | Critical failures | Fast recovery | Requires backup storage |
+| Checksum Verify | Migration integrity | Detect corruption | Extra storage |
+| node-pg-migrate | Node.js projects | Simple API | Limited features vs Flyway |

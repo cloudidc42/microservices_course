@@ -1,920 +1,2379 @@
-# Part 86: Message Broker Comparison
+# Part 86: Message Brokers Comparison
 
 ## บทนำ
 
-การเลือก Message Broker ที่เหมาะสมส่งผลต่อทั้ง performance, reliability, และ operational complexity ของระบบ บทนี้เปรียบเทียบ RabbitMQ, Apache Kafka, AWS SQS/SNS, Google Pub/Sub, และ Azure Service Bus พร้อมแนวทางการเลือกที่เหมาะกับ use case
+ในระบบ Microservices การสื่อสารแบบ Asynchronous ผ่าน Message Broker เป็นสิ่งสำคัญมาก บทนี้จะเปรียบเทียบ Message Broker ยอดนิยม 4 ตัว ได้แก่ Apache Kafka, RabbitMQ, NATS และ Apache Pulsar พร้อมตัวอย่างโค้ด TypeScript ที่ใช้งานได้จริง
 
 ---
 
-## Comparison Overview
+## 1. การเปรียบเทียบ Message Brokers
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     MESSAGE BROKER COMPARISON MATRIX                         │
-├────────────────┬────────────┬────────────┬────────────┬──────────┬───────────┤
-│                │  RabbitMQ  │   Kafka    │  AWS SQS   │ GCP Pub/ │ Azure SB  │
-│                │            │            │   /SNS     │   Sub    │           │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Throughput     │ 20K msg/s  │ 1M+ msg/s  │ 3K/10K     │ 10M/s   │ 1M msg/s  │
-│                │            │            │ (SQS/SNS)  │          │           │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Message        │ No replay  │ Yes        │ No replay  │ Yes      │ No replay │
-│ Replay         │            │ (retention)│            │          │           │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Delivery       │ At-least-  │ At-least-  │ At-least-  │ At-least-│ At-least- │
-│ Guarantee      │ once       │ once*      │ once       │ once     │ once      │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Ordering       │ Per-queue  │ Per-       │ Per-       │ Per-key  │ Per-      │
-│                │            │ partition  │ message    │          │ session   │
-│                │            │            │ group      │          │           │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Routing        │ Complex    │ Topic-     │ Simple     │ Topic-   │ Topic-    │
-│                │ (exchanges)│ based      │            │ based    │ based     │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Cost           │ Self-hosted│ Self-host/ │ Pay-per-   │ Pay-per- │ Pay-per-  │
-│                │            │ Confluent  │ message    │ message  │ message   │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Ops Complexity │ Medium     │ High       │ Low        │ Low      │ Low       │
-├────────────────┼────────────┼────────────┼────────────┼──────────┼───────────┤
-│ Best for       │ Task       │ Event      │ Simple     │ GCP      │ Azure     │
-│                │ queues,    │ streaming, │ queuing,   │ workloads│ workloads │
-│                │ routing    │ log proc.  │ serverless │          │           │
-└────────────────┴────────────┴────────────┴────────────┴──────────┴───────────┘
-```
+### 1.1 ตารางเปรียบเทียบหลัก
+
+| Feature | Kafka | RabbitMQ | NATS | Pulsar |
+|---------|-------|----------|------|--------|
+| Throughput | สูงมาก (มากกว่า 1M msg/s) | ปานกลาง (50K msg/s) | สูงมาก (10M msg/s) | สูงมาก (2M msg/s) |
+| Latency | ต่ำ (1-5ms) | ต่ำมาก (<1ms) | ต่ำมาก (<1ms) | ต่ำ (1-5ms) |
+| Message Ordering | Per-partition | Per-queue | ไม่รับประกัน | Per-partition |
+| Durability | สูงมาก | สูง | ต้องการ JetStream | สูงมาก |
+| Protocol | Custom (TCP) | AMQP 0-9-1 | NATS Protocol | Pulsar Protocol |
+| Retention | Log-based (permanent) | Queue-based (ลบหลัง consume) | Memory/JetStream | Tiered Storage |
+| Replay | รองรับ | ไม่รองรับ | JetStream เท่านั้น | รองรับ |
+| Schema Registry | Confluent Schema Registry | ไม่มีในตัว | ไม่มีในตัว | มีในตัว |
+
+### 1.2 Use Cases ที่เหมาะสม
+
+**Kafka เหมาะกับ:**
+- Event Sourcing และ CQRS
+- Log aggregation
+- Stream processing
+- Data pipeline ขนาดใหญ่
+
+**RabbitMQ เหมาะกับ:**
+- Task queues
+- Request/Reply patterns
+- Complex routing (topic, fanout, direct)
+- งานที่ต้องการ latency ต่ำมาก
+
+**NATS เหมาะกับ:**
+- Microservices messaging ที่เรียบง่าย
+- IoT messaging
+- Request/Reply แบบ synchronous
+- Edge computing
+
+**Pulsar เหมาะกับ:**
+- Multi-tenant environments
+- Geo-replication
+- Tiered storage (hot/warm/cold)
+- Unified messaging (Queue + Stream)
 
 ---
 
-## RabbitMQ: เหมาะสำหรับ Task Queues
+## 2. Apache Pulsar: TypeScript Producer/Consumer
 
-### เมื่อไหร่ควรใช้ RabbitMQ?
-- Task queues ที่มี complex routing logic
-- Microservices ที่ต้องการ flexible message routing
-- Self-hosted infrastructure
-- ไม่ต้องการ message replay
+### 2.1 ติดตั้ง Dependencies
 
-```typescript
-// services/order/src/messaging/rabbitmq.module.ts
-
-import { Module } from '@nestjs/common';
-import { RabbitMQModule } from '@golevelup/nestjs-rabbitmq';
-import { ConfigService } from '@nestjs/config';
-
-@Module({
-  imports: [
-    RabbitMQModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        exchanges: [
-          {
-            name: 'order.events',
-            type: 'topic',
-            options: { durable: true },
-          },
-          {
-            name: 'order.commands',
-            type: 'direct',
-            options: { durable: true },
-          },
-          // Dead Letter Exchange
-          {
-            name: 'order.dlx',
-            type: 'topic',
-            options: { durable: true },
-          },
-        ],
-        uri: config.get<string>('RABBITMQ_URI'),
-        connectionInitOptions: { wait: true },
-        channels: {
-          'channel-1': {
-            prefetchCount: 10,
-            default: true,
-          },
-        },
-      }),
-    }),
-  ],
-  exports: [RabbitMQModule],
-})
-export class MessagingModule {}
+```bash
+npm install pulsar-client
+npm install --save-dev @types/node
 ```
 
+### 2.2 Pulsar Producer พร้อม Schema
+
 ```typescript
-// services/order/src/messaging/order-publisher.service.ts
+// pulsar/producer.ts
+import Pulsar from 'pulsar-client';
 
-import { Injectable } from '@nestjs/common';
-import { AmqpConnection } from '@golevelup/nestjs-rabbitmq';
-
-@Injectable()
-export class OrderPublisher {
-  constructor(private readonly amqp: AmqpConnection) {}
-
-  async publishOrderCreated(order: Order): Promise<void> {
-    await this.amqp.publish(
-      'order.events',     // exchange
-      'order.created',    // routing key
-      {
-        orderId: order.id,
-        userId: order.userId,
-        totalAmount: order.totalAmount,
-        items: order.items,
-        createdAt: order.createdAt,
-      },
-      {
-        persistent: true,  // survive broker restart
-        messageId: `order-created-${order.id}`,
-        timestamp: Date.now(),
-        headers: {
-          'x-correlation-id': order.id,
-          'x-source-service': 'order-service',
-        },
-      }
-    );
-  }
+// Define message schema
+interface OrderEvent {
+  orderId: string;
+  customerId: string;
+  items: Array<{
+    productId: string;
+    quantity: number;
+    price: number;
+  }>;
+  totalAmount: number;
+  status: 'CREATED' | 'CONFIRMED' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED';
+  createdAt: string;
 }
-```
 
-```typescript
-// services/notification/src/listeners/order.listener.ts
+class PulsarOrderProducer {
+  private client: Pulsar.Client;
+  private producer: Pulsar.Producer | null = null;
 
-import { RabbitSubscribe, Nack } from '@golevelup/nestjs-rabbitmq';
-import { Injectable, Logger } from '@nestjs/common';
-
-@Injectable()
-export class OrderEventListener {
-  private readonly logger = new Logger(OrderEventListener.name);
-
-  @RabbitSubscribe({
-    exchange: 'order.events',
-    routingKey: 'order.created',
-    queue: 'notification-service.order-created',
-    queueOptions: {
-      durable: true,
-      arguments: {
-        'x-dead-letter-exchange': 'order.dlx',
-        'x-dead-letter-routing-key': 'notification.order.created.failed',
-        'x-message-ttl': 86400000, // 24 hours
-        'x-max-retries': 3,
-      },
-    },
-  })
-  async handleOrderCreated(
-    payload: OrderCreatedEvent,
-    amqpMsg: Message,
-  ): Promise<void | Nack> {
-    try {
-      await this.notificationService.sendOrderConfirmation(payload);
-      // Message จะถูก ack อัตโนมัติ
-    } catch (error) {
-      const retryCount = (amqpMsg.properties.headers?.['x-retry-count'] || 0) as number;
-      
-      if (retryCount < 3) {
-        this.logger.warn(
-          `Retrying order notification (attempt ${retryCount + 1}/3)`,
-          { orderId: payload.orderId }
-        );
-        // Nack กับ requeue = true จะ retry
-        return new Nack(true);
-      }
-      
-      this.logger.error(
-        'Max retries reached, sending to DLQ',
-        { orderId: payload.orderId, error: error.message }
-      );
-      // Nack กับ requeue = false จะส่งไป DLQ
-      return new Nack(false);
-    }
+  constructor(private readonly serviceUrl: string = 'pulsar://localhost:6650') {
+    this.client = new Pulsar.Client({
+      serviceUrl,
+      operationTimeoutSeconds: 30,
+      connectionTimeoutMs: 10000,
+    });
   }
-}
-```
 
----
-
-## Apache Kafka: เหมาะสำหรับ Event Streaming
-
-### เมื่อไหร่ควรใช้ Kafka?
-- Event streaming / event log
-- High throughput (> 100K messages/second)
-- ต้องการ message replay
-- Event-sourcing pattern
-- Analytics pipeline
-
-```typescript
-// services/order/src/messaging/kafka.module.ts
-
-import { Module } from '@nestjs/common';
-import { ClientsModule, Transport } from '@nestjs/microservices';
-import { ConfigService } from '@nestjs/config';
-
-@Module({
-  imports: [
-    ClientsModule.registerAsync([
-      {
-        name: 'KAFKA_CLIENT',
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.KAFKA,
-          options: {
-            client: {
-              clientId: 'order-service',
-              brokers: config.get<string[]>('KAFKA_BROKERS', ['kafka:9092']),
-              ssl: config.get<boolean>('KAFKA_SSL', false),
-              sasl: config.get('KAFKA_SASL_ENABLED')
-                ? {
-                    mechanism: 'plain',
-                    username: config.get('KAFKA_USERNAME'),
-                    password: config.get('KAFKA_PASSWORD'),
-                  }
-                : undefined,
-            },
-            producer: {
-              allowAutoTopicCreation: false,
-              transactionalId: 'order-service-producer',
-              idempotent: true,         // Exactly-once semantics
-              maxInFlightRequests: 5,
-            },
-            consumer: {
-              groupId: 'order-service-consumer-group',
-              sessionTimeout: 30000,
-              heartbeatInterval: 10000,
-              maxBytesPerPartition: 1048576, // 1MB
-            },
-          },
+  async initialize(topicName: string): Promise<void> {
+    this.producer = await this.client.createProducer({
+      topic: topicName,
+      // Partitioned topic configuration
+      messageRoutingMode: 'RoundRobinDistribution',
+      // Schema configuration
+      schema: {
+        type: Pulsar.SchemaType.Json,
+        jsonSchema: JSON.stringify({
+          type: 'record',
+          name: 'OrderEvent',
+          fields: [
+            { name: 'orderId', type: 'string' },
+            { name: 'customerId', type: 'string' },
+            { name: 'totalAmount', type: 'double' },
+            { name: 'status', type: 'string' },
+            { name: 'createdAt', type: 'string' },
+          ],
         }),
       },
-    ]),
-  ],
-  exports: [ClientsModule],
-})
-export class KafkaModule {}
-```
+      // Compression
+      compressionType: 'ZSTD',
+      // Batching
+      batchingEnabled: true,
+      batchingMaxPublishDelayMs: 10,
+      batchingMaxMessages: 1000,
+      // Send timeout
+      sendTimeoutMs: 30000,
+    });
 
-```typescript
-// services/order/src/messaging/kafka-producer.service.ts
-
-import { Injectable, Inject, Logger, OnModuleInit } from '@nestjs/common';
-import { ClientKafka, KafkaHeaders } from '@nestjs/microservices';
-import { Message } from 'kafkajs';
-
-@Injectable()
-export class KafkaOrderProducer implements OnModuleInit {
-  private readonly logger = new Logger(KafkaOrderProducer.name);
-
-  constructor(
-    @Inject('KAFKA_CLIENT')
-    private readonly kafkaClient: ClientKafka,
-  ) {}
-
-  async onModuleInit(): Promise<void> {
-    await this.kafkaClient.connect();
+    console.log(`Pulsar producer initialized for topic: ${topicName}`);
   }
 
-  async publishOrderEvent(
-    eventType: string,
-    orderId: string,
-    payload: unknown,
-  ): Promise<void> {
-    const message: Message = {
-      key: orderId,           // orderId เป็น partition key - ordering per order
-      value: JSON.stringify({
-        eventType,
-        timestamp: new Date().toISOString(),
+  async sendOrder(order: OrderEvent, partitionKey?: string): Promise<string> {
+    if (!this.producer) {
+      throw new Error('Producer not initialized. Call initialize() first.');
+    }
+
+    const messageData = Buffer.from(JSON.stringify(order));
+
+    const messageId = await this.producer.send({
+      data: messageData,
+      partitionKey: partitionKey || order.customerId,
+      // Properties (headers)
+      properties: {
+        eventType: 'OrderEvent',
         version: '1.0',
-        data: payload,
-      }),
-      headers: {
-        [KafkaHeaders.CORRELATION_ID]: orderId,
-        'source-service': 'order-service',
-        'event-type': eventType,
-        'schema-version': '1.0',
+        source: 'order-service',
+        correlationId: order.orderId,
       },
-    };
+      // Delivery delay (milliseconds)
+      deliverAfter: 0,
+      // Event time
+      eventTimestamp: Date.now(),
+    });
 
-    await this.kafkaClient.emit(
-      `order.events.${eventType.toLowerCase()}`,
-      message
-    ).toPromise();
-
-    this.logger.debug(`Published ${eventType} for order ${orderId}`);
+    console.log(`Order sent with messageId: ${messageId.toString()}`);
+    return messageId.toString();
   }
-}
-```
 
-```typescript
-// services/analytics/src/consumers/order-events.consumer.ts
-// Kafka Consumer ใน NestJS
+  async sendBatch(orders: OrderEvent[]): Promise<string[]> {
+    const messageIds: string[] = [];
 
-import { Controller } from '@nestjs/common';
-import {
-  MessagePattern,
-  Payload,
-  Ctx,
-  KafkaContext,
-} from '@nestjs/microservices';
+    for (const order of orders) {
+      const messageId = await this.sendOrder(order, order.customerId);
+      messageIds.push(messageId);
+    }
 
-@Controller()
-export class OrderEventsConsumer {
-  @MessagePattern('order.events.order.created')
-  async handleOrderCreated(
-    @Payload() message: KafkaMessage,
-    @Ctx() context: KafkaContext,
-  ): Promise<void> {
-    const originalMessage = context.getMessage();
-    const partition = context.getPartition();
-    const { offset } = originalMessage;
-    const topic = context.getTopic();
-    
-    try {
-      const event = JSON.parse(originalMessage.value.toString());
-      await this.analyticsService.processOrderCreated(event.data);
-      
-      // Manual commit (ถ้าตั้งค่า autoCommit: false)
-      const heartbeat = context.getHeartbeat();
-      await heartbeat();
-      
-    } catch (error) {
-      this.logger.error(
-        `Failed to process order created event`,
-        {
-          topic,
-          partition,
-          offset: offset.toString(),
-          error: error.message,
-        }
-      );
-      
-      // ส่ง DLQ
-      await this.dlqProducer.send({
-        topic: 'order.events.dlq',
-        messages: [originalMessage],
-      });
+    return messageIds;
+  }
+
+  async flush(): Promise<void> {
+    if (this.producer) {
+      await this.producer.flush();
     }
   }
+
+  async close(): Promise<void> {
+    if (this.producer) {
+      await this.producer.close();
+    }
+    await this.client.close();
+    console.log('Pulsar producer closed');
+  }
 }
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const producer = new PulsarOrderProducer('pulsar://localhost:6650');
+
+  try {
+    await producer.initialize('persistent://public/default/orders');
+
+    const order: OrderEvent = {
+      orderId: `order-${Date.now()}`,
+      customerId: 'customer-001',
+      items: [
+        { productId: 'prod-001', quantity: 2, price: 299.99 },
+        { productId: 'prod-002', quantity: 1, price: 149.99 },
+      ],
+      totalAmount: 749.97,
+      status: 'CREATED',
+      createdAt: new Date().toISOString(),
+    };
+
+    await producer.sendOrder(order);
+    await producer.flush();
+  } finally {
+    await producer.close();
+  }
+}
+
+main().catch(console.error);
 ```
 
-### Kafka Topic Configuration
-
-```yaml
-# kafka/topics/order-events.yaml
-# ใช้ kafka-topics.sh หรือ Strimzi Operator
-
-# Topics configuration
-topics:
-  - name: order.events.order.created
-    partitions: 12       # จำนวน partitions = parallelism
-    replicationFactor: 3 # HA
-    config:
-      retention.ms: "604800000"        # 7 days
-      retention.bytes: "10737418240"   # 10 GB per partition
-      min.insync.replicas: "2"
-      compression.type: "lz4"
-      cleanup.policy: "delete"
-      
-  - name: order.events.dlq
-    partitions: 3
-    replicationFactor: 3
-    config:
-      retention.ms: "2592000000"  # 30 days for DLQ
-      min.insync.replicas: "2"
-```
-
----
-
-## AWS SQS/SNS: เหมาะสำหรับ AWS Ecosystem
-
-### เมื่อไหร่ควรใช้ SQS/SNS?
-- AWS-native workloads
-- Serverless architecture (Lambda triggers)
-- Simple queuing โดยไม่ต้อง manage infrastructure
-- Fan-out patterns (SNS → multiple SQS queues)
+### 2.3 Pulsar Consumer พร้อม Partitioned Topics
 
 ```typescript
-// services/order/src/messaging/sqs.service.ts
+// pulsar/consumer.ts
+import Pulsar from 'pulsar-client';
 
-import { Injectable, Logger } from '@nestjs/common';
-import {
-  SQSClient,
-  SendMessageCommand,
-  ReceiveMessageCommand,
-  DeleteMessageCommand,
-  Message,
-} from '@aws-sdk/client-sqs';
-import {
-  SNSClient,
-  PublishCommand,
-} from '@aws-sdk/client-sns';
+interface OrderEvent {
+  orderId: string;
+  customerId: string;
+  totalAmount: number;
+  status: string;
+  createdAt: string;
+}
 
-@Injectable()
-export class SQSSNSService {
-  private readonly logger = new Logger(SQSSNSService.name);
-  private readonly sqsClient: SQSClient;
-  private readonly snsClient: SNSClient;
+type MessageHandler = (order: OrderEvent, messageId: string) => Promise<void>;
 
-  constructor(private readonly config: ConfigService) {
-    this.sqsClient = new SQSClient({
-      region: config.get('AWS_REGION'),
-      credentials: {
-        accessKeyId: config.get('AWS_ACCESS_KEY_ID'),
-        secretAccessKey: config.get('AWS_SECRET_ACCESS_KEY'),
-      },
-    });
+class PulsarOrderConsumer {
+  private client: Pulsar.Client;
+  private consumer: Pulsar.Consumer | null = null;
+  private isRunning = false;
+  private processingCount = 0;
 
-    this.snsClient = new SNSClient({
-      region: config.get('AWS_REGION'),
+  constructor(
+    private readonly serviceUrl: string = 'pulsar://localhost:6650',
+    private readonly consumerConfig: {
+      subscriptionName: string;
+      subscriptionType: Pulsar.SubscriptionType;
+      maxRedeliverCount?: number;
+      deadLetterTopic?: string;
+    }
+  ) {
+    this.client = new Pulsar.Client({
+      serviceUrl,
+      operationTimeoutSeconds: 30,
     });
   }
 
-  // ใช้ SNS เพื่อ fan-out ไปหลาย services
-  async publishToSNS(
-    topicArn: string,
-    eventType: string,
-    payload: unknown,
-    attributes?: Record<string, string>,
-  ): Promise<void> {
-    const command = new PublishCommand({
-      TopicArn: topicArn,
-      Message: JSON.stringify(payload),
-      Subject: eventType,
-      MessageAttributes: {
-        eventType: {
-          DataType: 'String',
-          StringValue: eventType,
-        },
-        ...Object.entries(attributes || {}).reduce((acc, [key, value]) => {
-          acc[key] = { DataType: 'String', StringValue: value };
-          return acc;
-        }, {} as Record<string, any>),
-      },
-      // Message deduplication (สำหรับ FIFO topics)
-      MessageDeduplicationId: `${eventType}-${Date.now()}`,
-      MessageGroupId: (payload as any).orderId || 'default',
+  async initialize(topicPattern: string | string[]): Promise<void> {
+    const topics = Array.isArray(topicPattern)
+      ? topicPattern
+      : [topicPattern];
+
+    this.consumer = await this.client.subscribe({
+      // รองรับทั้ง single topic และ multiple topics
+      topic: typeof topicPattern === 'string' ? topicPattern : undefined,
+      topics: Array.isArray(topicPattern) ? topicPattern : undefined,
+      // Subscription configuration
+      subscription: this.consumerConfig.subscriptionName,
+      subscriptionType: this.consumerConfig.subscriptionType,
+      // Acknowledge timeout
+      ackTimeoutMs: 10000,
+      // Negative acknowledge redelivery delay
+      nAckRedeliverTimeoutMs: 60000,
+      // Dead Letter Queue
+      deadLetterPolicy: this.consumerConfig.maxRedeliverCount
+        ? {
+            maxRedeliverCount: this.consumerConfig.maxRedeliverCount,
+            deadLetterTopic: this.consumerConfig.deadLetterTopic || `${topics[0]}-DLQ`,
+          }
+        : undefined,
+      // Pull mode configuration
+      receiverQueueSize: 1000,
+      // Priority level for Shared subscription
+      priorityLevel: 0,
     });
 
-    await this.snsClient.send(command);
+    console.log(`Pulsar consumer initialized, subscription: ${this.consumerConfig.subscriptionName}`);
   }
 
-  // SQS consumer
-  async consumeMessages(
-    queueUrl: string,
-    handler: (message: Message) => Promise<void>,
-  ): Promise<void> {
-    while (true) {
+  async startConsuming(handler: MessageHandler): Promise<void> {
+    if (!this.consumer) {
+      throw new Error('Consumer not initialized.');
+    }
+
+    this.isRunning = true;
+    console.log('Starting to consume messages...');
+
+    while (this.isRunning) {
       try {
-        const receiveCommand = new ReceiveMessageCommand({
-          QueueUrl: queueUrl,
-          MaxNumberOfMessages: 10,
-          WaitTimeSeconds: 20,   // Long polling
-          AttributeNames: ['All'],
-          MessageAttributeNames: ['All'],
-          VisibilityTimeout: 30, // 30 seconds to process
-        });
+        // รับ message ด้วย timeout
+        const message = await this.consumer.receive(5000);
 
-        const response = await this.sqsClient.send(receiveCommand);
+        if (message) {
+          this.processingCount++;
 
-        if (!response.Messages || response.Messages.length === 0) {
+          try {
+            const data = JSON.parse(message.getData().toString()) as OrderEvent;
+            const messageId = message.getMessageId().toString();
+
+            // บันทึก metadata
+            const properties = message.getProperties();
+            console.log(`Received message: ${messageId}`, {
+              eventType: properties['eventType'],
+              topic: message.getTopicName(),
+              partition: message.getMessageId().getPartition?.() ?? 'N/A',
+            });
+
+            // ประมวลผล message
+            await handler(data, messageId);
+
+            // Acknowledge สำเร็จ
+            await this.consumer.acknowledge(message);
+            this.processingCount--;
+          } catch (processingError) {
+            console.error('Error processing message:', processingError);
+            // Negative acknowledge เพื่อให้ retry
+            await this.consumer.negativeAcknowledge(message);
+            this.processingCount--;
+          }
+        }
+      } catch (receiveError: any) {
+        if (receiveError.message?.includes('timeout')) {
+          // Timeout ปกติ ไม่ใช่ error
           continue;
         }
 
-        await Promise.all(
-          response.Messages.map(async (message) => {
-            try {
-              await handler(message);
-              
-              // Delete after successful processing
-              await this.sqsClient.send(
-                new DeleteMessageCommand({
-                  QueueUrl: queueUrl,
-                  ReceiptHandle: message.ReceiptHandle!,
-                })
-              );
-            } catch (error) {
-              this.logger.error(
-                'Failed to process SQS message',
-                {
-                  messageId: message.MessageId,
-                  error: error.message,
-                }
-              );
-              // ไม่ delete - message จะ reappear หลัง VisibilityTimeout
-            }
-          })
-        );
-      } catch (error) {
-        this.logger.error('SQS consumer error', error);
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        if (this.isRunning) {
+          console.error('Error receiving message:', receiveError);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
       }
     }
   }
-}
-```
 
-```typescript
-// Terraform configuration สำหรับ SQS/SNS
-```
+  async stopConsuming(): Promise<void> {
+    this.isRunning = false;
 
-```hcl
-# infrastructure/terraform/messaging/sqs-sns.tf
+    // รอให้ประมวลผล messages ที่ค้างอยู่เสร็จ
+    while (this.processingCount > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
 
-# SNS Topic สำหรับ Order Events
-resource "aws_sns_topic" "order_events" {
-  name                        = "order-events.fifo"
-  fifo_topic                  = true
-  content_based_deduplication = false
-  
-  tags = {
-    Service     = "order-service"
-    Environment = var.environment
+    if (this.consumer) {
+      await this.consumer.close();
+    }
+    await this.client.close();
+    console.log('Pulsar consumer stopped');
   }
 }
 
-# SQS Queue สำหรับ Notification Service
-resource "aws_sqs_queue" "notification_service_queue" {
-  name                        = "notification-service-orders.fifo"
-  fifo_queue                  = true
-  content_based_deduplication = true
-  
-  # Visibility timeout ต้องมากกว่า Lambda timeout
-  visibility_timeout_seconds  = 300   # 5 minutes
-  message_retention_seconds   = 86400 # 24 hours
-  
-  # Dead Letter Queue
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.notification_dlq.arn
-    maxReceiveCount     = 3
-  })
+// Order processor handler
+async function processOrder(order: OrderEvent, messageId: string): Promise<void> {
+  console.log(`Processing order: ${order.orderId}`, {
+    customerId: order.customerId,
+    amount: order.totalAmount,
+    status: order.status,
+    messageId,
+  });
+
+  // จำลองการประมวลผล
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  console.log(`Order ${order.orderId} processed successfully`);
 }
 
-# Dead Letter Queue
-resource "aws_sqs_queue" "notification_dlq" {
-  name                      = "notification-service-orders-dlq.fifo"
-  fifo_queue                = true
-  message_retention_seconds = 1209600 # 14 days
+// ตัวอย่างการใช้งาน
+async function main() {
+  const consumer = new PulsarOrderConsumer(
+    'pulsar://localhost:6650',
+    {
+      subscriptionName: 'order-processor-subscription',
+      subscriptionType: Pulsar.SubscriptionType.KeyShared,
+      maxRedeliverCount: 3,
+      deadLetterTopic: 'persistent://public/default/orders-DLQ',
+    }
+  );
+
+  await consumer.initialize('persistent://public/default/orders');
+
+  // Handle graceful shutdown
+  process.on('SIGINT', async () => {
+    console.log('Shutting down...');
+    await consumer.stopConsuming();
+    process.exit(0);
+  });
+
+  await consumer.startConsuming(processOrder);
 }
 
-# Subscribe SQS to SNS
-resource "aws_sns_topic_subscription" "notification_subscription" {
-  topic_arn = aws_sns_topic.order_events.arn
-  protocol  = "sqs"
-  endpoint  = aws_sqs_queue.notification_service_queue.arn
-  
-  filter_policy = jsonencode({
-    eventType = ["order.created", "order.cancelled"]
-  })
-}
+main().catch(console.error);
 ```
 
 ---
 
-## Google Cloud Pub/Sub
+## 3. NATS JetStream: TypeScript Publisher/Consumer
 
-### เมื่อไหร่ควรใช้ Google Pub/Sub?
-- GCP-native workloads
-- Global message distribution
-- Very high throughput (10M+ messages/second)
-- Integration กับ BigQuery, Dataflow
+### 3.1 ติดตั้ง Dependencies
+
+```bash
+npm install nats
+npm install --save-dev @types/node
+```
+
+### 3.2 NATS JetStream Publisher พร้อม Persistence
 
 ```typescript
-// services/order/src/messaging/pubsub.service.ts
+// nats/jetstream-publisher.ts
+import {
+  connect,
+  NatsConnection,
+  JetStreamClient,
+  JetStreamManager,
+  StreamConfig,
+  RetentionPolicy,
+  StorageType,
+  DiscardPolicy,
+  StringCodec,
+  JSONCodec,
+} from 'nats';
 
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { PubSub, Message, Subscription } from '@google-cloud/pubsub';
+interface EventMessage<T = unknown> {
+  id: string;
+  type: string;
+  source: string;
+  timestamp: string;
+  data: T;
+  metadata?: Record<string, string>;
+}
 
-@Injectable()
-export class PubSubService implements OnModuleInit {
-  private readonly logger = new Logger(PubSubService.name);
-  private pubsub: PubSub;
-  private subscriptions: Map<string, Subscription> = new Map();
+interface UserCreatedEvent {
+  userId: string;
+  email: string;
+  name: string;
+  role: string;
+}
 
-  async onModuleInit(): Promise<void> {
-    this.pubsub = new PubSub({
-      projectId: process.env.GOOGLE_CLOUD_PROJECT,
+class NatsJetStreamPublisher {
+  private connection: NatsConnection | null = null;
+  private js: JetStreamClient | null = null;
+  private jsm: JetStreamManager | null = null;
+  private readonly jc = JSONCodec();
+
+  async connect(servers: string | string[] = 'nats://localhost:4222'): Promise<void> {
+    this.connection = await connect({
+      servers: Array.isArray(servers) ? servers : [servers],
+      // Reconnect configuration
+      maxReconnectAttempts: -1, // ไม่จำกัด
+      reconnectTimeWait: 2000,
+      // Authentication (optional)
+      // token: process.env.NATS_TOKEN,
+      // user: process.env.NATS_USER,
+      // pass: process.env.NATS_PASS,
+    });
+
+    this.js = this.connection.jetstream();
+    this.jsm = await this.connection.jetstreamManager();
+
+    console.log('Connected to NATS JetStream');
+  }
+
+  async createStream(config: Partial<StreamConfig> & { name: string }): Promise<void> {
+    if (!this.jsm) throw new Error('Not connected');
+
+    const streamConfig: StreamConfig = {
+      name: config.name,
+      subjects: config.subjects || [`${config.name}.>`],
+      // Retention policy
+      retention: config.retention || RetentionPolicy.Limits,
+      // Storage type
+      storage: config.storage || StorageType.File,
+      // Replication
+      num_replicas: config.num_replicas || 1,
+      // Limits
+      max_msgs: config.max_msgs || 1_000_000,
+      max_bytes: config.max_bytes || 1024 * 1024 * 1024, // 1GB
+      max_age: config.max_age || 7 * 24 * 60 * 60 * 1e9, // 7 days in nanoseconds
+      max_msg_size: config.max_msg_size || 1024 * 1024, // 1MB
+      // Discard policy
+      discard: config.discard || DiscardPolicy.Old,
+      // Deduplication window
+      duplicate_window: config.duplicate_window || 2 * 60 * 1e9, // 2 minutes
+    };
+
+    try {
+      // ตรวจสอบว่า stream มีอยู่แล้วหรือไม่
+      await this.jsm.streams.info(config.name);
+      console.log(`Stream ${config.name} already exists, updating...`);
+      await this.jsm.streams.update(config.name, streamConfig);
+    } catch {
+      // Stream ไม่มีอยู่ สร้างใหม่
+      await this.jsm.streams.add(streamConfig);
+      console.log(`Stream ${config.name} created`);
+    }
+  }
+
+  async publish<T>(
+    subject: string,
+    data: T,
+    options?: {
+      messageId?: string;
+      headers?: Record<string, string>;
+      timeout?: number;
+    }
+  ): Promise<{ seq: number; duplicate: boolean }> {
+    if (!this.js) throw new Error('Not connected');
+
+    const event: EventMessage<T> = {
+      id: options?.messageId || `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      type: subject.split('.').pop() || 'unknown',
+      source: process.env.SERVICE_NAME || 'unknown-service',
+      timestamp: new Date().toISOString(),
+      data,
+      metadata: options?.headers,
+    };
+
+    // สร้าง headers
+    const headers: Record<string, string> = {
+      'Nats-Msg-Id': event.id, // สำหรับ deduplication
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    };
+
+    // Publish พร้อม acknowledgment
+    const ack = await this.js.publish(
+      subject,
+      this.jc.encode(event),
+      {
+        msgID: event.id, // Deduplication ID
+        timeout: options?.timeout || 5000,
+        headers: Object.entries(headers).reduce((acc, [k, v]) => {
+          acc.set(k, v);
+          return acc;
+        }, new (require('nats').headers)()),
+      }
+    );
+
+    console.log(`Published to ${subject}: seq=${ack.seq}, duplicate=${ack.duplicate}`);
+    return { seq: ack.seq, duplicate: ack.duplicate };
+  }
+
+  async publishBatch<T>(
+    subject: string,
+    messages: T[],
+    batchSize = 100
+  ): Promise<Array<{ seq: number; duplicate: boolean }>> {
+    const results: Array<{ seq: number; duplicate: boolean }> = [];
+
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      const batchPromises = batch.map((msg) => this.publish(subject, msg));
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+    }
+
+    return results;
+  }
+
+  async close(): Promise<void> {
+    if (this.connection) {
+      await this.connection.drain();
+      await this.connection.close();
+      console.log('NATS connection closed');
+    }
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const publisher = new NatsJetStreamPublisher();
+
+  try {
+    await publisher.connect(['nats://localhost:4222']);
+
+    // สร้าง stream
+    await publisher.createStream({
+      name: 'USERS',
+      subjects: ['users.>'],
+      num_replicas: 1,
+    });
+
+    // Publish event
+    const userEvent: UserCreatedEvent = {
+      userId: `user-${Date.now()}`,
+      email: 'user@example.com',
+      name: 'John Doe',
+      role: 'customer',
+    };
+
+    const result = await publisher.publish('users.created', userEvent, {
+      headers: { 'X-Service': 'user-service' },
+    });
+
+    console.log('Published:', result);
+  } finally {
+    await publisher.close();
+  }
+}
+
+main().catch(console.error);
+```
+
+### 3.3 NATS JetStream Consumer พร้อม Durable Subscription
+
+```typescript
+// nats/jetstream-consumer.ts
+import {
+  connect,
+  NatsConnection,
+  JetStreamClient,
+  JetStreamManager,
+  ConsumerConfig,
+  AckPolicy,
+  DeliverPolicy,
+  ReplayPolicy,
+  JSONCodec,
+  NatsError,
+} from 'nats';
+
+interface EventMessage<T = unknown> {
+  id: string;
+  type: string;
+  source: string;
+  timestamp: string;
+  data: T;
+}
+
+type EventHandler<T> = (event: EventMessage<T>, ack: () => Promise<void>, nak: (delay?: number) => Promise<void>) => Promise<void>;
+
+class NatsJetStreamConsumer {
+  private connection: NatsConnection | null = null;
+  private js: JetStreamClient | null = null;
+  private jsm: JetStreamManager | null = null;
+  private readonly jc = JSONCodec();
+  private isRunning = false;
+
+  async connect(servers: string | string[] = 'nats://localhost:4222'): Promise<void> {
+    this.connection = await connect({
+      servers: Array.isArray(servers) ? servers : [servers],
+      maxReconnectAttempts: -1,
+      reconnectTimeWait: 2000,
+    });
+
+    this.js = this.connection.jetstream();
+    this.jsm = await this.connection.jetstreamManager();
+    console.log('Connected to NATS JetStream');
+  }
+
+  async createConsumer(
+    streamName: string,
+    consumerConfig: Partial<ConsumerConfig> & { durable_name: string }
+  ): Promise<void> {
+    if (!this.jsm) throw new Error('Not connected');
+
+    const config: ConsumerConfig = {
+      durable_name: consumerConfig.durable_name,
+      // Deliver policy - ส่งข้อความจากที่ไหน
+      deliver_policy: consumerConfig.deliver_policy || DeliverPolicy.New,
+      // Ack policy
+      ack_policy: consumerConfig.ack_policy || AckPolicy.Explicit,
+      // Ack wait time (nanoseconds)
+      ack_wait: consumerConfig.ack_wait || 30 * 1e9, // 30 seconds
+      // Max delivery attempts
+      max_deliver: consumerConfig.max_deliver || 3,
+      // Filter subject
+      filter_subject: consumerConfig.filter_subject,
+      // Replay policy
+      replay_policy: consumerConfig.replay_policy || ReplayPolicy.Instant,
+      // Max ack pending
+      max_ack_pending: consumerConfig.max_ack_pending || 1000,
+      // Heartbeat
+      idle_heartbeat: consumerConfig.idle_heartbeat,
+    };
+
+    try {
+      await this.jsm.consumers.info(streamName, consumerConfig.durable_name);
+      console.log(`Consumer ${consumerConfig.durable_name} already exists`);
+    } catch {
+      await this.jsm.consumers.add(streamName, config);
+      console.log(`Consumer ${consumerConfig.durable_name} created`);
+    }
+  }
+
+  async subscribe<T>(
+    streamName: string,
+    durableName: string,
+    handler: EventHandler<T>,
+    options?: {
+      filterSubject?: string;
+      maxMessages?: number;
+      concurrency?: number;
+    }
+  ): Promise<void> {
+    if (!this.js) throw new Error('Not connected');
+
+    this.isRunning = true;
+
+    // Subscribe ด้วย durable consumer
+    const subscription = await this.js.subscribe(
+      options?.filterSubject || `${streamName.toLowerCase()}.>`,
+      {
+        config: {
+          durable_name: durableName,
+          ack_policy: AckPolicy.Explicit,
+          deliver_policy: DeliverPolicy.New,
+          max_deliver: 3,
+        },
+      }
+    );
+
+    console.log(`Subscribed with durable: ${durableName}`);
+
+    // ประมวลผล messages
+    const semaphore = options?.concurrency || 10;
+    let activeCount = 0;
+
+    for await (const message of subscription) {
+      if (!this.isRunning) break;
+
+      // Concurrency control
+      while (activeCount >= semaphore) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      activeCount++;
+
+      // ประมวลผลแบบ async
+      (async () => {
+        try {
+          const event = this.jc.decode(message.data) as EventMessage<T>;
+
+          const ack = async () => {
+            message.ack();
+          };
+
+          const nak = async (delay?: number) => {
+            if (delay) {
+              message.nak(delay);
+            } else {
+              message.nak();
+            }
+          };
+
+          await handler(event, ack, nak);
+        } catch (error) {
+          console.error('Error processing message:', error);
+          message.nak(5000); // Retry after 5 seconds
+        } finally {
+          activeCount--;
+        }
+      })();
+
+      if (options?.maxMessages && subscription.getProcessed() >= options.maxMessages) {
+        break;
+      }
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.isRunning = false;
+    if (this.connection) {
+      await this.connection.drain();
+      await this.connection.close();
+    }
+    console.log('NATS consumer stopped');
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const consumer = new NatsJetStreamConsumer();
+
+  try {
+    await consumer.connect('nats://localhost:4222');
+
+    await consumer.createConsumer('USERS', {
+      durable_name: 'user-processor',
+      filter_subject: 'users.>',
+      max_deliver: 3,
+    });
+
+    process.on('SIGINT', async () => {
+      await consumer.stop();
+      process.exit(0);
+    });
+
+    await consumer.subscribe<{ userId: string; email: string }>(
+      'USERS',
+      'user-processor',
+      async (event, ack, nak) => {
+        console.log('Processing event:', event.type, event.data);
+        try {
+          // ประมวลผล
+          await ack();
+        } catch (error) {
+          await nak(5000);
+        }
+      },
+      { filterSubject: 'users.>', concurrency: 5 }
+    );
+  } catch (error) {
+    console.error('Fatal error:', error);
+    await consumer.stop();
+  }
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 4. Message Ordering Strategies
+
+### 4.1 Kafka Partition-based Ordering
+
+```typescript
+// kafka/ordering-producer.ts
+import { Kafka, Producer, Message, CompressionTypes } from 'kafkajs';
+
+interface OrderedMessage {
+  key: string;   // Partition key สำหรับ ordering
+  value: unknown;
+  headers?: Record<string, string>;
+}
+
+class KafkaOrderedProducer {
+  private kafka: Kafka;
+  private producer: Producer;
+
+  constructor(brokers: string[] = ['localhost:9092']) {
+    this.kafka = new Kafka({
+      clientId: 'ordered-producer',
+      brokers,
+      retry: {
+        initialRetryTime: 100,
+        retries: 8,
+      },
+    });
+
+    this.producer = this.kafka.producer({
+      // Idempotent producer สำหรับ exactly-once
+      idempotent: true,
+      // Max in-flight requests เมื่อใช้ idempotent
+      maxInFlightRequests: 1,
+      // Acks ต้องเป็น -1 (all) สำหรับ idempotent
+      allowAutoTopicCreation: false,
     });
   }
 
-  async publish(
-    topicName: string,
-    data: unknown,
-    attributes?: Record<string, string>,
-  ): Promise<string> {
-    const topic = this.pubsub.topic(topicName, {
-      batching: {
-        maxMessages: 1000,
-        maxMilliseconds: 100,
-      },
-      flowControl: {
-        maxOutstandingMessages: 100,
-      },
+  async connect(): Promise<void> {
+    await this.producer.connect();
+    console.log('Kafka producer connected');
+  }
+
+  // ส่ง messages พร้อม ordering guarantee ตาม key
+  async sendOrdered(topic: string, messages: OrderedMessage[]): Promise<void> {
+    const kafkaMessages: Message[] = messages.map((msg) => ({
+      key: msg.key,
+      value: JSON.stringify(msg.value),
+      headers: msg.headers
+        ? Object.entries(msg.headers).reduce(
+            (acc, [k, v]) => ({ ...acc, [k]: Buffer.from(v) }),
+            {}
+          )
+        : undefined,
+    }));
+
+    await this.producer.send({
+      topic,
+      messages: kafkaMessages,
+      compression: CompressionTypes.GZIP,
     });
 
-    const messageId = await topic.publishMessage({
-      json: data,
-      attributes: {
-        source: 'order-service',
-        environment: process.env.NODE_ENV || 'production',
-        ...attributes,
+    console.log(`Sent ${messages.length} messages to ${topic}`);
+  }
+
+  // กลยุทธ์การเลือก partition key
+  getPartitionKey(entityId: string, strategy: 'entity' | 'hash' | 'round-robin' = 'entity'): string {
+    switch (strategy) {
+      case 'entity':
+        // ใช้ entity ID โดยตรง - messages ของ entity เดียวกันไปที่ partition เดียวกัน
+        return entityId;
+
+      case 'hash':
+        // Hash ของ entity ID - กระจาย load ให้สม่ำเสมอ
+        const hash = Array.from(entityId).reduce((acc, char) => {
+          return ((acc << 5) - acc) + char.charCodeAt(0);
+        }, 0);
+        return Math.abs(hash).toString();
+
+      case 'round-robin':
+        // ไม่มี key - Kafka จะ round-robin โดยอัตโนมัติ
+        return '';
+
+      default:
+        return entityId;
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer.disconnect();
+    console.log('Kafka producer disconnected');
+  }
+}
+
+// ตัวอย่างการใช้ ordering สำหรับ order events
+async function demonstrateOrdering() {
+  const producer = new KafkaOrderedProducer(['localhost:9092']);
+  await producer.connect();
+
+  try {
+    // Events ของ order เดียวกัน - ต้องมี ordering guarantee
+    const orderId = 'order-12345';
+    const orderEvents: OrderedMessage[] = [
+      {
+        key: producer.getPartitionKey(orderId),
+        value: { orderId, event: 'CREATED', timestamp: Date.now() },
+      },
+      {
+        key: producer.getPartitionKey(orderId),
+        value: { orderId, event: 'PAYMENT_INITIATED', timestamp: Date.now() + 100 },
+      },
+      {
+        key: producer.getPartitionKey(orderId),
+        value: { orderId, event: 'PAYMENT_CONFIRMED', timestamp: Date.now() + 200 },
+      },
+      {
+        key: producer.getPartitionKey(orderId),
+        value: { orderId, event: 'SHIPPED', timestamp: Date.now() + 300 },
+      },
+    ];
+
+    await producer.sendOrdered('order-events', orderEvents);
+    console.log(`Sent ${orderEvents.length} ordered events for order ${orderId}`);
+  } finally {
+    await producer.disconnect();
+  }
+}
+
+demonstrateOrdering().catch(console.error);
+```
+
+---
+
+## 5. At-least-once vs Exactly-once
+
+### 5.1 Kafka Idempotent Producer (At-least-once ที่ปลอดภัยกว่า)
+
+```typescript
+// kafka/idempotent-producer.ts
+import { Kafka, Producer, Transaction } from 'kafkajs';
+
+class KafkaIdempotentProducer {
+  private kafka: Kafka;
+  private producer: Producer;
+
+  constructor(brokers: string[] = ['localhost:9092']) {
+    this.kafka = new Kafka({
+      clientId: 'idempotent-producer',
+      brokers,
+    });
+
+    // Idempotent producer - ป้องกัน duplicate เมื่อ retry
+    this.producer = this.kafka.producer({
+      idempotent: true,            // เปิด idempotent mode
+      maxInFlightRequests: 5,      // จำกัด in-flight requests
+      transactionalId: undefined,  // ไม่ใช้ transactions ในโหมดนี้
+    });
+  }
+
+  async connect(): Promise<void> {
+    await this.producer.connect();
+  }
+
+  // At-least-once ที่ปลอดภัย - ไม่มี duplicate จาก producer side
+  async sendIdempotent(topic: string, key: string, value: unknown): Promise<void> {
+    // แม้จะ retry ข้อความจะไม่ duplicate ใน Kafka
+    await this.producer.send({
+      topic,
+      messages: [
+        {
+          key,
+          value: JSON.stringify(value),
+        },
+      ],
+      acks: -1,  // รอ ack จากทุก replica
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer.disconnect();
+  }
+}
+```
+
+### 5.2 Kafka Transactions (Exactly-once)
+
+```typescript
+// kafka/transactional-producer.ts
+import { Kafka, Producer, Transaction, EachMessagePayload } from 'kafkajs';
+
+class KafkaTransactionalProducer {
+  private kafka: Kafka;
+  private producer: Producer;
+
+  constructor(
+    brokers: string[] = ['localhost:9092'],
+    private readonly transactionalId: string = 'my-transactional-producer'
+  ) {
+    this.kafka = new Kafka({
+      clientId: 'transactional-producer',
+      brokers,
+    });
+
+    // Transactional producer สำหรับ exactly-once
+    this.producer = this.kafka.producer({
+      idempotent: true,              // ต้องเปิด
+      maxInFlightRequests: 1,        // ต้องเป็น 1 สำหรับ transactions
+      transactionalId,               // Unique ID สำหรับ producer นี้
+    });
+  }
+
+  async connect(): Promise<void> {
+    await this.producer.connect();
+    console.log(`Transactional producer connected: ${this.transactionalId}`);
+  }
+
+  // Exactly-once: อ่านจาก topic A แล้วเขียนไป topic B ใน transaction เดียว
+  async processExactlyOnce(
+    sourceMessages: EachMessagePayload[],
+    processedTopic: string,
+    transform: (message: unknown) => unknown
+  ): Promise<void> {
+    const transaction = await this.producer.transaction();
+
+    try {
+      // 1. ประมวลผล messages
+      const processedMessages = sourceMessages.map((msg) => {
+        const value = msg.message.value
+          ? JSON.parse(msg.message.value.toString())
+          : null;
+        return {
+          key: msg.message.key?.toString(),
+          value: JSON.stringify(transform(value)),
+          headers: { 'X-Source-Offset': msg.message.offset },
+        };
+      });
+
+      // 2. เขียน messages ที่ประมวลผลแล้ว
+      await transaction.send({
+        topic: processedTopic,
+        messages: processedMessages,
+      });
+
+      // 3. Commit offsets ใน transaction เดียวกัน (สำคัญมาก!)
+      await transaction.sendOffsets({
+        consumerGroupId: 'my-consumer-group',
+        topics: sourceMessages.reduce<Record<string, Record<number, string>>>((acc, msg) => {
+          if (!acc[msg.topic]) acc[msg.topic] = {};
+          // +1 เพื่อ commit offset ถัดไป
+          acc[msg.topic][msg.partition] = (parseInt(msg.message.offset) + 1).toString();
+          return acc;
+        }, {}),
+      });
+
+      // 4. Commit transaction
+      await transaction.commit();
+      console.log('Transaction committed successfully');
+    } catch (error) {
+      // Rollback transaction เมื่อเกิด error
+      await transaction.abort();
+      console.error('Transaction aborted:', error);
+      throw error;
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer.disconnect();
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function demonstrateExactlyOnce() {
+  const producer = new KafkaTransactionalProducer(
+    ['localhost:9092'],
+    'order-processor-txn-1'
+  );
+
+  await producer.connect();
+
+  try {
+    // จำลอง source messages
+    const sourceMessages: EachMessagePayload[] = [
+      {
+        topic: 'raw-orders',
+        partition: 0,
+        message: {
+          key: Buffer.from('order-001'),
+          value: Buffer.from(JSON.stringify({ orderId: 'order-001', amount: 100 })),
+          offset: '10',
+          timestamp: Date.now().toString(),
+          attributes: 0,
+          headers: {},
+          size: 0,
+        },
+        heartbeat: async () => {},
+        pause: () => () => {},
+      },
+    ];
+
+    // ประมวลผลแบบ exactly-once
+    await producer.processExactlyOnce(
+      sourceMessages,
+      'processed-orders',
+      (raw: any) => ({
+        ...raw,
+        processedAt: new Date().toISOString(),
+        status: 'PROCESSED',
+      })
+    );
+  } finally {
+    await producer.disconnect();
+  }
+}
+
+demonstrateExactlyOnce().catch(console.error);
+```
+
+---
+
+## 6. Message Replay
+
+### 6.1 Kafka Consumer จาก Specific Offset
+
+```typescript
+// kafka/replay-consumer.ts
+import { Kafka, Consumer, EachMessagePayload, SeekEntry } from 'kafkajs';
+
+interface ReplayOptions {
+  topic: string;
+  partition: number;
+  fromOffset: string | 'earliest' | 'latest';
+  toOffset?: string;
+  fromTimestamp?: number; // Unix timestamp ใน milliseconds
+}
+
+class KafkaReplayConsumer {
+  private kafka: Kafka;
+  private consumer: Consumer;
+
+  constructor(
+    brokers: string[] = ['localhost:9092'],
+    private readonly groupId: string = 'replay-consumer'
+  ) {
+    this.kafka = new Kafka({
+      clientId: 'replay-consumer',
+      brokers,
+    });
+
+    this.consumer = this.kafka.consumer({ groupId });
+  }
+
+  async connect(): Promise<void> {
+    await this.consumer.connect();
+    console.log('Kafka replay consumer connected');
+  }
+
+  // Replay จาก specific offset
+  async replayFromOffset(
+    options: ReplayOptions,
+    handler: (payload: EachMessagePayload) => Promise<void>
+  ): Promise<void> {
+    await this.consumer.subscribe({
+      topic: options.topic,
+      fromBeginning: options.fromOffset === 'earliest',
+    });
+
+    // Seek ไปที่ offset ที่ต้องการ
+    this.consumer.on('consumer.group_join', async () => {
+      if (options.fromOffset !== 'earliest' && options.fromOffset !== 'latest') {
+        await this.consumer.seek({
+          topic: options.topic,
+          partition: options.partition,
+          offset: options.fromOffset,
+        });
+        console.log(`Seeking to offset ${options.fromOffset} on partition ${options.partition}`);
+      }
+    });
+
+    await this.consumer.run({
+      eachMessage: async (payload) => {
+        // หยุดเมื่อถึง toOffset
+        if (
+          options.toOffset &&
+          parseInt(payload.message.offset) > parseInt(options.toOffset)
+        ) {
+          await this.consumer.stop();
+          return;
+        }
+
+        await handler(payload);
       },
     });
+  }
+
+  // Replay จาก timestamp
+  async replayFromTimestamp(
+    topic: string,
+    partitions: number[],
+    fromTimestamp: number,
+    handler: (payload: EachMessagePayload) => Promise<void>
+  ): Promise<void> {
+    const admin = this.kafka.admin();
+    await admin.connect();
+
+    try {
+      // หา offsets ที่ตรงกับ timestamp
+      const offsetsByTime = await admin.fetchTopicOffsetsByTime(topic, fromTimestamp);
+
+      await this.consumer.subscribe({ topic, fromBeginning: false });
+
+      // Seek ไปที่ offsets ที่คำนวณได้
+      this.consumer.on('consumer.group_join', async () => {
+        for (const offsetInfo of offsetsByTime) {
+          if (partitions.includes(offsetInfo.partition)) {
+            await this.consumer.seek({
+              topic,
+              partition: offsetInfo.partition,
+              offset: offsetInfo.offset,
+            });
+            console.log(`Replay partition ${offsetInfo.partition} from offset ${offsetInfo.offset}`);
+          }
+        }
+      });
+
+      await this.consumer.run({
+        eachMessage: handler,
+      });
+    } finally {
+      await admin.disconnect();
+    }
+  }
+
+  async stop(): Promise<void> {
+    await this.consumer.stop();
+    await this.consumer.disconnect();
+    console.log('Replay consumer stopped');
+  }
+}
+
+// ตัวอย่าง: Replay events จาก 1 ชั่วโมงที่แล้ว
+async function replayLastHour() {
+  const consumer = new KafkaReplayConsumer(['localhost:9092'], 'replay-group-001');
+  await consumer.connect();
+
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+
+  await consumer.replayFromTimestamp(
+    'order-events',
+    [0, 1, 2], // partitions
+    oneHourAgo,
+    async ({ message, partition, topic }) => {
+      const event = JSON.parse(message.value?.toString() || '{}');
+      console.log(`Replaying: partition=${partition}, offset=${message.offset}`, event);
+    }
+  );
+}
+```
+
+### 6.2 NATS Replay Policy
+
+```typescript
+// nats/replay-consumer.ts
+import {
+  connect,
+  JetStreamManager,
+  DeliverPolicy,
+  ReplayPolicy,
+} from 'nats';
+
+async function setupReplayConsumer() {
+  const nc = await connect({ servers: 'nats://localhost:4222' });
+  const jsm = await nc.jetstreamManager();
+  const js = nc.jetstream();
+
+  // Consumer สำหรับ replay ทั้งหมด
+  await jsm.consumers.add('ORDERS', {
+    durable_name: 'order-replay-all',
+    deliver_policy: DeliverPolicy.All,  // เริ่มจากข้อความแรกสุด
+    ack_policy: require('nats').AckPolicy.Explicit,
+    replay_policy: ReplayPolicy.Instant, // ส่งทันที
+  });
+
+  // Consumer สำหรับ replay จาก timestamp
+  const fromTime = new Date(Date.now() - 3600000); // 1 ชั่วโมงที่แล้ว
+  await jsm.consumers.add('ORDERS', {
+    durable_name: 'order-replay-from-time',
+    deliver_policy: DeliverPolicy.StartTime,
+    opt_start_time: fromTime.toISOString(),
+    ack_policy: require('nats').AckPolicy.Explicit,
+  });
+
+  // Consumer สำหรับ replay จาก sequence number
+  await jsm.consumers.add('ORDERS', {
+    durable_name: 'order-replay-from-seq',
+    deliver_policy: DeliverPolicy.StartSequence,
+    opt_start_seq: 100, // เริ่มจาก sequence 100
+    ack_policy: require('nats').AckPolicy.Explicit,
+  });
+
+  // Consumer แบบ Original Rate Replay (replay ด้วย rate เดิม)
+  await jsm.consumers.add('ORDERS', {
+    durable_name: 'order-replay-original-rate',
+    deliver_policy: DeliverPolicy.All,
+    replay_policy: ReplayPolicy.Original, // ส่งในอัตราเดิม
+    ack_policy: require('nats').AckPolicy.Explicit,
+  });
+
+  await nc.drain();
+  await nc.close();
+}
+
+setupReplayConsumer().catch(console.error);
+```
+
+---
+
+## 7. Dead Letter Queue (DLQ) Patterns
+
+### 7.1 Universal DLQ Handler
+
+```typescript
+// dlq/dlq-handler.ts
+import { Kafka, Consumer, Producer, EachMessagePayload } from 'kafkajs';
+
+interface DLQMessage {
+  originalTopic: string;
+  originalPartition: number;
+  originalOffset: string;
+  originalKey: string | null;
+  originalValue: string | null;
+  originalHeaders: Record<string, string>;
+  errorMessage: string;
+  errorStack?: string;
+  failedAt: string;
+  retryCount: number;
+  maxRetries: number;
+}
+
+class KafkaDLQHandler {
+  private kafka: Kafka;
+  private producer: Producer;
+  private consumer: Consumer;
+  private dlqConsumer: Consumer;
+
+  constructor(
+    brokers: string[] = ['localhost:9092'],
+    private readonly config: {
+      sourceTopic: string;
+      dlqTopic: string;
+      retryTopic: string;
+      consumerGroupId: string;
+      maxRetries: number;
+      retryDelayMs: number;
+    }
+  ) {
+    this.kafka = new Kafka({ clientId: 'dlq-handler', brokers });
+    this.producer = this.kafka.producer({ idempotent: true });
+    this.consumer = this.kafka.consumer({ groupId: config.consumerGroupId });
+    this.dlqConsumer = this.kafka.consumer({
+      groupId: `${config.consumerGroupId}-dlq-processor`,
+    });
+  }
+
+  async connect(): Promise<void> {
+    await this.producer.connect();
+    await this.consumer.connect();
+    await this.dlqConsumer.connect();
+  }
+
+  // ส่ง message ไปยัง DLQ
+  async sendToDLQ(
+    originalPayload: EachMessagePayload,
+    error: Error,
+    retryCount: number
+  ): Promise<void> {
+    const dlqMessage: DLQMessage = {
+      originalTopic: originalPayload.topic,
+      originalPartition: originalPayload.partition,
+      originalOffset: originalPayload.message.offset,
+      originalKey: originalPayload.message.key?.toString() || null,
+      originalValue: originalPayload.message.value?.toString() || null,
+      originalHeaders: Object.entries(originalPayload.message.headers || {}).reduce(
+        (acc, [k, v]) => ({
+          ...acc,
+          [k]: Buffer.isBuffer(v) ? v.toString() : String(v),
+        }),
+        {}
+      ),
+      errorMessage: error.message,
+      errorStack: error.stack,
+      failedAt: new Date().toISOString(),
+      retryCount,
+      maxRetries: this.config.maxRetries,
+    };
+
+    await this.producer.send({
+      topic: this.config.dlqTopic,
+      messages: [
+        {
+          key: originalPayload.message.key,
+          value: JSON.stringify(dlqMessage),
+          headers: {
+            'X-DLQ-Original-Topic': Buffer.from(originalPayload.topic),
+            'X-DLQ-Error': Buffer.from(error.message),
+            'X-DLQ-Retry-Count': Buffer.from(retryCount.toString()),
+          },
+        },
+      ],
+    });
+
+    console.error(
+      `Message sent to DLQ: topic=${this.config.dlqTopic}, retries=${retryCount}`,
+      { error: error.message }
+    );
+  }
+
+  // ประมวลผล message พร้อม retry logic
+  async processWithRetry(
+    payload: EachMessagePayload,
+    handler: (payload: EachMessagePayload) => Promise<void>
+  ): Promise<void> {
+    let retryCount = 0;
+
+    // อ่าน retry count จาก headers
+    const retryCountHeader = payload.message.headers?.['X-Retry-Count'];
+    if (retryCountHeader) {
+      retryCount = parseInt(
+        Buffer.isBuffer(retryCountHeader) ? retryCountHeader.toString() : String(retryCountHeader)
+      );
+    }
+
+    try {
+      await handler(payload);
+    } catch (error) {
+      retryCount++;
+
+      if (retryCount >= this.config.maxRetries) {
+        // ส่งไป DLQ
+        await this.sendToDLQ(payload, error as Error, retryCount);
+      } else {
+        // ส่งไป retry topic พร้อม delay
+        await this.sendToRetry(payload, error as Error, retryCount);
+      }
+    }
+  }
+
+  // ส่งไป retry topic
+  private async sendToRetry(
+    payload: EachMessagePayload,
+    error: Error,
+    retryCount: number
+  ): Promise<void> {
+    const retryDelay = this.config.retryDelayMs * Math.pow(2, retryCount - 1); // Exponential backoff
+
+    await this.producer.send({
+      topic: this.config.retryTopic,
+      messages: [
+        {
+          key: payload.message.key,
+          value: payload.message.value,
+          headers: {
+            ...payload.message.headers,
+            'X-Retry-Count': Buffer.from(retryCount.toString()),
+            'X-Retry-After': Buffer.from((Date.now() + retryDelay).toString()),
+            'X-Original-Topic': Buffer.from(payload.topic),
+            'X-Last-Error': Buffer.from(error.message),
+          },
+        },
+      ],
+    });
+
+    console.log(`Message sent to retry topic: retry=${retryCount}, delay=${retryDelay}ms`);
+  }
+
+  // DLQ consumer สำหรับ manual inspection และ reprocessing
+  async startDLQProcessor(
+    reprocessHandler?: (dlqMessage: DLQMessage) => Promise<boolean>
+  ): Promise<void> {
+    await this.dlqConsumer.subscribe({
+      topic: this.config.dlqTopic,
+      fromBeginning: false,
+    });
+
+    await this.dlqConsumer.run({
+      eachMessage: async (payload) => {
+        const dlqMessage = JSON.parse(
+          payload.message.value?.toString() || '{}'
+        ) as DLQMessage;
+
+        console.log('DLQ message received:', {
+          originalTopic: dlqMessage.originalTopic,
+          error: dlqMessage.errorMessage,
+          retryCount: dlqMessage.retryCount,
+          failedAt: dlqMessage.failedAt,
+        });
+
+        // ถ้ามี reprocess handler ให้ลอง reprocess
+        if (reprocessHandler) {
+          const shouldReprocess = await reprocessHandler(dlqMessage);
+
+          if (shouldReprocess && dlqMessage.originalValue) {
+            // ส่ง message กลับไปที่ original topic
+            await this.producer.send({
+              topic: dlqMessage.originalTopic,
+              messages: [
+                {
+                  key: dlqMessage.originalKey
+                    ? Buffer.from(dlqMessage.originalKey)
+                    : null,
+                  value: Buffer.from(dlqMessage.originalValue),
+                  headers: {
+                    'X-Reprocessed-From-DLQ': Buffer.from('true'),
+                    'X-Original-Failed-At': Buffer.from(dlqMessage.failedAt),
+                  },
+                },
+              ],
+            });
+            console.log(`Message reprocessed from DLQ to ${dlqMessage.originalTopic}`);
+          }
+        }
+      },
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer.disconnect();
+    await this.consumer.disconnect();
+    await this.dlqConsumer.disconnect();
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const dlqHandler = new KafkaDLQHandler(['localhost:9092'], {
+    sourceTopic: 'orders',
+    dlqTopic: 'orders-dlq',
+    retryTopic: 'orders-retry',
+    consumerGroupId: 'order-processor',
+    maxRetries: 3,
+    retryDelayMs: 1000,
+  });
+
+  await dlqHandler.connect();
+
+  // เริ่ม DLQ processor
+  await dlqHandler.startDLQProcessor(async (dlqMessage) => {
+    // logic สำหรับตัดสินใจว่าจะ reprocess หรือไม่
+    const isTransientError = dlqMessage.errorMessage.includes('timeout');
+    return isTransientError;
+  });
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 8. Broker Monitoring: Prometheus Metrics
+
+### 8.1 Kafka Metrics Configuration
+
+```yaml
+# kubernetes/kafka-prometheus.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics-config
+  namespace: kafka
+data:
+  metrics.yaml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Broker metrics
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec, topic=(.+)><>Count
+        name: kafka_server_brokertopicmetrics_messagesinpersec_count
+        labels:
+          topic: "$1"
+
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=BytesInPerSec, topic=(.+)><>Count
+        name: kafka_server_brokertopicmetrics_bytesinpersec_count
+        labels:
+          topic: "$1"
+
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=BytesOutPerSec, topic=(.+)><>Count
+        name: kafka_server_brokertopicmetrics_bytesoutpersec_count
+        labels:
+          topic: "$1"
+
+      # Consumer lag
+      - pattern: kafka.server<type=FetcherLagMetrics, name=ConsumerLag, clientId=(.+), topic=(.+), partition=(.+)><>Value
+        name: kafka_server_fetcherlagmetrics_consumerlag
+        labels:
+          client_id: "$1"
+          topic: "$2"
+          partition: "$3"
+
+      # Under replicated partitions
+      - pattern: kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value
+        name: kafka_server_replicamanager_underreplicatedpartitions
+
+      # Active controller count
+      - pattern: kafka.controller<type=KafkaController, name=ActiveControllerCount><>Value
+        name: kafka_controller_kafkacontroller_activecontrollercount
+
+      # Request handler idle ratio
+      - pattern: kafka.server<type=KafkaRequestHandlerPool, name=RequestHandlerAvgIdlePercent><>MeanRate
+        name: kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_meanrate
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kafka-broker
+  namespace: kafka
+spec:
+  selector:
+    matchLabels:
+      app: kafka
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+```
+
+### 8.2 Prometheus Alerts สำหรับ Kafka
+
+```yaml
+# monitoring/kafka-alerts.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kafka-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: kafka.rules
+      interval: 30s
+      rules:
+        # Consumer lag สูง
+        - alert: KafkaConsumerLagHigh
+          expr: |
+            kafka_consumergroup_lag_sum > 10000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kafka consumer lag is high"
+            description: "Consumer group {{ $labels.consumergroup }} has lag {{ $value }} on topic {{ $labels.topic }}"
+
+        # Under-replicated partitions
+        - alert: KafkaUnderReplicatedPartitions
+          expr: |
+            kafka_server_replicamanager_underreplicatedpartitions > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka has under-replicated partitions"
+            description: "Broker {{ $labels.instance }} has {{ $value }} under-replicated partitions"
+
+        # No active controller
+        - alert: KafkaNoActiveController
+          expr: |
+            sum(kafka_controller_kafkacontroller_activecontrollercount) == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka has no active controller"
+
+        # Offline partitions
+        - alert: KafkaOfflinePartitions
+          expr: |
+            kafka_controller_kafkacontroller_offlinepartitionscount > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka has offline partitions"
+
+        # Broker down
+        - alert: KafkaBrokerDown
+          expr: |
+            up{job="kafka"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka broker is down"
+```
+
+### 8.3 TypeScript Prometheus Client สำหรับ Custom Metrics
+
+```typescript
+// monitoring/broker-metrics.ts
+import { Registry, Counter, Gauge, Histogram, collectDefaultMetrics } from 'prom-client';
+
+class MessageBrokerMetrics {
+  private readonly registry: Registry;
+
+  // Counters
+  readonly messagesProduced: Counter<string>;
+  readonly messagesConsumed: Counter<string>;
+  readonly messagesFailed: Counter<string>;
+  readonly dlqMessages: Counter<string>;
+
+  // Gauges
+  readonly consumerLag: Gauge<string>;
+  readonly activeConsumers: Gauge<string>;
+  readonly connectionPoolSize: Gauge<string>;
+
+  // Histograms
+  readonly producerLatency: Histogram<string>;
+  readonly consumerProcessingDuration: Histogram<string>;
+  readonly messageSize: Histogram<string>;
+
+  constructor(prefix = 'message_broker') {
+    this.registry = new Registry();
+    collectDefaultMetrics({ register: this.registry });
+
+    this.messagesProduced = new Counter({
+      name: `${prefix}_messages_produced_total`,
+      help: 'Total number of messages produced',
+      labelNames: ['topic', 'broker', 'status'],
+      registers: [this.registry],
+    });
+
+    this.messagesConsumed = new Counter({
+      name: `${prefix}_messages_consumed_total`,
+      help: 'Total number of messages consumed',
+      labelNames: ['topic', 'consumer_group', 'status'],
+      registers: [this.registry],
+    });
+
+    this.messagesFailed = new Counter({
+      name: `${prefix}_messages_failed_total`,
+      help: 'Total number of failed message processings',
+      labelNames: ['topic', 'consumer_group', 'error_type'],
+      registers: [this.registry],
+    });
+
+    this.dlqMessages = new Counter({
+      name: `${prefix}_dlq_messages_total`,
+      help: 'Total number of messages sent to DLQ',
+      labelNames: ['source_topic', 'dlq_topic', 'error_type'],
+      registers: [this.registry],
+    });
+
+    this.consumerLag = new Gauge({
+      name: `${prefix}_consumer_lag`,
+      help: 'Current consumer lag per topic partition',
+      labelNames: ['topic', 'partition', 'consumer_group'],
+      registers: [this.registry],
+    });
+
+    this.activeConsumers = new Gauge({
+      name: `${prefix}_active_consumers`,
+      help: 'Number of active consumers',
+      labelNames: ['consumer_group'],
+      registers: [this.registry],
+    });
+
+    this.connectionPoolSize = new Gauge({
+      name: `${prefix}_connection_pool_size`,
+      help: 'Current connection pool size',
+      labelNames: ['broker', 'type'],
+      registers: [this.registry],
+    });
+
+    this.producerLatency = new Histogram({
+      name: `${prefix}_producer_latency_seconds`,
+      help: 'Producer message publish latency in seconds',
+      labelNames: ['topic', 'broker'],
+      buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+      registers: [this.registry],
+    });
+
+    this.consumerProcessingDuration = new Histogram({
+      name: `${prefix}_consumer_processing_duration_seconds`,
+      help: 'Consumer message processing duration in seconds',
+      labelNames: ['topic', 'consumer_group'],
+      buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5, 10],
+      registers: [this.registry],
+    });
+
+    this.messageSize = new Histogram({
+      name: `${prefix}_message_size_bytes`,
+      help: 'Message size in bytes',
+      labelNames: ['topic'],
+      buckets: [100, 1000, 10000, 100000, 1000000],
+      registers: [this.registry],
+    });
+  }
+
+  async getMetrics(): Promise<string> {
+    return this.registry.metrics();
+  }
+
+  getContentType(): string {
+    return this.registry.contentType;
+  }
+}
+
+// Singleton instance
+export const brokerMetrics = new MessageBrokerMetrics();
+
+// Express endpoint สำหรับ /metrics
+import express from 'express';
+
+const app = express();
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', brokerMetrics.getContentType());
+  res.send(await brokerMetrics.getMetrics());
+});
+
+app.listen(9090, () => {
+  console.log('Metrics server listening on :9090');
+});
+```
+
+---
+
+## 9. Migration Guide: RabbitMQ → Kafka
+
+### 9.1 TypeScript Migration Example
+
+```typescript
+// migration/rabbitmq-to-kafka-migration.ts
+import amqplib, { Connection, Channel } from 'amqplib';
+import { Kafka, Producer, Consumer } from 'kafkajs';
+
+// =========================================================
+// Step 1: สร้าง Abstraction Layer
+// =========================================================
+
+interface MessageBrokerAdapter {
+  connect(): Promise<void>;
+  publish(topic: string, message: unknown, key?: string): Promise<void>;
+  subscribe(topic: string, handler: (message: unknown) => Promise<void>): Promise<void>;
+  disconnect(): Promise<void>;
+}
+
+// =========================================================
+// Step 2: RabbitMQ Adapter (existing)
+// =========================================================
+
+class RabbitMQAdapter implements MessageBrokerAdapter {
+  private connection: Connection | null = null;
+  private channel: Channel | null = null;
+
+  constructor(private readonly url: string = 'amqp://localhost') {}
+
+  async connect(): Promise<void> {
+    this.connection = await amqplib.connect(this.url);
+    this.channel = await this.connection.createChannel();
+    console.log('Connected to RabbitMQ');
+  }
+
+  async publish(exchange: string, message: unknown, routingKey = ''): Promise<void> {
+    if (!this.channel) throw new Error('Not connected');
+
+    await this.channel.assertExchange(exchange, 'topic', { durable: true });
+    this.channel.publish(
+      exchange,
+      routingKey,
+      Buffer.from(JSON.stringify(message)),
+      { persistent: true }
+    );
+  }
+
+  async subscribe(queue: string, handler: (message: unknown) => Promise<void>): Promise<void> {
+    if (!this.channel) throw new Error('Not connected');
+
+    await this.channel.assertQueue(queue, { durable: true });
+    this.channel.prefetch(1);
+
+    await this.channel.consume(queue, async (msg) => {
+      if (!msg) return;
+
+      try {
+        const content = JSON.parse(msg.content.toString());
+        await handler(content);
+        this.channel?.ack(msg);
+      } catch (error) {
+        this.channel?.nack(msg, false, false);
+        console.error('Error processing message:', error);
+      }
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    await this.channel?.close();
+    await this.connection?.close();
+    console.log('Disconnected from RabbitMQ');
+  }
+}
+
+// =========================================================
+// Step 3: Kafka Adapter (target)
+// =========================================================
+
+class KafkaAdapter implements MessageBrokerAdapter {
+  private kafka: Kafka;
+  private producer: Producer | null = null;
+  private consumers: Map<string, Consumer> = new Map();
+  private consumerGroupCounter = 0;
+
+  constructor(brokers: string[] = ['localhost:9092']) {
+    this.kafka = new Kafka({
+      clientId: 'migrated-service',
+      brokers,
+    });
+  }
+
+  async connect(): Promise<void> {
+    this.producer = this.kafka.producer({ idempotent: true });
+    await this.producer.connect();
+    console.log('Connected to Kafka');
+  }
+
+  async publish(topic: string, message: unknown, key?: string): Promise<void> {
+    if (!this.producer) throw new Error('Not connected');
+
+    await this.producer.send({
+      topic,
+      messages: [
+        {
+          key: key ? Buffer.from(key) : undefined,
+          value: Buffer.from(JSON.stringify(message)),
+          headers: {
+            'Content-Type': Buffer.from('application/json'),
+            'Produced-At': Buffer.from(new Date().toISOString()),
+          },
+        },
+      ],
+    });
+  }
+
+  async subscribe(topic: string, handler: (message: unknown) => Promise<void>): Promise<void> {
+    const groupId = `migrated-consumer-${this.consumerGroupCounter++}`;
+    const consumer = this.kafka.consumer({ groupId });
+    this.consumers.set(topic, consumer);
+
+    await consumer.connect();
+    await consumer.subscribe({ topic, fromBeginning: false });
+
+    await consumer.run({
+      eachMessage: async ({ message }) => {
+        try {
+          const content = JSON.parse(message.value?.toString() || '{}');
+          await handler(content);
+        } catch (error) {
+          console.error('Error processing Kafka message:', error);
+          throw error; // Kafka consumer จะ retry อัตโนมัติ
+        }
+      },
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer?.disconnect();
+    for (const consumer of this.consumers.values()) {
+      await consumer.disconnect();
+    }
+    console.log('Disconnected from Kafka');
+  }
+}
+
+// =========================================================
+// Step 4: Migration Strategy - Dual Write
+// =========================================================
+
+class DualWriteMigrationAdapter implements MessageBrokerAdapter {
+  private rabbitMQ: RabbitMQAdapter;
+  private kafka: KafkaAdapter;
+  private migrationProgress: Map<string, number> = new Map(); // topic -> percentage (0-100)
+
+  constructor() {
+    this.rabbitMQ = new RabbitMQAdapter();
+    this.kafka = new KafkaAdapter();
+  }
+
+  async connect(): Promise<void> {
+    await Promise.all([
+      this.rabbitMQ.connect(),
+      this.kafka.connect(),
+    ]);
+  }
+
+  setMigrationProgress(topic: string, percentage: number): void {
+    this.migrationProgress.set(topic, Math.min(100, Math.max(0, percentage)));
+    console.log(`Migration progress for ${topic}: ${percentage}%`);
+  }
+
+  async publish(topic: string, message: unknown, key?: string): Promise<void> {
+    const progress = this.migrationProgress.get(topic) || 0;
+
+    if (progress < 100) {
+      // ยังส่งไป RabbitMQ
+      await this.rabbitMQ.publish(topic, message, key);
+    }
+
+    if (progress > 0) {
+      // เริ่มส่งไป Kafka
+      await this.kafka.publish(topic, message, key);
+    }
+
+    console.log(`Dual write: ${topic} (${progress}% to Kafka)`);
+  }
+
+  async subscribe(topic: string, handler: (message: unknown) => Promise<void>): Promise<void> {
+    const progress = this.migrationProgress.get(topic) || 0;
+
+    if (progress < 100) {
+      // ยัง consume จาก RabbitMQ
+      await this.rabbitMQ.subscribe(topic, handler);
+    }
+
+    if (progress > 0) {
+      // เริ่ม consume จาก Kafka
+      await this.kafka.subscribe(topic, handler);
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    await Promise.all([
+      this.rabbitMQ.disconnect(),
+      this.kafka.disconnect(),
+    ]);
+  }
+}
+
+// =========================================================
+// Step 5: ใช้งาน Migration
+// =========================================================
+
+async function migrateOrderService() {
+  const broker = new DualWriteMigrationAdapter();
+  await broker.connect();
+
+  // Phase 1: 0% - ยังใช้ RabbitMQ 100%
+  broker.setMigrationProgress('orders', 0);
+
+  // Phase 2: 50% - Dual write
+  broker.setMigrationProgress('orders', 50);
+  await broker.publish('orders', { orderId: 'test-001', amount: 100 });
+
+  // Phase 3: 100% - ย้ายไป Kafka ทั้งหมด
+  broker.setMigrationProgress('orders', 100);
+  await broker.publish('orders', { orderId: 'test-002', amount: 200 });
+
+  await broker.disconnect();
+}
+
+migrateOrderService().catch(console.error);
+```
+
+---
+
+## 10. Multi-Broker Pattern: BrokerAbstraction Interface
+
+```typescript
+// broker/broker-abstraction.ts
+// Interface หลักสำหรับ Message Broker
+
+export interface BrokerMessage<T = unknown> {
+  id: string;
+  key?: string;
+  data: T;
+  headers?: Record<string, string>;
+  timestamp: Date;
+  topic: string;
+}
+
+export interface PublishOptions {
+  key?: string;
+  headers?: Record<string, string>;
+  partitionKey?: string;
+  delay?: number;
+  messageId?: string;
+}
+
+export interface SubscribeOptions {
+  groupId?: string;
+  fromBeginning?: boolean;
+  concurrency?: number;
+  maxRetries?: number;
+  dlqTopic?: string;
+}
+
+export interface BrokerAdapter {
+  readonly name: string;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  publish<T>(topic: string, message: T, options?: PublishOptions): Promise<string>;
+  subscribe<T>(
+    topic: string,
+    handler: (message: BrokerMessage<T>) => Promise<void>,
+    options?: SubscribeOptions
+  ): Promise<void>;
+  createTopic(name: string, config?: TopicConfig): Promise<void>;
+  getMetrics(): Promise<BrokerMetrics>;
+}
+
+export interface TopicConfig {
+  partitions?: number;
+  replicationFactor?: number;
+  retentionMs?: number;
+  maxMessageSize?: number;
+}
+
+export interface BrokerMetrics {
+  messagesProduced: number;
+  messagesConsumed: number;
+  messagesFailed: number;
+  avgLatencyMs: number;
+  pendingMessages: number;
+}
+
+// =========================================================
+// Kafka Adapter Implementation
+// =========================================================
+
+import { Kafka, Producer, Consumer } from 'kafkajs';
+
+class KafkaBrokerAdapter implements BrokerAdapter {
+  readonly name = 'kafka';
+  private kafka: Kafka;
+  private producer: Producer | null = null;
+  private consumers: Consumer[] = [];
+  private metrics: BrokerMetrics = {
+    messagesProduced: 0,
+    messagesConsumed: 0,
+    messagesFailed: 0,
+    avgLatencyMs: 0,
+    pendingMessages: 0,
+  };
+
+  constructor(private readonly brokers: string[]) {
+    this.kafka = new Kafka({ clientId: 'broker-abstraction', brokers });
+  }
+
+  async connect(): Promise<void> {
+    this.producer = this.kafka.producer({ idempotent: true });
+    await this.producer.connect();
+  }
+
+  async disconnect(): Promise<void> {
+    await this.producer?.disconnect();
+    await Promise.all(this.consumers.map((c) => c.disconnect()));
+  }
+
+  async publish<T>(topic: string, message: T, options?: PublishOptions): Promise<string> {
+    if (!this.producer) throw new Error('Not connected');
+
+    const startTime = Date.now();
+    const messageId = options?.messageId || `kafka-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    await this.producer.send({
+      topic,
+      messages: [
+        {
+          key: options?.key ? Buffer.from(options.key) : undefined,
+          value: Buffer.from(JSON.stringify(message)),
+          headers: {
+            'X-Message-Id': Buffer.from(messageId),
+            ...Object.entries(options?.headers || {}).reduce(
+              (acc, [k, v]) => ({ ...acc, [k]: Buffer.from(v) }),
+              {}
+            ),
+          },
+        },
+      ],
+    });
+
+    this.metrics.messagesProduced++;
+    this.metrics.avgLatencyMs =
+      (this.metrics.avgLatencyMs + (Date.now() - startTime)) / 2;
 
     return messageId;
   }
 
-  async subscribe(
-    subscriptionName: string,
-    handler: (message: Message) => Promise<void>,
+  async subscribe<T>(
+    topic: string,
+    handler: (message: BrokerMessage<T>) => Promise<void>,
+    options?: SubscribeOptions
   ): Promise<void> {
-    const subscription = this.pubsub.subscription(subscriptionName, {
-      flowControl: {
-        maxMessages: 100,
-        allowExcessMessages: false,
-      },
-      ackDeadline: 60, // 60 seconds
+    const consumer = this.kafka.consumer({
+      groupId: options?.groupId || 'default-group',
     });
 
-    this.subscriptions.set(subscriptionName, subscription);
+    this.consumers.push(consumer);
+    await consumer.connect();
+    await consumer.subscribe({ topic, fromBeginning: options?.fromBeginning ?? false });
 
-    subscription.on('message', async (message: Message) => {
-      try {
-        await handler(message);
-        message.ack();
-      } catch (error) {
-        this.logger.error('Failed to process Pub/Sub message', {
-          messageId: message.id,
-          error: error.message,
-        });
-        message.nack(); // จะ retry ตาม backoff policy
-      }
-    });
-
-    subscription.on('error', (error) => {
-      this.logger.error('Pub/Sub subscription error', error);
-    });
-  }
-}
-```
-
----
-
-## Azure Service Bus
-
-### เมื่อไหร่ควรใช้ Azure Service Bus?
-- Azure-native workloads
-- Enterprise messaging patterns
-- Transaction support
-- Message sessions สำหรับ ordered processing
-
-```typescript
-// services/order/src/messaging/azure-servicebus.service.ts
-
-import { Injectable, Logger } from '@nestjs/common';
-import {
-  ServiceBusClient,
-  ServiceBusSender,
-  ServiceBusMessage,
-  ProcessErrorArgs,
-} from '@azure/service-bus';
-
-@Injectable()
-export class AzureServiceBusService {
-  private readonly logger = new Logger(AzureServiceBusService.name);
-  private client: ServiceBusClient;
-  private senders: Map<string, ServiceBusSender> = new Map();
-
-  constructor(private readonly config: ConfigService) {
-    this.client = new ServiceBusClient(
-      config.get('AZURE_SERVICE_BUS_CONNECTION_STRING')
-    );
-  }
-
-  async publish(
-    topicName: string,
-    eventType: string,
-    payload: unknown,
-    sessionId?: string, // สำหรับ ordered processing
-  ): Promise<void> {
-    let sender = this.senders.get(topicName);
-    if (!sender) {
-      sender = this.client.createSender(topicName);
-      this.senders.set(topicName, sender);
-    }
-
-    const message: ServiceBusMessage = {
-      body: payload,
-      contentType: 'application/json',
-      subject: eventType,
-      sessionId,  // Messages กับ same sessionId จะ process ตามลำดับ
-      messageId: `${eventType}-${Date.now()}`,
-      applicationProperties: {
-        sourceService: 'order-service',
-        eventType,
-        schemaVersion: '1.0',
-      },
-    };
-
-    await sender.sendMessages(message);
-  }
-
-  async subscribe(
-    topicName: string,
-    subscriptionName: string,
-    handler: (message: any) => Promise<void>,
-  ): Promise<void> {
-    const receiver = this.client.createReceiver(
-      topicName,
-      subscriptionName,
-      { receiveMode: 'peekLock' }
-    );
-
-    receiver.subscribe({
-      processMessage: async (message) => {
+    await consumer.run({
+      eachMessage: async ({ topic, message }) => {
         try {
-          await handler(message.body);
-          await receiver.completeMessage(message);
+          const brokerMessage: BrokerMessage<T> = {
+            id: message.headers?.['X-Message-Id']?.toString() || message.offset,
+            key: message.key?.toString(),
+            data: JSON.parse(message.value?.toString() || '{}'),
+            headers: Object.entries(message.headers || {}).reduce(
+              (acc, [k, v]) => ({
+                ...acc,
+                [k]: Buffer.isBuffer(v) ? v.toString() : String(v),
+              }),
+              {}
+            ),
+            timestamp: new Date(parseInt(message.timestamp)),
+            topic,
+          };
+
+          await handler(brokerMessage);
+          this.metrics.messagesConsumed++;
         } catch (error) {
-          // Dead letter หลังจาก max delivery count
-          await receiver.abandonMessage(message);
-          this.logger.error('Message processing failed', {
-            messageId: message.messageId,
-            deliveryCount: message.deliveryCount,
-            error: error.message,
-          });
+          this.metrics.messagesFailed++;
+          throw error;
         }
       },
-      processError: async (error: ProcessErrorArgs) => {
-        this.logger.error('Service Bus error', error.error);
-      },
     });
   }
-}
-```
 
----
+  async createTopic(name: string, config?: TopicConfig): Promise<void> {
+    const admin = this.kafka.admin();
+    await admin.connect();
 
-## Performance Characteristics & Cost Comparison
-
-```
-Performance Benchmark (approximate):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Kafka (3 brokers, 12 partitions):
-  Producer throughput: 1,000,000+ msgs/s
-  Consumer throughput: 500,000+ msgs/s
-  P99 latency:         < 10ms
-  Message retention:   Configurable (days to forever)
-
-RabbitMQ (clustered, 3 nodes):
-  Producer throughput: 100,000 msgs/s
-  Consumer throughput: 100,000 msgs/s
-  P99 latency:         < 5ms
-  Message retention:   Until consumed + TTL
-
-AWS SQS Standard:
-  Producer throughput: Unlimited (auto-scaling)
-  Consumer throughput: 3,000 msgs/s per queue (standard)
-  P99 latency:         < 100ms
-  Message retention:   Up to 14 days
-
-Google Pub/Sub:
-  Producer throughput: 10,000,000 msgs/s
-  Consumer throughput: 10,000,000 msgs/s
-  P99 latency:         < 100ms
-  Message retention:   Up to 7 days (with snapshot up to 31 days)
-```
-
-```
-Cost Comparison (USD, approximate):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Scenario: 10M messages/day, 1KB each = 10GB/day
-
-RabbitMQ (self-hosted):
-  EC2 m5.xlarge x3:  ~$600/month
-  EBS storage:        ~$100/month
-  Total:             ~$700/month
-
-Kafka (Confluent Cloud):
-  Basic cluster:      ~$200/month
-  Storage 10GB/day:   ~$300/month
-  Total:             ~$500/month
-
-AWS SQS Standard:
-  $0.40 per 1M requests
-  10M msgs/day x 30 = 300M msgs/month
-  Total:             ~$120/month
-
-Google Pub/Sub:
-  $0.04 per GB
-  10GB/day x 30 = 300GB/month
-  Total:             ~$12/month ← ถูกมาก!
-
-Azure Service Bus:
-  Standard: $0.01 per 1M messages
-  Premium: from $677/month (dedicated)
-  Standard total:    ~$3/month
-```
-
----
-
-## Migration Strategies
-
-### จาก RabbitMQ ไป Kafka
-
-```typescript
-// tools/migration/src/rabbitmq-to-kafka.ts
-// Dual-write strategy สำหรับ zero-downtime migration
-
-@Injectable()
-export class DualWritePublisher {
-  private readonly migrationPhase: 'rabbitmq-only' | 'dual-write' | 'kafka-only';
-
-  constructor(
-    private readonly rabbitPublisher: RabbitMQPublisher,
-    private readonly kafkaPublisher: KafkaPublisher,
-    private readonly configService: ConfigService,
-  ) {
-    this.migrationPhase = this.configService.get(
-      'MIGRATION_PHASE',
-      'rabbitmq-only'
-    );
-  }
-
-  async publish(event: string, payload: unknown): Promise<void> {
-    switch (this.migrationPhase) {
-      case 'rabbitmq-only':
-        await this.rabbitPublisher.publish(event, payload);
-        break;
-        
-      case 'dual-write':
-        // Write ไปทั้งสอง - consumers ใช้ Kafka แต่ยัง fallback ได้
-        await Promise.all([
-          this.rabbitPublisher.publish(event, payload),
-          this.kafkaPublisher.publish(event, payload),
-        ]);
-        break;
-        
-      case 'kafka-only':
-        await this.kafkaPublisher.publish(event, payload);
-        break;
+    try {
+      await admin.createTopics({
+        topics: [
+          {
+            topic: name,
+            numPartitions: config?.partitions || 3,
+            replicationFactor: config?.replicationFactor || 1,
+            configEntries: [
+              {
+                name: 'retention.ms',
+                value: (config?.retentionMs || 7 * 24 * 60 * 60 * 1000).toString(),
+              },
+              {
+                name: 'max.message.bytes',
+                value: (config?.maxMessageSize || 1048576).toString(),
+              },
+            ],
+          },
+        ],
+      });
+    } finally {
+      await admin.disconnect();
     }
   }
+
+  async getMetrics(): Promise<BrokerMetrics> {
+    return { ...this.metrics };
+  }
 }
-```
 
-```
-Migration Timeline:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// =========================================================
+// BrokerAbstraction Manager
+// =========================================================
 
-Phase 1 (สัปดาห์ 1-2): Setup Kafka cluster
-Phase 2 (สัปดาห์ 3-4): Dual-write (produce ไปทั้ง RabbitMQ + Kafka)
-Phase 3 (สัปดาห์ 5-6): Migrate consumers ทีละ service
-Phase 4 (สัปดาห์ 7-8): Switch to Kafka-only, monitor
-Phase 5 (สัปดาห์ 9): Decommission RabbitMQ
-```
+class BrokerAbstractionManager {
+  private adapters: Map<string, BrokerAdapter> = new Map();
+  private defaultAdapter: string | null = null;
 
----
+  registerAdapter(adapter: BrokerAdapter, isDefault = false): void {
+    this.adapters.set(adapter.name, adapter);
+    if (isDefault || !this.defaultAdapter) {
+      this.defaultAdapter = adapter.name;
+    }
+    console.log(`Registered broker adapter: ${adapter.name}`);
+  }
 
-## Decision Framework
+  async connectAll(): Promise<void> {
+    await Promise.all(
+      Array.from(this.adapters.values()).map((adapter) => adapter.connect())
+    );
+    console.log('All broker adapters connected');
+  }
 
-```
-เลือก Message Broker อย่างไร?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  async disconnectAll(): Promise<void> {
+    await Promise.all(
+      Array.from(this.adapters.values()).map((adapter) => adapter.disconnect())
+    );
+    console.log('All broker adapters disconnected');
+  }
 
-คำถาม 1: ต้องการ message replay ไหม?
-  ใช่ → Kafka หรือ GCP Pub/Sub
-  ไม่ → ไปคำถาม 2
+  getAdapter(name?: string): BrokerAdapter {
+    const adapterName = name || this.defaultAdapter;
+    if (!adapterName) throw new Error('No adapter registered');
 
-คำถาม 2: Cloud provider ที่ใช้คือ?
-  AWS → SQS/SNS
-  GCP → Pub/Sub
-  Azure → Service Bus
-  On-premise/Hybrid → ไปคำถาม 3
+    const adapter = this.adapters.get(adapterName);
+    if (!adapter) throw new Error(`Adapter not found: ${adapterName}`);
 
-คำถาม 3: Throughput เท่าไหร่?
-  > 100K msgs/s → Kafka
-  < 100K msgs/s → RabbitMQ
+    return adapter;
+  }
 
-คำถาม 4: ต้องการ complex routing ไหม?
-  ใช่ (multiple exchange types) → RabbitMQ
-  ไม่ → ขึ้นอยู่กับปัจจัยอื่น
+  async publish<T>(
+    topic: string,
+    message: T,
+    options?: PublishOptions & { broker?: string }
+  ): Promise<string> {
+    return this.getAdapter(options?.broker).publish(topic, message, options);
+  }
 
-คำถาม 5: มี team expertise ไหม?
-  Kafka expertise ต่ำ → เริ่มด้วย RabbitMQ หรือ managed service
-  High operational burden ไม่ต้องการ → Managed service
+  async subscribe<T>(
+    topic: string,
+    handler: (message: BrokerMessage<T>) => Promise<void>,
+    options?: SubscribeOptions & { broker?: string }
+  ): Promise<void> {
+    return this.getAdapter(options?.broker).subscribe(topic, handler, options);
+  }
+
+  async getAllMetrics(): Promise<Record<string, BrokerMetrics>> {
+    const metrics: Record<string, BrokerMetrics> = {};
+    for (const [name, adapter] of this.adapters) {
+      metrics[name] = await adapter.getMetrics();
+    }
+    return metrics;
+  }
+}
+
+// ตัวอย่างการใช้งาน
+async function main() {
+  const manager = new BrokerAbstractionManager();
+
+  // ลงทะเบียน adapters
+  manager.registerAdapter(new KafkaBrokerAdapter(['localhost:9092']), true);
+
+  await manager.connectAll();
+
+  try {
+    // Publish ไป default broker (Kafka)
+    const messageId = await manager.publish('orders', {
+      orderId: 'order-001',
+      amount: 999.99,
+    });
+    console.log('Published with ID:', messageId);
+
+    // Subscribe จาก default broker
+    await manager.subscribe<{ orderId: string; amount: number }>(
+      'orders',
+      async (message) => {
+        console.log('Received order:', message.data);
+      },
+      { groupId: 'order-processor' }
+    );
+  } finally {
+    await manager.disconnectAll();
+  }
+}
+
+main().catch(console.error);
 ```
 
 ---
 
 ## สรุป
 
-| Broker | Strengths | Weaknesses | Best For |
-|--------|-----------|------------|---------|
-| RabbitMQ | Flexible routing, low latency | No replay, lower throughput | Task queues, complex routing |
-| Kafka | High throughput, replay, event log | High complexity, resource intensive | Event streaming, analytics |
-| AWS SQS/SNS | Managed, scalable, cheap | Limited features | AWS ecosystem, serverless |
-| GCP Pub/Sub | Very high throughput, managed | GCP lock-in | GCP ecosystem, big data |
-| Azure Service Bus | Enterprise features, sessions | Azure lock-in, cost | Azure ecosystem, enterprise |
-
-สำหรับ Thai tech companies ที่ใช้ cloud:
-- ถ้า use AWS → SQS/SNS เป็น default, Kafka เมื่อต้องการ replay/streaming
-- ถ้า use GCP → Pub/Sub เป็น default
-- ถ้า self-hosted → RabbitMQ สำหรับ general purpose, Kafka สำหรับ event streaming
-- ถ้า scale ใหญ่ (เช่น Shopee, Lazada Thailand) → Kafka เป็นหลัก
+| หัวข้อ | เนื้อหาสำคัญ |
+|--------|-------------|
+| การเปรียบเทียบ Brokers | Kafka เหมาะกับ throughput สูง, RabbitMQ เหมาะกับ latency ต่ำ, NATS เหมาะกับ simplicity, Pulsar เหมาะกับ multi-tenant |
+| Pulsar Producer/Consumer | รองรับ partitioned topics, schema validation, และ batching |
+| NATS JetStream | persistence ด้วย durable subscription, replay policy หลากหลาย |
+| Message Ordering | ใช้ partition key เพื่อรับประกัน ordering ใน Kafka และ Pulsar |
+| At-least-once vs Exactly-once | Idempotent producer ป้องกัน duplicate, Transactions รับประกัน exactly-once |
+| Message Replay | Kafka ใช้ seek offset, NATS ใช้ DeliverPolicy |
+| Dead Letter Queue | Pattern สำหรับ error handling พร้อม retry และ exponential backoff |
+| Broker Monitoring | Prometheus metrics สำหรับ consumer lag, throughput, และ availability |
+| Migration RabbitMQ → Kafka | Dual-write pattern สำหรับ zero-downtime migration |
+| Multi-broker Abstraction | Interface pattern สำหรับ broker-agnostic code |

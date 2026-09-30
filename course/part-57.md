@@ -1,146 +1,642 @@
-# Part 57: Asynchronous Patterns and Event-Driven Architecture
+# Part 57: Async Communication Patterns — Request-Reply, Outbox Pattern, Inbox Pattern, และ Message Schema Versioning
 
-## บทนำ
-
-Event-Driven Architecture (EDA) เป็น Architecture Pattern ที่ Services สื่อสารกัน
-ผ่าน Events แทนการเรียกตรง ทำให้ระบบ Loosely Coupled, Scalable และ Resilient
-บทนี้จะครอบคลุม Patterns ขั้นสูงที่ใช้ใน Production
+ในบทนี้เราจะเรียนรู้ Async Communication Patterns ขั้นสูงสำหรับ Microservices ครอบคลุม Request-Reply over RabbitMQ, Correlation ID Tracking, Message Ordering, Idempotent Consumer, At-least-once Delivery, Outbox Pattern, Inbox Pattern, และ Message Schema Versioning
 
 ---
 
-## 1. Async Patterns Overview
+## 1. Request-Reply Pattern over RabbitMQ
 
-### Fire-and-Forget
+Request-Reply ช่วยให้ services สามารถสื่อสารแบบ synchronous-like ผ่าน message broker โดยไม่ต้องใช้ HTTP
 
 ```typescript
-// src/patterns/fire-and-forget.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import { Queue } from 'bull';
+// src/messaging/request-reply/rpc-client.ts
+import { Channel, ConsumeMessage } from 'amqplib';
+import { randomUUID } from 'crypto';
 
-@Injectable()
-export class FireAndForgetService {
-  private readonly logger = new Logger(FireAndForgetService.name);
-
-  constructor(
-    @InjectQueue('email') private readonly emailQueue: Queue,
-    @InjectQueue('analytics') private readonly analyticsQueue: Queue
-  ) {}
-
-  // Fire-and-forget: ส่งแล้วไม่รอผล
-  async sendWelcomeEmail(userId: string, email: string): Promise<void> {
-    // ส่ง job ไปยัง queue โดยไม่รอผล
-    await this.emailQueue.add(
-      'welcome-email',
-      { userId, email },
-      {
-        removeOnComplete: true,
-        removeOnFail: false,
-        attempts: 3,
-        backoff: {
-          type: 'exponential',
-          delay: 2000,
-        },
-      }
-    );
-    
-    this.logger.log(`Welcome email queued for user ${userId}`);
-    // Return ทันทีโดยไม่รอ email ถูกส่ง
-  }
-
-  // Track analytics events แบบ fire-and-forget
-  trackEvent(event: {
-    type: string;
-    userId?: string;
-    properties: Record<string, unknown>;
-  }): void {
-    // Intentionally not awaiting
-    this.analyticsQueue
-      .add('track-event', event, { removeOnComplete: true })
-      .catch(err => this.logger.error('Failed to queue analytics event:', err));
-  }
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  timeoutId: NodeJS.Timeout;
 }
-```
 
-### Request-Reply Pattern
-
-```typescript
-// src/patterns/request-reply.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { RabbitMQClient } from '../messaging/rabbitmq.client';
-
-@Injectable()
-export class RequestReplyService {
-  private readonly logger = new Logger(RequestReplyService.name);
-  private pendingRequests = new Map<string, {
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-    timer: NodeJS.Timeout;
-  }>();
-
-  constructor(private readonly rabbitmq: RabbitMQClient) {}
-
+export class RpcClient {
+  private readonly replyQueue: string;
+  private readonly pendingRequests = new Map<string, PendingRequest>();
+  private initialized = false;
+  
+  constructor(
+    private readonly channel: Channel,
+    private readonly defaultTimeoutMs: number = 30000
+  ) {
+    this.replyQueue = `rpc.reply.${process.env.SERVICE_NAME}.${randomUUID()}`;
+  }
+  
   async initialize(): Promise<void> {
-    // Setup reply queue
-    const replyQueue = await this.rabbitmq.assertQueue('', {
+    if (this.initialized) return;
+    
+    // Create exclusive reply queue
+    await this.channel.assertQueue(this.replyQueue, {
       exclusive: true,
       autoDelete: true,
+      durable: false,
     });
-
-    const channel = this.rabbitmq.getChannel();
-    await channel.consume(replyQueue.queue, (msg) => {
-      if (!msg) return;
-      
-      const correlationId = msg.properties.correlationId;
-      const pending = this.pendingRequests.get(correlationId);
-      
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingRequests.delete(correlationId);
-        
-        const response = JSON.parse(msg.content.toString());
-        if (response.success) {
-          pending.resolve(response.data);
-        } else {
-          pending.reject(new Error(response.error || 'Request failed'));
-        }
-        
-        channel.ack(msg);
-      }
-    });
+    
+    // Start consuming replies
+    this.channel.consume(
+      this.replyQueue,
+      (msg) => this.handleReply(msg),
+      { noAck: true }
+    );
+    
+    this.initialized = true;
+    log.info('RPC client initialized', { replyQueue: this.replyQueue });
   }
-
-  async request<T>(
-    service: string,
-    operation: string,
-    payload: unknown,
-    timeoutMs = 30000
-  ): Promise<T> {
-    const correlationId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const queue = `${service}.rpc`;
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+  
+  async call<TRequest, TResponse>(
+    targetQueue: string,
+    request: TRequest,
+    options: {
+      timeoutMs?: number;
+      correlationId?: string;
+      headers?: Record<string, string>;
+    } = {}
+  ): Promise<TResponse> {
+    await this.initialize();
+    
+    const correlationId = options.correlationId || randomUUID();
+    const timeoutMs = options.timeoutMs || this.defaultTimeoutMs;
+    
+    return new Promise<TResponse>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
         this.pendingRequests.delete(correlationId);
-        reject(new Error(`Request to ${service}.${operation} timed out after ${timeoutMs}ms`));
+        reject(new Error(`RPC timeout after ${timeoutMs}ms for ${targetQueue}`));
       }, timeoutMs);
-
+      
       this.pendingRequests.set(correlationId, {
         resolve: resolve as (value: unknown) => void,
         reject,
-        timer,
+        timeoutId,
       });
-
-      const channel = this.rabbitmq.getChannel();
-      channel.sendToQueue(
-        queue,
-        Buffer.from(JSON.stringify({ operation, payload })),
+      
+      this.channel.sendToQueue(
+        targetQueue,
+        Buffer.from(JSON.stringify(request)),
         {
           correlationId,
-          replyTo: 'amq.rabbitmq.reply-to',
+          replyTo: this.replyQueue,
           contentType: 'application/json',
+          messageId: randomUUID(),
+          timestamp: Math.floor(Date.now() / 1000),
+          expiration: timeoutMs.toString(),
+          headers: {
+            'x-source-service': process.env.SERVICE_NAME,
+            ...options.headers,
+          },
         }
       );
+      
+      log.info('RPC request sent', {
+        targetQueue,
+        correlationId,
+        timeout: timeoutMs,
+      });
+    });
+  }
+  
+  private handleReply(msg: ConsumeMessage | null): void {
+    if (!msg) return;
+    
+    const correlationId = msg.properties.correlationId;
+    const pending = this.pendingRequests.get(correlationId);
+    
+    if (!pending) {
+      log.warn('Received reply for unknown correlation ID', { correlationId });
+      return;
+    }
+    
+    this.pendingRequests.delete(correlationId);
+    clearTimeout(pending.timeoutId);
+    
+    try {
+      const response = JSON.parse(msg.content.toString());
+      
+      if (response.error) {
+        pending.reject(new RpcError(response.error.message, response.error.code));
+      } else {
+        pending.resolve(response.data);
+      }
+    } catch (error) {
+      pending.reject(new Error('Failed to parse RPC response'));
+    }
+  }
+  
+  async close(): Promise<void> {
+    // Reject all pending requests
+    for (const [correlationId, pending] of this.pendingRequests) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error('RPC client closed'));
+    }
+    this.pendingRequests.clear();
+  }
+}
+
+export class RpcError extends Error {
+  constructor(message: string, public readonly code: string) {
+    super(message);
+    this.name = 'RpcError';
+  }
+}
+
+// RPC Server: handles incoming requests and sends replies
+export class RpcServer {
+  constructor(
+    private readonly channel: Channel,
+    private readonly queueName: string
+  ) {}
+  
+  async registerHandler<TRequest, TResponse>(
+    handler: (request: TRequest, meta: { correlationId: string; messageId: string }) => Promise<TResponse>
+  ): Promise<void> {
+    await this.channel.assertQueue(this.queueName, {
+      durable: true,
+      arguments: {
+        'x-message-ttl': 60000, // Don't process stale requests
+      },
+    });
+    
+    await this.channel.prefetch(1); // Process one request at a time
+    
+    this.channel.consume(this.queueName, async (msg) => {
+      if (!msg) return;
+      
+      const correlationId = msg.properties.correlationId;
+      const replyTo = msg.properties.replyTo;
+      
+      if (!correlationId || !replyTo) {
+        log.warn('RPC request missing correlationId or replyTo', {
+          messageId: msg.properties.messageId,
+        });
+        this.channel.ack(msg);
+        return;
+      }
+      
+      const startTime = Date.now();
+      
+      try {
+        const request = JSON.parse(msg.content.toString()) as TRequest;
+        
+        const response = await handler(request, {
+          correlationId,
+          messageId: msg.properties.messageId,
+        });
+        
+        this.channel.sendToQueue(
+          replyTo,
+          Buffer.from(JSON.stringify({ data: response })),
+          {
+            correlationId,
+            contentType: 'application/json',
+            headers: {
+              'x-processing-time-ms': Date.now() - startTime,
+              'x-processed-by': process.env.SERVICE_NAME,
+            },
+          }
+        );
+        
+        this.channel.ack(msg);
+      } catch (error) {
+        const err = error as Error;
+        
+        // Send error response
+        this.channel.sendToQueue(
+          replyTo,
+          Buffer.from(JSON.stringify({
+            error: {
+              message: err.message,
+              code: (error as any).code || 'INTERNAL_ERROR',
+            },
+          })),
+          {
+            correlationId,
+            contentType: 'application/json',
+          }
+        );
+        
+        this.channel.ack(msg);
+      }
+    });
+    
+    log.info('RPC server registered', { queue: this.queueName });
+  }
+}
+
+// Usage example
+const rpcClient = new RpcClient(channel);
+
+// Order service calling inventory service
+const availability = await rpcClient.call<
+  { productIds: string[] },
+  { available: Record<string, number> }
+>(
+  'inventory.check-availability',
+  { productIds: ['prod-1', 'prod-2'] },
+  { timeoutMs: 5000 }
+);
+```
+
+---
+
+## 2. Correlation ID Tracking
+
+```typescript
+// src/messaging/correlation-tracking.ts
+import { AsyncLocalStorage } from 'async_hooks';
+import { Request, Response, NextFunction } from 'express';
+import { randomUUID } from 'crypto';
+
+interface TraceContext {
+  correlationId: string;
+  requestId: string;
+  traceId?: string;
+  userId?: string;
+  sessionId?: string;
+}
+
+const asyncStorage = new AsyncLocalStorage<TraceContext>();
+
+// Middleware to set correlation context
+export function correlationMiddleware() {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const correlationId =
+      (req.headers['x-correlation-id'] as string) ||
+      (req.headers['x-request-id'] as string) ||
+      randomUUID();
+    
+    const context: TraceContext = {
+      correlationId,
+      requestId: randomUUID(),
+      traceId: req.headers['traceparent'] as string,
+      userId: req.user?.id,
+    };
+    
+    res.setHeader('x-correlation-id', correlationId);
+    res.setHeader('x-request-id', context.requestId);
+    
+    asyncStorage.run(context, () => next());
+  };
+}
+
+// Get current correlation context
+export function getTraceContext(): TraceContext | null {
+  return asyncStorage.getStore() ?? null;
+}
+
+export function getCorrelationId(): string {
+  return getTraceContext()?.correlationId || randomUUID();
+}
+
+// Inject correlation ID into all outgoing messages
+export function enrichMessageWithContext(
+  payload: Record<string, unknown>,
+  additionalHeaders?: Record<string, string>
+): { payload: Record<string, unknown>; headers: Record<string, string> } {
+  const context = getTraceContext();
+  
+  return {
+    payload: {
+      ...payload,
+      _context: {
+        correlationId: context?.correlationId,
+        requestId: context?.requestId,
+        userId: context?.userId,
+        timestamp: new Date().toISOString(),
+      },
+    },
+    headers: {
+      'x-correlation-id': context?.correlationId || '',
+      'x-request-id': context?.requestId || '',
+      'x-user-id': context?.userId || '',
+      'x-trace-id': context?.traceId || '',
+      ...additionalHeaders,
+    },
+  };
+}
+
+// Extract correlation context from incoming message
+export function extractContextFromMessage(
+  msg: { properties: { headers?: Record<string, string> }; content: Buffer }
+): TraceContext {
+  const headers = msg.properties.headers || {};
+  const payload = JSON.parse(msg.content.toString());
+  
+  return {
+    correlationId:
+      headers['x-correlation-id'] ||
+      payload._context?.correlationId ||
+      randomUUID(),
+    requestId:
+      headers['x-request-id'] ||
+      payload._context?.requestId ||
+      randomUUID(),
+    traceId: headers['x-trace-id'],
+    userId: headers['x-user-id'] || payload._context?.userId,
+  };
+}
+
+// Run message handler with correlation context
+export async function withMessageContext<T>(
+  msg: { properties: any; content: Buffer },
+  handler: () => Promise<T>
+): Promise<T> {
+  const context = extractContextFromMessage(msg);
+  return asyncStorage.run(context, handler);
+}
+```
+
+---
+
+## 3. Message Ordering Guarantees
+
+```typescript
+// src/messaging/ordering.ts
+import { Channel, ConsumeMessage } from 'amqplib';
+import { Redis } from 'ioredis';
+
+// Pattern: Sequence number + ordering buffer
+interface OrderedMessage<T> {
+  sequenceNumber: number;
+  partitionKey: string;
+  payload: T;
+  timestamp: string;
+}
+
+export class OrderingBuffer<T> {
+  private readonly buffer = new Map<number, OrderedMessage<T>>();
+  private expectedSequence: number;
+  private readonly maxBufferSize: number;
+  private gapTimer: NodeJS.Timeout | null = null;
+  
+  constructor(
+    private readonly startSequence: number,
+    private readonly onDelivered: (msg: OrderedMessage<T>) => Promise<void>,
+    private readonly onGapTimeout: (gap: number[]) => void,
+    maxBufferSize = 1000,
+    private readonly gapTimeoutMs = 5000
+  ) {
+    this.expectedSequence = startSequence;
+    this.maxBufferSize = maxBufferSize;
+  }
+  
+  async receive(msg: OrderedMessage<T>): Promise<void> {
+    if (msg.sequenceNumber < this.expectedSequence) {
+      // Duplicate - already processed
+      log.warn('Received duplicate message', {
+        received: msg.sequenceNumber,
+        expected: this.expectedSequence,
+      });
+      return;
+    }
+    
+    if (msg.sequenceNumber === this.expectedSequence) {
+      // In-order message
+      await this.deliverAndDrain(msg);
+    } else {
+      // Out-of-order: buffer it
+      if (this.buffer.size >= this.maxBufferSize) {
+        throw new Error(`Ordering buffer overflow at sequence ${msg.sequenceNumber}`);
+      }
+      
+      this.buffer.set(msg.sequenceNumber, msg);
+      this.startGapTimer();
+    }
+  }
+  
+  private async deliverAndDrain(msg: OrderedMessage<T>): Promise<void> {
+    await this.onDelivered(msg);
+    this.expectedSequence++;
+    
+    // Drain buffered in-order messages
+    while (this.buffer.has(this.expectedSequence)) {
+      const next = this.buffer.get(this.expectedSequence)!;
+      this.buffer.delete(this.expectedSequence);
+      await this.onDelivered(next);
+      this.expectedSequence++;
+    }
+    
+    if (this.buffer.size === 0 && this.gapTimer) {
+      clearTimeout(this.gapTimer);
+      this.gapTimer = null;
+    }
+  }
+  
+  private startGapTimer(): void {
+    if (this.gapTimer) return;
+    
+    this.gapTimer = setTimeout(() => {
+      const gaps: number[] = [];
+      const bufferKeys = [...this.buffer.keys()].sort((a, b) => a - b);
+      
+      // Find missing sequence numbers
+      for (let seq = this.expectedSequence; seq < bufferKeys[0]; seq++) {
+        gaps.push(seq);
+      }
+      
+      if (gaps.length > 0) {
+        log.warn('Sequence gap detected', { gaps, expectedSequence: this.expectedSequence });
+        this.onGapTimeout(gaps);
+      }
+    }, this.gapTimeoutMs);
+  }
+}
+
+// Kafka-style partitioned ordering with RabbitMQ
+export class PartitionedConsumer<T> {
+  private readonly buffers = new Map<string, OrderingBuffer<T>>();
+  
+  async processMessage(
+    channel: Channel,
+    msg: ConsumeMessage,
+    handler: (payload: T) => Promise<void>
+  ): Promise<void> {
+    const partitionKey = msg.properties.headers?.['x-partition-key'] as string;
+    const sequenceNumber = parseInt(msg.properties.headers?.['x-sequence-number'] as string);
+    
+    if (!partitionKey || isNaN(sequenceNumber)) {
+      // No ordering guarantee needed
+      const payload = JSON.parse(msg.content.toString()) as T;
+      await handler(payload);
+      channel.ack(msg);
+      return;
+    }
+    
+    let buffer = this.buffers.get(partitionKey);
+    if (!buffer) {
+      buffer = new OrderingBuffer<T>(
+        sequenceNumber,
+        async (orderedMsg) => {
+          await handler(orderedMsg.payload);
+        },
+        (gaps) => {
+          log.warn('Gap in message sequence', { partitionKey, gaps });
+        }
+      );
+      this.buffers.set(partitionKey, buffer);
+    }
+    
+    const ordered: OrderedMessage<T> = {
+      sequenceNumber,
+      partitionKey,
+      payload: JSON.parse(msg.content.toString()),
+      timestamp: new Date().toISOString(),
+    };
+    
+    await buffer.receive(ordered);
+    channel.ack(msg);
+  }
+}
+```
+
+---
+
+## 4. Idempotent Consumer Implementation
+
+```typescript
+// src/messaging/idempotent-consumer.ts
+import { Channel, ConsumeMessage } from 'amqplib';
+import { Redis } from 'ioredis';
+import { db } from '../database';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export class IdempotentConsumer {
+  private readonly idempotencyKeyTTL: number;
+  
+  constructor(
+    private readonly channel: Channel,
+    ttlSeconds: number = 86400 // 24 hours
+  ) {
+    this.idempotencyKeyTTL = ttlSeconds;
+  }
+  
+  async processOnce<T>(
+    msg: ConsumeMessage,
+    handler: (payload: T) => Promise<unknown>,
+    options: {
+      idempotencyKey?: string; // Custom key, defaults to messageId
+      lockTimeoutMs?: number;
+    } = {}
+  ): Promise<boolean> {
+    const messageId = options.idempotencyKey ||
+      msg.properties.messageId ||
+      this.hashMessage(msg.content);
+    
+    const idempotencyKey = `idempotent:${messageId}`;
+    const processingKey = `processing:${messageId}`;
+    const lockTimeout = options.lockTimeoutMs || 60000;
+    
+    // Try to acquire processing lock
+    const locked = await redis.set(
+      processingKey,
+      process.env.POD_NAME || 'processor',
+      'PX', lockTimeout,
+      'NX' // Only set if not exists
+    );
+    
+    if (!locked) {
+      // Another instance is processing this message
+      log.warn('Message already being processed, skipping', { messageId });
+      this.channel.ack(msg); // Ack to remove from queue
+      return false;
+    }
+    
+    try {
+      // Check if already processed successfully
+      const alreadyProcessed = await redis.exists(idempotencyKey);
+      if (alreadyProcessed) {
+        log.info('Message already processed (idempotent skip)', { messageId });
+        this.channel.ack(msg);
+        return false;
+      }
+      
+      // Process the message
+      const payload = JSON.parse(msg.content.toString()) as T;
+      await handler(payload);
+      
+      // Mark as processed
+      await redis.setex(idempotencyKey, this.idempotencyKeyTTL, JSON.stringify({
+        processedAt: new Date().toISOString(),
+        processedBy: process.env.POD_NAME,
+      }));
+      
+      this.channel.ack(msg);
+      return true;
+    } catch (error) {
+      // Don't mark as processed on error - allow retry
+      this.channel.nack(msg, false, true);
+      throw error;
+    } finally {
+      await redis.del(processingKey);
+    }
+  }
+  
+  private hashMessage(content: Buffer): string {
+    return require('crypto')
+      .createHash('sha256')
+      .update(content)
+      .digest('hex');
+  }
+}
+
+// Database-backed idempotency (stronger guarantee)
+export class DatabaseIdempotentConsumer {
+  async processOnce<T>(
+    messageId: string,
+    handler: (payload: T) => Promise<unknown>,
+    payload: T
+  ): Promise<boolean> {
+    return db.transaction(async (trx) => {
+      // Try to insert idempotency record
+      try {
+        await trx('processed_messages').insert({
+          message_id: messageId,
+          processed_at: new Date(),
+          status: 'processing',
+          processor: process.env.POD_NAME,
+        });
+      } catch (error) {
+        // Unique constraint violation = already processed or in progress
+        const existing = await trx('processed_messages')
+          .where({ message_id: messageId })
+          .first();
+        
+        if (existing?.status === 'completed') {
+          log.info('Message already processed', { messageId });
+          return false;
+        }
+        
+        if (existing?.status === 'processing') {
+          // Another instance is handling it
+          throw new Error('Message is being processed by another instance');
+        }
+        
+        throw error;
+      }
+      
+      try {
+        await handler(payload);
+        
+        await trx('processed_messages')
+          .where({ message_id: messageId })
+          .update({ status: 'completed', completed_at: new Date() });
+        
+        return true;
+      } catch (error) {
+        await trx('processed_messages')
+          .where({ message_id: messageId })
+          .update({ status: 'failed', failed_at: new Date(), error_message: (error as Error).message });
+        
+        throw error;
+      }
     });
   }
 }
@@ -148,1095 +644,739 @@ export class RequestReplyService {
 
 ---
 
-## 2. Transactional Outbox Pattern (Full Implementation)
+## 5. Outbox Pattern กับ PostgreSQL Triggers
 
-### Outbox Table Schema
+```typescript
+// src/messaging/outbox/outbox-pattern.ts
+import { Knex } from 'knex';
+import { Channel } from 'amqplib';
 
-```sql
--- migrations/create-outbox-table.sql
-CREATE TABLE IF NOT EXISTS outbox_events (
+// Database schema
+/*
+CREATE TABLE outbox_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   aggregate_type VARCHAR(100) NOT NULL,
-  aggregate_id VARCHAR(255) NOT NULL,
+  aggregate_id VARCHAR(100) NOT NULL,
   event_type VARCHAR(200) NOT NULL,
   payload JSONB NOT NULL,
+  exchange VARCHAR(200),
+  routing_key VARCHAR(200),
   headers JSONB DEFAULT '{}',
   status VARCHAR(20) NOT NULL DEFAULT 'pending',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   processed_at TIMESTAMPTZ,
-  failed_at TIMESTAMPTZ,
   retry_count INTEGER NOT NULL DEFAULT 0,
-  max_retries INTEGER NOT NULL DEFAULT 3,
-  error_message TEXT,
-  scheduled_for TIMESTAMPTZ DEFAULT NOW()
+  last_error TEXT,
+  scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_outbox_status_scheduled 
-  ON outbox_events(status, scheduled_for) 
+CREATE INDEX idx_outbox_pending ON outbox_events (status, scheduled_at)
   WHERE status IN ('pending', 'failed');
+*/
 
-CREATE INDEX idx_outbox_aggregate 
-  ON outbox_events(aggregate_type, aggregate_id);
-```
+// PostgreSQL trigger to capture domain events atomically
+const OUTBOX_TRIGGER_SQL = `
+CREATE OR REPLACE FUNCTION capture_order_events()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO outbox_events (
+      aggregate_type, aggregate_id, event_type, payload, exchange, routing_key
+    ) VALUES (
+      'Order', NEW.id::text,
+      'OrderCreated',
+      jsonb_build_object(
+        'orderId', NEW.id,
+        'userId', NEW.user_id,
+        'status', NEW.status,
+        'totalAmount', NEW.total_amount,
+        'currency', NEW.currency,
+        'createdAt', NEW.created_at
+      ),
+      'orders.events',
+      'order.created'
+    );
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF OLD.status != NEW.status THEN
+      INSERT INTO outbox_events (
+        aggregate_type, aggregate_id, event_type, payload, exchange, routing_key
+      ) VALUES (
+        'Order', NEW.id::text,
+        'OrderStatusChanged',
+        jsonb_build_object(
+          'orderId', NEW.id,
+          'previousStatus', OLD.status,
+          'newStatus', NEW.status,
+          'updatedAt', NOW()
+        ),
+        'orders.events',
+        'order.status_changed'
+      );
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-### Outbox Repository
+CREATE TRIGGER order_events_trigger
+  AFTER INSERT OR UPDATE ON orders
+  FOR EACH ROW EXECUTE FUNCTION capture_order_events();
+`;
 
-```typescript
-// src/outbox/outbox.repository.ts
-import { Injectable } from '@nestjs/common';
-import { DataSource, EntityManager } from 'typeorm';
-import { OutboxEvent } from './outbox.entity';
-
-@Injectable()
-export class OutboxRepository {
-  constructor(private readonly dataSource: DataSource) {}
-
-  // บันทึก event พร้อมกับ transaction ของ business operation
-  async saveEventInTransaction(
-    manager: EntityManager,
-    event: Partial<OutboxEvent>
-  ): Promise<OutboxEvent> {
-    const outboxEvent = manager.create(OutboxEvent, {
-      ...event,
-      status: 'pending',
-      createdAt: new Date(),
-    });
-    
-    return manager.save(OutboxEvent, outboxEvent);
-  }
-
-  // ดึง pending events สำหรับ processing
-  async getPendingEvents(limit = 100): Promise<OutboxEvent[]> {
-    return this.dataSource
-      .getRepository(OutboxEvent)
-      .createQueryBuilder('event')
-      .where('event.status IN (:...statuses)', { statuses: ['pending', 'failed'] })
-      .andWhere('event.scheduledFor <= :now', { now: new Date() })
-      .andWhere('event.retryCount < event.maxRetries')
-      .orderBy('event.scheduledFor', 'ASC')
-      .limit(limit)
-      .getMany();
-  }
-
-  async markAsProcessed(id: string): Promise<void> {
-    await this.dataSource.getRepository(OutboxEvent).update(id, {
-      status: 'processed',
-      processedAt: new Date(),
-    });
-  }
-
-  async markAsFailed(id: string, error: string, nextRetryAt?: Date): Promise<void> {
-    const repo = this.dataSource.getRepository(OutboxEvent);
-    const event = await repo.findOneBy({ id });
-    
-    if (!event) return;
-    
-    const newRetryCount = event.retryCount + 1;
-    const shouldRetry = newRetryCount < event.maxRetries;
-    
-    await repo.update(id, {
-      status: shouldRetry ? 'failed' : 'dead',
-      failedAt: new Date(),
-      retryCount: newRetryCount,
-      errorMessage: error,
-      scheduledFor: shouldRetry ? (nextRetryAt || this.calculateNextRetry(newRetryCount)) : undefined,
-    });
-  }
-
-  private calculateNextRetry(retryCount: number): Date {
-    // Exponential backoff: 2^n * 1000ms
-    const delayMs = Math.min(Math.pow(2, retryCount) * 1000, 300000); // max 5 min
-    return new Date(Date.now() + delayMs);
-  }
-}
-```
-
-### Outbox Processor
-
-```typescript
-// src/outbox/outbox.processor.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
-import { DataSource } from 'typeorm';
-import { OutboxRepository } from './outbox.repository';
-import { EventPublisher } from '../events/event-publisher.service';
-import { OutboxEvent } from './outbox.entity';
-
-@Injectable()
+// Outbox processor: polls and publishes
 export class OutboxProcessor {
-  private readonly logger = new Logger(OutboxProcessor.name);
-  private isProcessing = false;
-
+  private isRunning = false;
+  private intervalId: NodeJS.Timeout | null = null;
+  
   constructor(
-    private readonly outboxRepository: OutboxRepository,
-    private readonly eventPublisher: EventPublisher,
-    private readonly dataSource: DataSource
-  ) {}
-
-  @Cron('*/5 * * * * *') // ทุก 5 วินาที
-  async processOutbox(): Promise<void> {
-    if (this.isProcessing) {
-      this.logger.debug('Outbox processing already in progress, skipping');
-      return;
+    private readonly db: Knex,
+    private readonly channel: Channel,
+    private readonly config: {
+      pollIntervalMs?: number;
+      batchSize?: number;
+      maxRetries?: number;
+      retryDelayMs?: number;
+    } = {}
+  ) {
+    this.config = {
+      pollIntervalMs: 1000,
+      batchSize: 100,
+      maxRetries: 5,
+      retryDelayMs: 5000,
+      ...config,
+    };
+  }
+  
+  start(): void {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    
+    // Initial run immediately
+    this.processOutbox().catch(err => log.error('Outbox processing error', err));
+    
+    this.intervalId = setInterval(() => {
+      this.processOutbox().catch(err => log.error('Outbox processing error', err));
+    }, this.config.pollIntervalMs);
+    
+    log.info('Outbox processor started');
+  }
+  
+  stop(): void {
+    this.isRunning = false;
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
     }
-
-    this.isProcessing = true;
-
-    try {
-      const events = await this.outboxRepository.getPendingEvents(50);
-      
-      if (events.length === 0) return;
-      
-      this.logger.debug(`Processing ${events.length} outbox events`);
-      
-      for (const event of events) {
-        await this.processEvent(event);
-      }
-    } catch (error) {
-      this.logger.error('Error processing outbox:', error);
-    } finally {
-      this.isProcessing = false;
+    log.info('Outbox processor stopped');
+  }
+  
+  private async processOutbox(): Promise<void> {
+    const events = await this.db('outbox_events')
+      .where('status', 'pending')
+      .orWhere((builder) => {
+        builder
+          .where('status', 'failed')
+          .where('retry_count', '<', this.config.maxRetries!)
+          .where('scheduled_at', '<=', new Date());
+      })
+      .orderBy('created_at', 'asc')
+      .limit(this.config.batchSize!)
+      .forUpdate()
+      .skipLocked(); // Skip rows locked by other processes (PostgreSQL)
+    
+    if (events.length === 0) return;
+    
+    log.info(`Processing ${events.length} outbox events`);
+    
+    for (const event of events) {
+      await this.publishEvent(event);
     }
   }
-
-  private async processEvent(event: OutboxEvent): Promise<void> {
+  
+  private async publishEvent(event: any): Promise<void> {
     try {
-      await this.eventPublisher.publish({
-        exchange: this.getExchangeForAggregate(event.aggregateType),
-        routingKey: event.eventType,
-        content: {
-          id: event.id,
-          aggregateType: event.aggregateType,
-          aggregateId: event.aggregateId,
-          eventType: event.eventType,
-          payload: event.payload,
-          occurredAt: event.createdAt,
+      // Mark as processing
+      await this.db('outbox_events')
+        .where({ id: event.id })
+        .update({ status: 'processing' });
+      
+      const payload = Buffer.from(JSON.stringify({
+        ...event.payload,
+        _outbox: {
+          eventId: event.id,
+          eventType: event.event_type,
+          aggregateType: event.aggregate_type,
+          aggregateId: event.aggregate_id,
+          occurredAt: event.created_at,
         },
-        options: {
-          headers: event.headers,
-          messageId: event.id,
-        },
+      }));
+      
+      const headers: Record<string, string> = {
+        ...(event.headers || {}),
+        'x-event-type': event.event_type,
+        'x-aggregate-type': event.aggregate_type,
+        'x-aggregate-id': event.aggregate_id,
+        'x-outbox-id': event.id,
+      };
+      
+      // Publish with confirm
+      await new Promise<void>((resolve, reject) => {
+        const published = this.channel.publish(
+          event.exchange || '',
+          event.routing_key,
+          payload,
+          {
+            persistent: true,
+            contentType: 'application/json',
+            messageId: event.id,
+            type: event.event_type,
+            headers,
+          }
+        );
+        
+        if (!published) {
+          reject(new Error('Channel write buffer full'));
+        } else {
+          resolve();
+        }
       });
       
-      await this.outboxRepository.markAsProcessed(event.id);
-      this.logger.debug(`Outbox event ${event.id} processed successfully`);
+      // Wait for broker confirmation
+      await this.channel.waitForConfirms();
+      
+      // Mark as published
+      await this.db('outbox_events')
+        .where({ id: event.id })
+        .update({
+          status: 'published',
+          processed_at: new Date(),
+        });
+      
+      log.info('Outbox event published', {
+        eventId: event.id,
+        eventType: event.event_type,
+        aggregateId: event.aggregate_id,
+      });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.warn(`Failed to process outbox event ${event.id}: ${errorMessage}`);
-      await this.outboxRepository.markAsFailed(event.id, errorMessage);
-    }
-  }
-
-  private getExchangeForAggregate(aggregateType: string): string {
-    const exchangeMap: Record<string, string> = {
-      Order: 'orders.events',
-      Payment: 'payments.events',
-      User: 'users.events',
-      Product: 'products.events',
-    };
-    
-    return exchangeMap[aggregateType] || 'events';
-  }
-}
-```
-
-### Order Service กับ Outbox Pattern
-
-```typescript
-// src/orders/order.service.ts
-import { Injectable } from '@nestjs/common';
-import { DataSource } from 'typeorm';
-import { OutboxRepository } from '../outbox/outbox.repository';
-import { Order } from './order.entity';
-
-@Injectable()
-export class OrderService {
-  constructor(
-    private readonly dataSource: DataSource,
-    private readonly outboxRepository: OutboxRepository
-  ) {}
-
-  async createOrder(createOrderDto: {
-    customerId: string;
-    items: Array<{ productId: string; quantity: number; price: number }>;
-  }): Promise<Order> {
-    // Transaction เดียวสำหรับทั้ง business operation และ outbox event
-    return this.dataSource.transaction(async (manager) => {
-      // 1. สร้าง Order
-      const total = createOrderDto.items.reduce(
-        (sum, item) => sum + item.quantity * item.price,
-        0
+      const retryCount = (event.retry_count || 0) + 1;
+      const status = retryCount >= this.config.maxRetries! ? 'dead' : 'failed';
+      const nextScheduledAt = new Date(
+        Date.now() + this.config.retryDelayMs! * Math.pow(2, retryCount - 1)
       );
       
-      const order = manager.create(Order, {
-        customerId: createOrderDto.customerId,
-        items: createOrderDto.items,
-        total,
-        status: 'pending',
+      await this.db('outbox_events')
+        .where({ id: event.id })
+        .update({
+          status,
+          retry_count: retryCount,
+          last_error: (error as Error).message,
+          scheduled_at: nextScheduledAt,
+        });
+      
+      log.error('Failed to publish outbox event', error as Error, {
+        eventId: event.id,
+        retryCount,
+        status,
       });
-      
-      const savedOrder = await manager.save(Order, order);
-      
-      // 2. บันทึก Outbox Event ในTransaction เดียวกัน
-      await this.outboxRepository.saveEventInTransaction(manager, {
-        aggregateType: 'Order',
-        aggregateId: savedOrder.id,
-        eventType: 'order.created',
-        payload: {
-          orderId: savedOrder.id,
-          customerId: savedOrder.customerId,
-          items: savedOrder.items,
-          total: savedOrder.total,
-          status: savedOrder.status,
-        },
-        headers: {
-          'content-type': 'application/json',
-          'schema-version': '1.0',
-        },
-      });
-      
-      return savedOrder;
-      // ถ้า transaction fail ทั้ง Order และ Outbox event จะถูก rollback พร้อมกัน
+    }
+  }
+}
+
+// Helper to publish events as part of a database transaction
+export class TransactionalOutbox {
+  constructor(private readonly trx: Knex.Transaction) {}
+  
+  async publish(
+    aggregateType: string,
+    aggregateId: string,
+    eventType: string,
+    payload: Record<string, unknown>,
+    routing: { exchange?: string; routingKey: string }
+  ): Promise<void> {
+    await this.trx('outbox_events').insert({
+      aggregate_type: aggregateType,
+      aggregate_id: aggregateId,
+      event_type: eventType,
+      payload: JSON.stringify(payload),
+      exchange: routing.exchange || '',
+      routing_key: routing.routingKey,
+      status: 'pending',
+      created_at: new Date(),
     });
   }
+}
+
+// Usage in service
+async function createOrderWithOutbox(orderData: CreateOrderDto): Promise<Order> {
+  return db.transaction(async (trx) => {
+    // 1. Create order in database
+    const [order] = await trx('orders').insert({
+      user_id: orderData.userId,
+      status: 'pending',
+      total_amount: orderData.totalAmount,
+      currency: orderData.currency,
+    }).returning('*');
+    
+    // 2. Record outbox event in same transaction
+    const outbox = new TransactionalOutbox(trx);
+    await outbox.publish(
+      'Order',
+      order.id,
+      'OrderCreated',
+      {
+        orderId: order.id,
+        userId: order.user_id,
+        totalAmount: order.total_amount,
+        currency: order.currency,
+      },
+      { routingKey: 'order.created' }
+    );
+    
+    // Both operations are atomic - either both succeed or both fail
+    return order;
+  });
 }
 ```
 
 ---
 
-## 3. Inbox Pattern สำหรับ Idempotent Consumers
+## 6. Inbox Pattern สำหรับ Deduplication
 
 ```typescript
-// src/inbox/inbox.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { DataSource } from 'typeorm';
-import { InboxEvent } from './inbox.entity';
+// src/messaging/inbox/inbox-pattern.ts
+import { Knex } from 'knex';
+import { Channel, ConsumeMessage } from 'amqplib';
 
-@Injectable()
-export class InboxService {
-  private readonly logger = new Logger(InboxService.name);
+/*
+CREATE TABLE inbox_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  message_id VARCHAR(255) UNIQUE NOT NULL,  -- RabbitMQ messageId
+  correlation_id VARCHAR(255),
+  event_type VARCHAR(200) NOT NULL,
+  payload JSONB NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ,
+  status VARCHAR(20) NOT NULL DEFAULT 'received',
+  error_message TEXT,
+  processing_attempts INTEGER NOT NULL DEFAULT 0
+);
 
-  constructor(private readonly dataSource: DataSource) {}
+CREATE UNIQUE INDEX idx_inbox_message_id ON inbox_messages (message_id);
+CREATE INDEX idx_inbox_unprocessed ON inbox_messages (status, received_at)
+  WHERE status IN ('received', 'failed');
+*/
 
-  async processIdempotent(
+export class InboxConsumer {
+  constructor(
+    private readonly db: Knex,
+    private readonly channel: Channel
+  ) {}
+  
+  async consume(
+    queueName: string,
+    handlers: Map<string, (payload: unknown) => Promise<void>>
+  ): Promise<void> {
+    await this.channel.prefetch(10);
+    
+    this.channel.consume(queueName, async (msg) => {
+      if (!msg) return;
+      
+      const messageId = msg.properties.messageId;
+      const eventType = msg.properties.type ||
+        msg.properties.headers?.['x-event-type'];
+      
+      if (!messageId) {
+        log.warn('Message missing messageId, cannot use inbox deduplication');
+        this.channel.ack(msg);
+        return;
+      }
+      
+      try {
+        // Attempt to insert into inbox (unique constraint prevents duplicates)
+        const inserted = await this.tryInsertInbox(msg, messageId, eventType);
+        
+        if (!inserted) {
+          // Already in inbox (duplicate)
+          this.channel.ack(msg);
+          return;
+        }
+        
+        // Process the message
+        const handler = handlers.get(eventType);
+        if (!handler) {
+          log.warn('No handler for event type', { eventType, messageId });
+          await this.markInboxStatus(messageId, 'skipped');
+          this.channel.ack(msg);
+          return;
+        }
+        
+        const payload = JSON.parse(msg.content.toString());
+        await handler(payload);
+        
+        await this.markInboxStatus(messageId, 'processed');
+        this.channel.ack(msg);
+      } catch (error) {
+        await this.markInboxError(messageId, (error as Error).message);
+        this.channel.nack(msg, false, false); // Send to DLQ
+      }
+    });
+  }
+  
+  private async tryInsertInbox(
+    msg: ConsumeMessage,
     messageId: string,
-    eventType: string,
-    handler: () => Promise<void>
-  ): Promise<{ processed: boolean; alreadyProcessed: boolean }> {
-    const repo = this.dataSource.getRepository(InboxEvent);
-    
-    // ตรวจสอบว่า message นี้เคย process แล้วหรือยัง
-    const existing = await repo.findOneBy({ messageId });
-    
-    if (existing) {
-      if (existing.status === 'processed') {
-        this.logger.debug(`Message ${messageId} already processed, skipping`);
-        return { processed: false, alreadyProcessed: true };
-      }
-      
-      if (existing.status === 'processing') {
-        this.logger.warn(`Message ${messageId} is being processed by another instance`);
-        return { processed: false, alreadyProcessed: false };
-      }
-    }
-
-    // สร้าง inbox record เพื่อ "lock" message นี้
+    eventType: string
+  ): Promise<boolean> {
     try {
-      await repo.insert({
-        messageId,
-        eventType,
-        status: 'processing',
-        receivedAt: new Date(),
+      await this.db('inbox_messages').insert({
+        message_id: messageId,
+        correlation_id: msg.properties.correlationId,
+        event_type: eventType || 'unknown',
+        payload: msg.content.toString(),
+        received_at: new Date(),
+        status: 'received',
       });
-    } catch (e) {
-      // Duplicate key error - message already being processed
-      this.logger.warn(`Race condition detected for message ${messageId}`);
-      return { processed: false, alreadyProcessed: false };
-    }
-
-    // Process message
-    try {
-      await handler();
-      
-      await repo.update({ messageId }, {
-        status: 'processed',
-        processedAt: new Date(),
-      });
-      
-      return { processed: true, alreadyProcessed: false };
-    } catch (error) {
-      await repo.update({ messageId }, {
-        status: 'failed',
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
-      });
-      
+      return true;
+    } catch (error: any) {
+      if (error.code === '23505') { // PostgreSQL unique violation
+        log.info('Duplicate message detected', { messageId });
+        return false;
+      }
       throw error;
     }
   }
-}
-```
-
----
-
-## 4. Choreography vs Orchestration Sagas
-
-### Choreography Saga
-
-```typescript
-// src/sagas/choreography/order-saga.events.ts
-export const OrderSagaEvents = {
-  ORDER_CREATED: 'order.created',
-  PAYMENT_INITIATED: 'payment.initiated',
-  PAYMENT_COMPLETED: 'payment.completed',
-  PAYMENT_FAILED: 'payment.failed',
-  INVENTORY_RESERVED: 'inventory.reserved',
-  INVENTORY_FAILED: 'inventory.failed',
-  ORDER_CONFIRMED: 'order.confirmed',
-  ORDER_CANCELLED: 'order.cancelled',
-} as const;
-
-// Order Service
-// src/sagas/choreography/order-choreography.service.ts
-@Injectable()
-export class OrderChoreographyService {
-  constructor(
-    private readonly eventBus: EventBusService,
-    private readonly orderRepository: OrderRepository
-  ) {}
-
-  // Listen สำหรับ payment events
-  @EventHandler(OrderSagaEvents.PAYMENT_COMPLETED)
-  async onPaymentCompleted(event: { orderId: string; transactionId: string }): Promise<void> {
-    const order = await this.orderRepository.findById(event.orderId);
-    
-    if (!order || order.status !== 'payment_pending') return;
-    
-    await this.orderRepository.updateStatus(event.orderId, 'payment_completed');
-    
-    // Publish event เพื่อให้ Inventory Service ทำงานต่อ
-    await this.eventBus.publish(OrderSagaEvents.ORDER_CONFIRMED, {
-      orderId: event.orderId,
-      customerId: order.customerId,
-      items: order.items,
-    });
+  
+  private async markInboxStatus(messageId: string, status: string): Promise<void> {
+    await this.db('inbox_messages')
+      .where({ message_id: messageId })
+      .update({
+        status,
+        processed_at: new Date(),
+        processing_attempts: this.db.raw('processing_attempts + 1'),
+      });
   }
-
-  @EventHandler(OrderSagaEvents.PAYMENT_FAILED)
-  async onPaymentFailed(event: { orderId: string; reason: string }): Promise<void> {
-    await this.orderRepository.updateStatus(event.orderId, 'cancelled');
-    
-    await this.eventBus.publish(OrderSagaEvents.ORDER_CANCELLED, {
-      orderId: event.orderId,
-      reason: `Payment failed: ${event.reason}`,
-    });
-  }
-
-  @EventHandler(OrderSagaEvents.INVENTORY_FAILED)
-  async onInventoryFailed(event: { orderId: string; reason: string }): Promise<void> {
-    await this.orderRepository.updateStatus(event.orderId, 'cancelled');
-    
-    // Trigger compensation: คืนเงิน
-    await this.eventBus.publish('payment.refund.requested', {
-      orderId: event.orderId,
-      reason: event.reason,
-    });
-  }
-}
-```
-
-### Orchestration Saga
-
-```typescript
-// src/sagas/orchestration/order-orchestrator.ts
-import { Injectable, Logger } from '@nestjs/common';
-
-type SagaState = 
-  | 'started'
-  | 'payment_pending'
-  | 'payment_completed'
-  | 'inventory_pending'
-  | 'completed'
-  | 'compensating'
-  | 'cancelled';
-
-interface SagaData {
-  orderId: string;
-  customerId: string;
-  items: Array<{ productId: string; quantity: number; price: number }>;
-  total: number;
-  paymentTransactionId?: string;
-  inventoryReservationId?: string;
-}
-
-@Injectable()
-export class OrderSagaOrchestrator {
-  private readonly logger = new Logger(OrderSagaOrchestrator.name);
-
-  constructor(
-    private readonly sagaRepository: SagaRepository,
-    private readonly paymentService: PaymentServiceClient,
-    private readonly inventoryService: InventoryServiceClient,
-    private readonly notificationService: NotificationServiceClient
-  ) {}
-
-  async startOrderSaga(data: SagaData): Promise<void> {
-    const sagaId = `order-saga-${data.orderId}`;
-    
-    // บันทึก saga state
-    await this.sagaRepository.save({
-      id: sagaId,
-      type: 'OrderSaga',
-      state: 'started',
-      data,
-    });
-
-    await this.executeNextStep(sagaId, 'started', data);
-  }
-
-  private async executeNextStep(
-    sagaId: string,
-    currentState: SagaState,
-    data: SagaData
-  ): Promise<void> {
-    try {
-      switch (currentState) {
-        case 'started':
-          await this.step1_initiatePayment(sagaId, data);
-          break;
-          
-        case 'payment_completed':
-          await this.step2_reserveInventory(sagaId, data);
-          break;
-          
-        case 'inventory_pending':
-          await this.step3_completeOrder(sagaId, data);
-          break;
-          
-        default:
-          this.logger.warn(`Unknown saga state: ${currentState}`);
-      }
-    } catch (error) {
-      this.logger.error(`Saga ${sagaId} failed at state ${currentState}:`, error);
-      await this.startCompensation(sagaId, currentState, data);
-    }
-  }
-
-  private async step1_initiatePayment(sagaId: string, data: SagaData): Promise<void> {
-    await this.sagaRepository.updateState(sagaId, 'payment_pending');
-    
-    const result = await this.paymentService.initiatePayment({
-      orderId: data.orderId,
-      customerId: data.customerId,
-      amount: data.total,
-    });
-    
-    await this.sagaRepository.updateData(sagaId, {
-      ...data,
-      paymentTransactionId: result.transactionId,
-    });
-    
-    await this.sagaRepository.updateState(sagaId, 'payment_completed');
-    await this.executeNextStep(sagaId, 'payment_completed', {
-      ...data,
-      paymentTransactionId: result.transactionId,
-    });
-  }
-
-  private async step2_reserveInventory(sagaId: string, data: SagaData): Promise<void> {
-    await this.sagaRepository.updateState(sagaId, 'inventory_pending');
-    
-    const result = await this.inventoryService.reserveItems({
-      orderId: data.orderId,
-      items: data.items,
-    });
-    
-    await this.sagaRepository.updateData(sagaId, {
-      ...data,
-      inventoryReservationId: result.reservationId,
-    });
-    
-    await this.executeNextStep(sagaId, 'inventory_pending', data);
-  }
-
-  private async step3_completeOrder(sagaId: string, data: SagaData): Promise<void> {
-    await this.sagaRepository.updateState(sagaId, 'completed');
-    
-    await this.notificationService.sendOrderConfirmation({
-      orderId: data.orderId,
-      customerId: data.customerId,
-    });
-    
-    this.logger.log(`Saga ${sagaId} completed successfully`);
-  }
-
-  private async startCompensation(
-    sagaId: string,
-    failedState: SagaState,
-    data: SagaData
-  ): Promise<void> {
-    await this.sagaRepository.updateState(sagaId, 'compensating');
-    
-    this.logger.warn(`Starting compensation for saga ${sagaId} at state ${failedState}`);
-
-    switch (failedState) {
-      case 'inventory_pending':
-        // Inventory failed - refund payment
-        if (data.paymentTransactionId) {
-          await this.paymentService.refund({
-            transactionId: data.paymentTransactionId,
-            reason: 'Inventory reservation failed',
-          });
-        }
-        break;
-        
-      case 'payment_completed':
-        // Nothing to compensate if payment just completed and inventory not yet started
-        break;
-    }
-    
-    await this.sagaRepository.updateState(sagaId, 'cancelled');
+  
+  private async markInboxError(messageId: string, errorMessage: string): Promise<void> {
+    await this.db('inbox_messages')
+      .where({ message_id: messageId })
+      .update({
+        status: 'failed',
+        error_message: errorMessage,
+        processing_attempts: this.db.raw('processing_attempts + 1'),
+      });
   }
 }
 ```
 
 ---
 
-## 5. Event-Carried State Transfer
+## 7. Message Schema Versioning
 
 ```typescript
-// src/patterns/event-carried-state.ts
-// แทนที่จะ call API เพื่อดึงข้อมูล User เราส่งข้อมูลที่จำเป็นไปใน Event
+// src/messaging/schema-versioning.ts
 
-export interface OrderCreatedEvent {
-  // Identity fields
-  eventId: string;
-  eventType: 'order.created';
-  occurredAt: string;
-  
-  // Order data
+// Version 1 schema
+interface OrderCreatedV1 {
+  _schema_version: 1;
   orderId: string;
-  
-  // Embedded customer data (Event-Carried State Transfer)
-  customer: {
-    id: string;
-    email: string;
-    name: string;
-    phone?: string;
-    address: {
-      street: string;
-      city: string;
-      postalCode: string;
-      country: string;
-    };
-    tier: 'standard' | 'premium' | 'vip';
-  };
-  
-  // Embedded product data
+  userId: string;
+  total: number; // Before: single total field
   items: Array<{
     productId: string;
-    productName: string;
-    productSku: string;
     quantity: number;
-    unitPrice: number;
-    totalPrice: number;
-    category: string;
+    price: number;
   }>;
+  createdAt: string;
+}
+
+// Version 2 schema (breaking change: total split into subtotal + tax)
+interface OrderCreatedV2 {
+  _schema_version: 2;
+  orderId: string;
+  userId: string;
+  subtotal: number;  // Changed from total
+  tax: number;       // New field
+  total: number;     // Kept for backward compat
+  currency: string;  // New required field
+  items: Array<{
+    productId: string;
+    productName: string; // New field
+    quantity: number;
+    unitPrice: number;   // Renamed from price
+    totalPrice: number;  // New field
+  }>;
+  createdAt: string;
+  updatedAt: string; // New field
+}
+
+type OrderCreatedEvent = OrderCreatedV1 | OrderCreatedV2;
+
+// Schema migrator
+export class MessageMigrator {
+  private readonly migrations = new Map<
+    `${number}->${number}`,
+    (msg: any) => any
+  >();
   
-  total: number;
-  currency: string;
+  registerMigration(
+    fromVersion: number,
+    toVersion: number,
+    migrator: (msg: any) => any
+  ): void {
+    this.migrations.set(`${fromVersion}->${toVersion}`, migrator);
+  }
   
-  // Shipping info
-  shippingMethod: string;
-  estimatedDelivery: string;
-}
-```
-
----
-
-## 6. Change Data Capture (CDC) with Debezium
-
-### Debezium Configuration
-
-```yaml
-# debezium/postgres-connector.json
-{
-  "name": "orders-postgres-connector",
-  "config": {
-    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-    "database.hostname": "postgres",
-    "database.port": "5432",
-    "database.user": "debezium",
-    "database.password": "debezium_password",
-    "database.dbname": "orders_db",
-    "database.server.name": "orders",
-    "table.include.list": "public.orders,public.order_items,public.customers",
-    "plugin.name": "pgoutput",
-    "slot.name": "debezium_orders",
-    "publication.name": "debezium_publication",
-    "topic.prefix": "cdc.orders",
-    "transforms": "unwrap,route",
-    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-    "transforms.unwrap.drop.tombstones": "false",
-    "transforms.unwrap.delete.handling.mode": "rewrite",
-    "transforms.route.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "key.converter.schemas.enable": "false",
-    "value.converter.schemas.enable": "false"
+  migrateToLatest<T>(message: { _schema_version?: number } & Record<string, unknown>): T {
+    const currentVersion = message._schema_version || 1;
+    const LATEST_VERSION = 2;
+    
+    let current: any = message;
+    
+    for (let v = currentVersion; v < LATEST_VERSION; v++) {
+      const migration = this.migrations.get(`${v}->${v + 1}`);
+      if (!migration) {
+        throw new Error(`No migration from v${v} to v${v + 1}`);
+      }
+      current = migration(current);
+    }
+    
+    return current as T;
   }
 }
-```
 
-```yaml
-# docker-compose.debezium.yml
-version: '3.8'
+// Register migrations
+export const orderEventMigrator = new MessageMigrator();
 
-services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+// Migration: V1 → V2
+orderEventMigrator.registerMigration(1, 2, (v1: OrderCreatedV1): OrderCreatedV2 => ({
+  _schema_version: 2,
+  orderId: v1.orderId,
+  userId: v1.userId,
+  subtotal: v1.total,       // Estimate: assume no tax in V1
+  tax: 0,                   // Default: no tax
+  total: v1.total,
+  currency: 'USD',          // Default: assume USD for old events
+  items: v1.items.map(item => ({
+    productId: item.productId,
+    productName: item.productId, // Use productId as placeholder
+    quantity: item.quantity,
+    unitPrice: item.price,        // Renamed
+    totalPrice: item.price * item.quantity,
+  })),
+  createdAt: v1.createdAt,
+  updatedAt: v1.createdAt,        // Default to createdAt
+}));
 
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    depends_on:
-      - zookeeper
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+// Schema registry for validation
+import Ajv from 'ajv';
 
-  debezium:
-    image: debezium/connect:2.4
-    depends_on:
-      - kafka
-    ports:
-      - "8083:8083"
-    environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-      GROUP_ID: debezium-connect
-      CONFIG_STORAGE_TOPIC: debezium.configs
-      OFFSET_STORAGE_TOPIC: debezium.offsets
-      STATUS_STORAGE_TOPIC: debezium.status
-```
+const ajv = new Ajv({ allErrors: true });
 
-### CDC Event Consumer ใน TypeScript
+const schemas: Record<number, object> = {
+  1: {
+    type: 'object',
+    required: ['_schema_version', 'orderId', 'userId', 'total'],
+    properties: {
+      _schema_version: { type: 'integer', enum: [1] },
+      orderId: { type: 'string', format: 'uuid' },
+      userId: { type: 'string', format: 'uuid' },
+      total: { type: 'number', minimum: 0 },
+    },
+  },
+  2: {
+    type: 'object',
+    required: ['_schema_version', 'orderId', 'userId', 'subtotal', 'total', 'currency'],
+    properties: {
+      _schema_version: { type: 'integer', enum: [2] },
+      orderId: { type: 'string', format: 'uuid' },
+      userId: { type: 'string', format: 'uuid' },
+      subtotal: { type: 'number', minimum: 0 },
+      tax: { type: 'number', minimum: 0 },
+      total: { type: 'number', minimum: 0 },
+      currency: { type: 'string', pattern: '^[A-Z]{3}$' },
+    },
+  },
+};
 
-```typescript
-// src/cdc/cdc-consumer.ts
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Kafka, Consumer, KafkaMessage } from 'kafkajs';
-
-interface DebeziumEvent<T> {
-  before: T | null;
-  after: T | null;
-  op: 'c' | 'u' | 'd' | 'r';  // create, update, delete, read
-  ts_ms: number;
-  source: {
-    db: string;
-    table: string;
-  };
+export class SchemaRegistry {
+  private readonly validators = new Map<number, ReturnType<typeof ajv.compile>>();
+  
+  constructor() {
+    for (const [version, schema] of Object.entries(schemas)) {
+      this.validators.set(parseInt(version), ajv.compile(schema));
+    }
+  }
+  
+  validate(message: unknown, version?: number): void {
+    const v = version || (message as any)?._schema_version || 1;
+    const validator = this.validators.get(v);
+    
+    if (!validator) {
+      throw new Error(`Unknown schema version: ${v}`);
+    }
+    
+    if (!validator(message)) {
+      throw new Error(
+        `Schema validation failed (v${v}): ${ajv.errorsText(validator.errors)}`
+      );
+    }
+  }
 }
 
-@Injectable()
-export class CDCConsumerService implements OnModuleInit {
-  private readonly logger = new Logger(CDCConsumerService.name);
-  private consumer: Consumer;
-
-  constructor(private readonly orderProjectionService: OrderProjectionService) {
-    const kafka = new Kafka({
-      clientId: 'order-cdc-consumer',
-      brokers: ['kafka:9092'],
-    });
-    
-    this.consumer = kafka.consumer({ groupId: 'order-projections' });
-  }
-
-  async onModuleInit(): Promise<void> {
-    await this.consumer.connect();
-    
-    await this.consumer.subscribe({
-      topics: [
-        'cdc.orders.public.orders',
-        'cdc.orders.public.order_items',
-      ],
-      fromBeginning: false,
-    });
-    
-    await this.consumer.run({
-      eachMessage: async ({ topic, message }) => {
-        await this.processMessage(topic, message);
-      },
-    });
-  }
-
-  private async processMessage(topic: string, message: KafkaMessage): Promise<void> {
-    if (!message.value) return;
+// Consumer that handles multiple schema versions
+export function createVersionedConsumer(channel: Channel, queueName: string) {
+  const migrator = orderEventMigrator;
+  const registry = new SchemaRegistry();
+  
+  channel.consume(queueName, async (msg) => {
+    if (!msg) return;
     
     try {
-      const event = JSON.parse(message.value.toString()) as DebeziumEvent<Record<string, unknown>>;
+      const rawPayload = JSON.parse(msg.content.toString());
+      const version = rawPayload._schema_version || 1;
       
-      const tableName = topic.split('.').pop();
+      // Validate against claimed schema version
+      registry.validate(rawPayload, version);
       
-      switch (tableName) {
-        case 'orders':
-          await this.handleOrderChange(event);
-          break;
-        case 'order_items':
-          await this.handleOrderItemChange(event);
-          break;
-      }
+      // Migrate to latest version if needed
+      const payload = migrator.migrateToLatest<OrderCreatedV2>(rawPayload);
+      
+      log.info('Processing order event', {
+        orderId: payload.orderId,
+        schemaVersion: version,
+        migratedTo: payload._schema_version,
+      });
+      
+      await processOrder(payload);
+      channel.ack(msg);
     } catch (error) {
-      this.logger.error(`Failed to process CDC message from ${topic}:`, error);
+      log.error('Failed to process message', error as Error);
+      channel.nack(msg, false, false);
     }
-  }
+  });
+}
 
-  private async handleOrderChange(event: DebeziumEvent<Record<string, unknown>>): Promise<void> {
-    switch (event.op) {
-      case 'c':
-        await this.orderProjectionService.onCreate(event.after!);
-        break;
-      case 'u':
-        await this.orderProjectionService.onUpdate(event.before!, event.after!);
-        break;
-      case 'd':
-        await this.orderProjectionService.onDelete(event.before!);
-        break;
-    }
-  }
-
-  private async handleOrderItemChange(event: DebeziumEvent<Record<string, unknown>>): Promise<void> {
-    switch (event.op) {
-      case 'c':
-        await this.orderProjectionService.onItemAdded(event.after!);
-        break;
-      case 'u':
-        await this.orderProjectionService.onItemUpdated(event.before!, event.after!);
-        break;
-      case 'd':
-        await this.orderProjectionService.onItemRemoved(event.before!);
-        break;
-    }
-  }
+async function processOrder(event: OrderCreatedV2): Promise<void> {
+  // Process always works with V2 schema
 }
 ```
 
 ---
 
-## 7. AsyncAPI Specification
-
-```yaml
-# asyncapi.yaml
-asyncapi: '2.6.0'
-info:
-  title: Order Service Events API
-  version: '1.0.0'
-  description: Event definitions สำหรับ Order Service
-  contact:
-    name: Platform Team
-    email: platform@company.com
-
-servers:
-  production:
-    url: rabbitmq.production.svc.cluster.local:5672
-    protocol: amqp
-    description: Production RabbitMQ
-    security:
-      - userPassword: []
-  
-  staging:
-    url: rabbitmq.staging.svc.cluster.local:5672
-    protocol: amqp
-    description: Staging RabbitMQ
-
-defaultContentType: application/json
-
-channels:
-  order/created:
-    description: Published เมื่อมีการสร้าง Order ใหม่
-    subscribe:
-      summary: Order Created Event
-      operationId: onOrderCreated
-      message:
-        $ref: '#/components/messages/OrderCreated'
-    bindings:
-      amqp:
-        is: routingKey
-        exchange:
-          name: orders.events
-          type: topic
-          durable: true
-
-  order/cancelled:
-    description: Published เมื่อ Order ถูก cancel
-    subscribe:
-      summary: Order Cancelled Event
-      operationId: onOrderCancelled
-      message:
-        $ref: '#/components/messages/OrderCancelled'
-
-  payment/requested:
-    description: Published เพื่อ request payment processing
-    publish:
-      summary: Request Payment Processing
-      operationId: requestPayment
-      message:
-        $ref: '#/components/messages/PaymentRequested'
-
-components:
-  messages:
-    OrderCreated:
-      name: OrderCreated
-      title: Order Created
-      summary: สร้าง Order ใหม่เรียบร้อยแล้ว
-      contentType: application/json
-      headers:
-        type: object
-        properties:
-          correlationId:
-            description: Unique ID สำหรับ tracing
-            type: string
-            format: uuid
-          schemaVersion:
-            description: Version ของ schema
-            type: string
-            default: "1.0"
-      payload:
-        $ref: '#/components/schemas/OrderCreatedPayload'
-        
-    OrderCancelled:
-      name: OrderCancelled
-      payload:
-        $ref: '#/components/schemas/OrderCancelledPayload'
-        
-    PaymentRequested:
-      name: PaymentRequested
-      payload:
-        $ref: '#/components/schemas/PaymentRequestedPayload'
-        
-  schemas:
-    OrderCreatedPayload:
-      type: object
-      required:
-        - orderId
-        - customerId
-        - items
-        - total
-        - createdAt
-      properties:
-        orderId:
-          type: string
-          format: uuid
-          description: Unique identifier ของ Order
-        customerId:
-          type: string
-          format: uuid
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/OrderItem'
-        total:
-          type: number
-          format: float
-          minimum: 0
-        currency:
-          type: string
-          default: THB
-        createdAt:
-          type: string
-          format: date-time
-          
-    OrderItem:
-      type: object
-      required:
-        - productId
-        - quantity
-        - unitPrice
-      properties:
-        productId:
-          type: string
-          format: uuid
-        productName:
-          type: string
-        quantity:
-          type: integer
-          minimum: 1
-        unitPrice:
-          type: number
-          minimum: 0
-        totalPrice:
-          type: number
-          minimum: 0
-          
-    OrderCancelledPayload:
-      type: object
-      required:
-        - orderId
-        - reason
-        - cancelledAt
-      properties:
-        orderId:
-          type: string
-          format: uuid
-        reason:
-          type: string
-        cancelledAt:
-          type: string
-          format: date-time
-          
-    PaymentRequestedPayload:
-      type: object
-      required:
-        - orderId
-        - amount
-        - currency
-        - customerId
-      properties:
-        orderId:
-          type: string
-          format: uuid
-        amount:
-          type: number
-          minimum: 0
-        currency:
-          type: string
-          default: THB
-        customerId:
-          type: string
-          format: uuid
-        paymentMethod:
-          type: string
-          enum: [credit_card, bank_transfer, qr_code]
-          
-  securitySchemes:
-    userPassword:
-      type: userPassword
-```
-
----
-
-## 8. Compensating Transactions
+## 8. At-least-once Delivery กับ Business Logic Idempotency
 
 ```typescript
-// src/sagas/compensating-transactions.ts
-export interface CompensationStep {
-  name: string;
-  compensate: () => Promise<void>;
-}
+// src/messaging/at-least-once-delivery.ts
+import { Channel, ConsumeMessage } from 'amqplib';
+import { db } from '../database';
 
-export class CompensationManager {
-  private readonly logger = console;
-  private executedSteps: CompensationStep[] = [];
-
-  async execute(
-    step: CompensationStep,
-    operation: () => Promise<void>
+// Business logic ต้องเป็น idempotent เสมอเมื่อใช้ at-least-once delivery
+export class OrderPaymentProcessor {
+  async processPaymentSuccess(
+    channel: Channel,
+    msg: ConsumeMessage
   ): Promise<void> {
-    try {
-      await operation();
-      this.executedSteps.push(step);
-    } catch (error) {
-      this.logger.error(`Step ${step.name} failed:`, error);
-      await this.compensateAll();
-      throw error;
+    const event = JSON.parse(msg.content.toString());
+    const { orderId, paymentId, amount } = event;
+    
+    // Idempotent: ถ้า order already paid, ไม่ทำซ้ำ
+    const order = await db('orders')
+      .where({ id: orderId })
+      .first();
+    
+    if (!order) {
+      log.warn('Order not found for payment event', { orderId, paymentId });
+      channel.ack(msg); // Ack: ไม่ retry event ที่ไม่มี order
+      return;
     }
-  }
-
-  private async compensateAll(): Promise<void> {
-    this.logger.warn(`Starting compensation for ${this.executedSteps.length} steps`);
     
-    // Compensate ในลำดับย้อนกลับ
-    const stepsToCompensate = [...this.executedSteps].reverse();
+    if (order.status === 'paid') {
+      // Already processed - idempotent success
+      log.info('Order already paid, skipping', { orderId, paymentId });
+      channel.ack(msg);
+      return;
+    }
     
-    for (const step of stepsToCompensate) {
-      try {
-        this.logger.warn(`Compensating step: ${step.name}`);
-        await step.compensate();
-      } catch (error) {
-        this.logger.error(`Compensation failed for step ${step.name}:`, error);
-        // Log and continue with other compensations
+    if (order.status !== 'pending') {
+      log.warn('Cannot process payment for order in status', {
+        orderId,
+        status: order.status,
+      });
+      channel.ack(msg); // Ack to prevent infinite retry
+      return;
+    }
+    
+    try {
+      await db.transaction(async (trx) => {
+        // Update order status
+        await trx('orders')
+          .where({ id: orderId, status: 'pending' }) // Optimistic lock via status check
+          .update({
+            status: 'paid',
+            payment_id: paymentId,
+            paid_at: new Date(),
+            updated_at: new Date(),
+          });
+        
+        // Verify update happened (another instance might have beaten us)
+        const updated = await trx('orders')
+          .where({ id: orderId, status: 'paid', payment_id: paymentId })
+          .first();
+        
+        if (!updated) {
+          throw new Error('Concurrent update detected');
+        }
+        
+        // Record payment history
+        await trx('payment_history').insert({
+          order_id: orderId,
+          payment_id: paymentId,
+          amount,
+          status: 'completed',
+          processed_at: new Date(),
+        });
+      });
+      
+      channel.ack(msg);
+      log.info('Payment processed successfully', { orderId, paymentId });
+    } catch (error) {
+      if ((error as Error).message === 'Concurrent update detected') {
+        // Another instance processed it first, ack to avoid re-delivery
+        channel.ack(msg);
+      } else {
+        channel.nack(msg, false, true); // Retry
+        throw error;
       }
     }
-    
-    this.executedSteps = [];
   }
 }
-
-// การใช้งาน
-async function createOrderWithCompensation(orderData: {
-  customerId: string;
-  items: Array<{ productId: string; quantity: number; price: number }>;
-  total: number;
-}) {
-  const compensation = new CompensationManager();
-  let orderId: string | undefined;
-  let paymentId: string | undefined;
-
-  await compensation.execute(
-    {
-      name: 'create-order',
-      compensate: async () => {
-        if (orderId) await cancelOrder(orderId);
-      },
-    },
-    async () => {
-      orderId = await createOrder(orderData);
-    }
-  );
-
-  await compensation.execute(
-    {
-      name: 'process-payment',
-      compensate: async () => {
-        if (paymentId) await refundPayment(paymentId);
-      },
-    },
-    async () => {
-      paymentId = await processPayment({ orderId: orderId!, amount: orderData.total });
-    }
-  );
-
-  await compensation.execute(
-    {
-      name: 'reserve-inventory',
-      compensate: async () => {
-        if (orderId) await releaseInventory(orderId);
-      },
-    },
-    async () => {
-      await reserveInventory(orderId!, orderData.items);
-    }
-  );
-}
-
-// Placeholder functions
-async function cancelOrder(id: string): Promise<void> { console.log('Cancelling order', id); }
-async function refundPayment(id: string): Promise<void> { console.log('Refunding payment', id); }
-async function releaseInventory(id: string): Promise<void> { console.log('Releasing inventory', id); }
-async function createOrder(data: unknown): Promise<string> { return 'order-123'; }
-async function processPayment(data: unknown): Promise<string> { return 'payment-123'; }
-async function reserveInventory(orderId: string, items: unknown): Promise<void> { }
 ```
 
 ---
 
 ## สรุป
 
-| Pattern | รูปแบบ | เหมาะกับ |
-|---------|--------|---------|
-| Fire-and-Forget | ส่งแล้วไม่รอผล | Email, Notifications, Analytics |
-| Request-Reply | ส่งและรอผลตอบกลับ | Cross-service queries |
-| Choreography Saga | Services ตัดสินใจเอง | Simple workflows, loose coupling |
-| Orchestration Saga | Central coordinator | Complex workflows, ง่ายต่อ debugging |
-| Transactional Outbox | At-least-once delivery | Critical business events |
-| Inbox Pattern | Idempotent processing | ป้องกัน duplicate processing |
-| CDC | Database change capture | Real-time data sync |
-| Event-Carried State | ส่งข้อมูลใน event | ลด API calls, improve decoupling |
-| Compensating Transactions | Rollback distributed ops | Long-running transactions |
-| AsyncAPI | API documentation | Cross-team communication |
+ในบทนี้เราได้เรียนรู้ Async Communication Patterns ขั้นสูงครอบคลุม:
+
+1. **Request-Reply over RabbitMQ** — RpcClient/RpcServer ด้วย reply queues, correlation IDs, timeout handling, และ error propagation
+
+2. **Correlation ID Tracking** — AsyncLocalStorage สำหรับ propagate context ข้าม async boundaries, automatic injection ใน outgoing messages
+
+3. **Message Ordering** — OrderingBuffer สำหรับ reorder out-of-sequence messages, gap detection, partition-based ordering
+
+4. **Idempotent Consumer** — Redis-based distributed locking, database unique constraint, business logic idempotency ด้วย status checks
+
+5. **Outbox Pattern** — Database trigger สำหรับ automatic event capture, polling processor พร้อม exponential backoff retry, PostgreSQL `FOR UPDATE SKIP LOCKED`
+
+6. **Inbox Pattern** — Database deduplication ด้วย unique constraint, message handler registry, status tracking
+
+7. **Schema Versioning** — Version field, AJV validation per version, migration chain, consumer ที่ handle multiple versions
+
+8. **At-least-once Delivery** — Business logic idempotency ด้วย optimistic locking, concurrent update detection
+
+Key takeaways:
+- Outbox + Inbox patterns ร่วมกันให้ exactly-once semantics ได้โดยไม่ต้องใช้ distributed transactions
+- ทุก consumer ต้องเป็น idempotent เสมอเมื่อใช้ at-least-once delivery
+- Schema versioning ทำให้ services deploy independently ได้โดยไม่ต้องประสานงาน
+- Request-Reply ผ่าน message broker มีข้อดีเรื่อง decoupling และ backpressure แต่ latency สูงกว่า HTTP ตรง
+- Correlation ID เป็น essential สำหรับ debugging distributed systems
