@@ -2,93 +2,188 @@
 
 ## บทนำ
 
-Final Project นี้จะรวบรวมทุกสิ่งที่เราเรียนมาตลอดคอร์สนี้ เราจะสร้าง E-Commerce Platform ที่ประกอบด้วย 6 Services: User, Product, Order, Payment, Notification และ Search โดยแต่ละ Service จะใช้ Best Practices ที่เหมาะสม
+ในบทสุดท้ายของโปรเจกต์ เราจะประกอบทุกสิ่งที่เรียนมาตลอดหลักสูตรเข้าด้วยกันเป็นระบบ microservices ที่สมบูรณ์พร้อมใช้งาน production เราจะสร้าง e-commerce platform ขนาดกลางที่ประกอบด้วย 5 services หลัก พร้อมด้วย infrastructure ครบครัน
 
 ---
 
-## 1. Architecture Overview
+## 99.1 Architecture Overview
+
+ระบบ e-commerce ประกอบด้วย 5 services หลัก:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     E-COMMERCE MICROSERVICES PLATFORM                        │
-│                                                                               │
-│  Client (Web/Mobile)                                                          │
-│       │                                                                       │
-│  ┌────▼─────────────────────────────────────────────────────────┐            │
-│  │                    API Gateway (Kong)                          │            │
-│  │  Rate Limiting │ Auth │ CORS │ Load Balance │ Metrics          │            │
-│  └────┬─────────────┬───────────┬──────────────┬────────────────┘            │
-│       │             │           │              │                              │
-│  ┌────▼───┐  ┌──────▼───┐  ┌───▼──────┐  ┌───▼──────┐                     │
-│  │  User  │  │ Product  │  │  Order   │  │ Payment  │                     │
-│  │Service │  │ Service  │  │ Service  │  │ Service  │                     │
-│  │:3001   │  │ :3002    │  │ :3003    │  │ :3004    │                     │
-│  └────────┘  └──────────┘  └────┬─────┘  └──────────┘                     │
-│                                  │                                            │
-│                    ┌─────────────▼────────────────┐                          │
-│                    │        Apache Kafka           │                          │
-│                    │  (order.created, payment.*)   │                          │
-│                    └──────┬───────────────┬────────┘                          │
-│                           │               │                                   │
-│                   ┌───────▼───┐   ┌───────▼───────┐                         │
-│                   │Notification│   │Search Service │                         │
-│                   │Service :3005│   │:3006(Elastic) │                         │
-│                   └───────────┘   └───────────────┘                         │
-│                                                                               │
-│  Infrastructure:                                                              │
-│  PostgreSQL (users, products, orders, payments)                               │
-│  Redis (sessions, cache, rate limiting)                                       │
-│  Kafka (async events)                                                         │
-│  Elasticsearch (search index)                                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         API Gateway (Kong)                        │
+│                    https://api.myshop.example.com                │
+└──────────┬──────────────┬──────────────┬─────────────┬──────────┘
+           │              │              │             │
+    ┌──────▼─────┐  ┌─────▼──────┐ ┌───▼──────┐ ┌───▼──────────┐
+    │ UserService│  │ProductSvc  │ │OrderSvc  │ │PaymentService│
+    │  :3001     │  │  :3002     │ │ :3003    │ │   :3004      │
+    └──────┬─────┘  └─────┬──────┘ └───┬──────┘ └───┬──────────┘
+           │              │            │             │
+    ┌──────▼─────┐  ┌─────▼──────┐    │        ┌───▼──────────┐
+    │ PostgreSQL │  │ PostgreSQL │    │        │NotificationSvc│
+    │(users_db)  │  │(products_db│    │        │   :3005      │
+    └──────┬─────┘  └────────────┘    │        └──────────────┘
+           │                     ┌────▼───────────────────────┐
+    ┌──────▼─────┐               │         Kafka              │
+    │  Redis     │               │  orders.created            │
+    │(cache/jwt) │               │  payments.processed        │
+    └────────────┘               │  notifications.send        │
+                                 └────────────────────────────┘
 ```
+
+### Technology Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Runtime | Node.js 20 + TypeScript |
+| Framework | Express.js |
+| ORM | Prisma |
+| Database | PostgreSQL 15 |
+| Cache | Redis 7 |
+| Message Broker | Apache Kafka |
+| Container | Docker |
+| Orchestration | Kubernetes |
+| CI/CD | GitHub Actions |
+| Monitoring | Prometheus + Grafana |
+| Tracing | Jaeger |
 
 ---
 
-## 2. Complete TypeScript UserService
+## 99.2 TypeScript UserService
+
+UserService จัดการ authentication และข้อมูลผู้ใช้ด้วย Express + Prisma ORM + Redis cache + JWT auth:
+
+### Prisma Schema
+
+```prisma
+// user-service/prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  password    String
+  firstName   String
+  lastName    String
+  phone       String?
+  role        UserRole  @default(CUSTOMER)
+  isActive    Boolean   @default(true)
+  isVerified  Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  addresses   Address[]
+  sessions    Session[]
+
+  @@index([email])
+  @@map("users")
+}
+
+model Address {
+  id         String   @id @default(cuid())
+  userId     String
+  type       String   @default("shipping")
+  street     String
+  city       String
+  state      String
+  country    String
+  postalCode String
+  isDefault  Boolean  @default(false)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("addresses")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@map("sessions")
+}
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+  VENDOR
+}
+```
+
+### UserService Implementation
 
 ```typescript
-// services/user/src/index.ts
+// user-service/src/index.ts
 import express from 'express';
-import { json } from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
 import { createClient } from 'redis';
-import { sign, verify } from 'jsonwebtoken';
-import { hash, compare } from 'bcryptjs';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { z } from 'zod';
-import promClient from 'prom-client';
+import { createLogger, transports, format } from 'winston';
+import { register, Counter, Histogram } from 'prom-client';
 
 const app = express();
-app.use(json());
-
 const prisma = new PrismaClient();
 const redis = createClient({ url: process.env.REDIS_URL });
-redis.connect();
+const logger = createLogger({
+  format: format.combine(format.timestamp(), format.json()),
+  transports: [new transports.Console()],
+});
 
 // Prometheus metrics
-const register = new promClient.Registry();
-promClient.collectDefaultMetrics({ register });
-
-const httpRequestsTotal = new promClient.Counter({
+const httpRequestsTotal = new Counter({
   name: 'http_requests_total',
   help: 'Total HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
-  registers: [register],
+  labelNames: ['method', 'path', 'status'],
 });
-
-const httpDuration = new promClient.Histogram({
+const httpRequestDuration = new Histogram({
   name: 'http_request_duration_seconds',
   help: 'HTTP request duration',
-  labelNames: ['method', 'route'],
-  buckets: [0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5],
-  registers: [register],
+  labelNames: ['method', 'path'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
-// Schemas
+// Middleware
+app.use(helmet());
+app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') }));
+app.use(express.json({ limit: '1mb' }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+
+// Metrics middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    httpRequestsTotal.labels(req.method, req.path, String(res.statusCode)).inc();
+    httpRequestDuration.labels(req.method, req.path).observe(duration);
+  });
+  next();
+});
+
+// Validation schemas
 const RegisterSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
-  name: z.string().min(2).max(100),
+  password: z.string().min(8).max(100),
+  firstName: z.string().min(1).max(50),
+  lastName: z.string().min(1).max(50),
   phone: z.string().optional(),
 });
 
@@ -97,1098 +192,1244 @@ const LoginSchema = z.object({
   password: z.string(),
 });
 
-// Middleware
-const metricsMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const end = httpDuration.startTimer({ method: req.method, route: req.route?.path || req.path });
-  res.on('finish', () => {
-    httpRequestsTotal.inc({ method: req.method, route: req.route?.path || req.path, status_code: res.statusCode });
-    end();
-  });
-  next();
-};
+const UpdateUserSchema = z.object({
+  firstName: z.string().min(1).max(50).optional(),
+  lastName: z.string().min(1).max(50).optional(),
+  phone: z.string().optional(),
+});
 
-app.use(metricsMiddleware);
+// JWT utilities
+function generateTokens(userId: string, role: string) {
+  const accessToken = jwt.sign(
+    { userId, role },
+    process.env.JWT_SECRET!,
+    { expiresIn: '15m' }
+  );
+  const refreshToken = jwt.sign(
+    { userId, type: 'refresh' },
+    process.env.JWT_REFRESH_SECRET!,
+    { expiresIn: '7d' }
+  );
+  return { accessToken, refreshToken };
+}
 
-const authenticateJWT = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Token required' });
+function verifyToken(token: string): { userId: string; role: string } {
+  return jwt.verify(token, process.env.JWT_SECRET!) as { userId: string; role: string };
+}
+
+// Auth middleware
+const authenticate = async (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): Promise<void> => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const token = authHeader.substring(7);
+
+  // Check token blacklist in Redis
+  const isBlacklisted = await redis.get(`blacklist:${token}`);
+  if (isBlacklisted) {
+    res.status(401).json({ error: 'Token revoked' });
+    return;
+  }
 
   try {
-    // Check blacklist
-    const isBlacklisted = await redis.get(`blacklist:${token}`);
-    if (isBlacklisted) return res.status(401).json({ error: 'Token revoked' });
-
-    const payload = verify(token, process.env.JWT_SECRET!) as any;
-    (req as any).user = payload;
+    const payload = verifyToken(token);
+    (req as express.Request & { user: typeof payload }).user = payload;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
   }
 };
 
-// Routes
-app.post('/api/v1/auth/register', async (req, res) => {
+// Routes: Auth
+app.post('/auth/register', async (req, res): Promise<void> => {
   try {
     const body = RegisterSchema.parse(req.body);
 
     const existing = await prisma.user.findUnique({ where: { email: body.email } });
-    if (existing) return res.status(409).json({ error: 'Email already registered' });
+    if (existing) {
+      res.status(409).json({ error: 'Email already registered' });
+      return;
+    }
 
-    const passwordHash = await hash(body.password, 12);
-
+    const hashedPassword = await bcrypt.hash(body.password, 12);
     const user = await prisma.user.create({
       data: {
         email: body.email,
-        passwordHash,
-        name: body.name,
+        password: hashedPassword,
+        firstName: body.firstName,
+        lastName: body.lastName,
         phone: body.phone,
-        role: 'customer',
       },
-      select: { id: true, email: true, name: true, role: true, createdAt: true },
+      select: { id: true, email: true, firstName: true, lastName: true, role: true },
     });
 
-    const token = sign(
-      { userId: user.id, email: user.email, role: user.role },
-      process.env.JWT_SECRET!,
-      { expiresIn: '7d', issuer: 'user-service' }
-    );
+    const { accessToken, refreshToken } = generateTokens(user.id, user.role);
+
+    // Store refresh token in Redis
+    await redis.setEx(`refresh:${user.id}`, 7 * 24 * 3600, refreshToken);
+
+    logger.info('User registered', { userId: user.id });
+    res.status(201).json({ user, accessToken, refreshToken });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: 'Validation failed', details: error.errors });
+      return;
+    }
+    logger.error('Registration error', { error });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/auth/login', async (req, res): Promise<void> => {
+  try {
+    const body = LoginSchema.parse(req.body);
+
+    // Check rate limit for failed attempts
+    const failKey = `login_fail:${body.email}`;
+    const failures = await redis.get(failKey);
+    if (failures && parseInt(failures) >= 5) {
+      res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: body.email },
+    });
+
+    if (!user || !(await bcrypt.compare(body.password, user.password))) {
+      await redis.setEx(failKey, 900, String((parseInt(failures ?? '0') + 1)));
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+
+    if (!user.isActive) {
+      res.status(403).json({ error: 'Account deactivated' });
+      return;
+    }
+
+    // Clear failure counter
+    await redis.del(failKey);
+
+    const { accessToken, refreshToken } = generateTokens(user.id, user.role);
+    await redis.setEx(`refresh:${user.id}`, 7 * 24 * 3600, refreshToken);
 
     // Cache user profile
-    await redis.setEx(`user:${user.id}`, 3600, JSON.stringify(user));
-
-    res.status(201).json({ user, token });
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Validation failed', details: error.errors });
-    }
-    console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed' });
-  }
-});
-
-app.post('/api/v1/auth/login', async (req, res) => {
-  try {
-    const { email, password } = LoginSchema.parse(req.body);
-
-    // Rate limit login attempts
-    const attemptKey = `login_attempts:${email}`;
-    const attempts = await redis.incr(attemptKey);
-    if (attempts === 1) await redis.expire(attemptKey, 900); // 15 min window
-    if (attempts > 5) {
-      return res.status(429).json({ error: 'Too many login attempts. Try again in 15 minutes.' });
-    }
-
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const isValid = await compare(password, user.passwordHash);
-    if (!isValid) return res.status(401).json({ error: 'Invalid credentials' });
-
-    // Clear attempts on success
-    await redis.del(attemptKey);
-
-    const accessToken = sign(
-      { userId: user.id, email: user.email, role: user.role },
-      process.env.JWT_SECRET!,
-      { expiresIn: '1h', issuer: 'user-service' }
+    await redis.setEx(
+      `user:${user.id}`,
+      300,
+      JSON.stringify({ id: user.id, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role })
     );
 
-    const refreshToken = sign(
-      { userId: user.id, type: 'refresh' },
-      process.env.JWT_REFRESH_SECRET!,
-      { expiresIn: '30d' }
-    );
-
-    // Store refresh token
-    await redis.setEx(`refresh:${user.id}`, 30 * 86400, refreshToken);
-
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { lastLoginAt: new Date() },
-    });
-
+    logger.info('User logged in', { userId: user.id });
     res.json({
+      user: { id: user.id, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role },
       accessToken,
       refreshToken,
-      user: { id: user.id, email: user.email, name: user.name, role: user.role },
     });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Validation failed', details: error.errors });
+      res.status(400).json({ error: 'Validation failed', details: error.errors });
+      return;
     }
-    res.status(500).json({ error: 'Login failed' });
+    logger.error('Login error', { error });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/v1/auth/refresh', async (req, res) => {
+app.post('/auth/refresh', async (req, res): Promise<void> => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    res.status(400).json({ error: 'Refresh token required' });
+    return;
+  }
+
   try {
-    const { refreshToken } = req.body;
-    if (!refreshToken) return res.status(400).json({ error: 'Refresh token required' });
-
-    const payload = verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as any;
-    if (payload.type !== 'refresh') return res.status(401).json({ error: 'Invalid token' });
-
+    const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as { userId: string };
     const stored = await redis.get(`refresh:${payload.userId}`);
-    if (stored !== refreshToken) return res.status(401).json({ error: 'Token expired or revoked' });
+
+    if (stored !== refreshToken) {
+      res.status(401).json({ error: 'Invalid refresh token' });
+      return;
+    }
 
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-    if (!user) return res.status(401).json({ error: 'User not found' });
+    if (!user || !user.isActive) {
+      res.status(401).json({ error: 'User not found or inactive' });
+      return;
+    }
 
-    const newAccessToken = sign(
-      { userId: user.id, email: user.email, role: user.role },
-      process.env.JWT_SECRET!,
-      { expiresIn: '1h' }
-    );
+    const tokens = generateTokens(user.id, user.role);
+    await redis.setEx(`refresh:${user.id}`, 7 * 24 * 3600, tokens.refreshToken);
 
-    res.json({ accessToken: newAccessToken });
+    res.json(tokens);
   } catch {
     res.status(401).json({ error: 'Invalid refresh token' });
   }
 });
 
-app.post('/api/v1/auth/logout', authenticateJWT, async (req, res) => {
-  const user = (req as any).user;
-  const token = req.headers.authorization?.replace('Bearer ', '')!;
+app.post('/auth/logout', authenticate, async (req, res): Promise<void> => {
+  const token = req.headers.authorization!.substring(7);
+  const user = (req as express.Request & { user: { userId: string } }).user;
 
-  // Blacklist token
-  await redis.setEx(`blacklist:${token}`, 3600, '1');
+  // Blacklist the current access token
+  await redis.setEx(`blacklist:${token}`, 900, '1'); // 15 min TTL
   await redis.del(`refresh:${user.userId}`);
+  await redis.del(`user:${user.userId}`);
 
   res.json({ message: 'Logged out successfully' });
 });
 
-app.get('/api/v1/users/me', authenticateJWT, async (req, res) => {
-  const { userId } = (req as any).user;
+// Routes: Users CRUD
+app.get('/users/me', authenticate, async (req, res): Promise<void> => {
+  const user = (req as express.Request & { user: { userId: string } }).user;
 
   // Try cache first
-  const cached = await redis.get(`user:${userId}`);
-  if (cached) return res.json(JSON.parse(cached));
+  const cached = await redis.get(`user:${user.userId}`);
+  if (cached) {
+    res.json(JSON.parse(cached));
+    return;
+  }
 
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true, email: true, name: true, phone: true, role: true, createdAt: true },
+  const userData = await prisma.user.findUnique({
+    where: { id: user.userId },
+    select: {
+      id: true, email: true, firstName: true, lastName: true,
+      phone: true, role: true, createdAt: true, addresses: true,
+    },
   });
 
-  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!userData) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
 
-  await redis.setEx(`user:${userId}`, 3600, JSON.stringify(user));
-  res.json(user);
+  await redis.setEx(`user:${user.userId}`, 300, JSON.stringify(userData));
+  res.json(userData);
 });
 
-app.patch('/api/v1/users/me', authenticateJWT, async (req, res) => {
-  const { userId } = (req as any).user;
-  const UpdateSchema = z.object({
-    name: z.string().min(2).max(100).optional(),
-    phone: z.string().optional(),
-  });
-
+app.put('/users/me', authenticate, async (req, res): Promise<void> => {
   try {
-    const updates = UpdateSchema.parse(req.body);
-    const user = await prisma.user.update({
-      where: { id: userId },
-      data: updates,
-      select: { id: true, email: true, name: true, phone: true, role: true },
+    const user = (req as express.Request & { user: { userId: string } }).user;
+    const body = UpdateUserSchema.parse(req.body);
+
+    const updated = await prisma.user.update({
+      where: { id: user.userId },
+      data: body,
+      select: { id: true, email: true, firstName: true, lastName: true, phone: true },
     });
 
-    await redis.setEx(`user:${userId}`, 3600, JSON.stringify(user));
-    res.json(user);
+    await redis.del(`user:${user.userId}`);
+    res.json(updated);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Validation failed', details: error.errors });
+      res.status(400).json({ error: 'Validation failed', details: error.errors });
+      return;
     }
-    res.status(500).json({ error: 'Update failed' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Internal endpoint for other services
-app.get('/internal/users/:id', async (req, res) => {
-  const internalKey = req.headers['x-internal-key'];
-  if (internalKey !== process.env.INTERNAL_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
+app.get('/users/:id', authenticate, async (req, res): Promise<void> => {
+  const requester = (req as express.Request & { user: { userId: string; role: string } }).user;
+  if (requester.role !== 'ADMIN' && requester.userId !== req.params.id) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
   }
 
   const user = await prisma.user.findUnique({
     where: { id: req.params.id },
-    select: { id: true, email: true, name: true, role: true },
+    select: { id: true, email: true, firstName: true, lastName: true, role: true, createdAt: true },
   });
 
-  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
   res.json(user);
 });
 
-app.get('/health', async (_req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    await redis.ping();
-    res.json({ status: 'healthy', service: 'user-service', timestamp: new Date() });
-  } catch (error) {
-    res.status(503).json({ status: 'unhealthy', error: String(error) });
-  }
+// Health check
+app.get('/health', (_, res) => {
+  res.json({ status: 'ok', service: 'user-service', timestamp: new Date().toISOString() });
 });
 
-app.get('/metrics', async (_req, res) => {
+// Metrics endpoint
+app.get('/metrics', async (_, res) => {
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 });
 
-const PORT = process.env.PORT || 3001;
-const server = app.listen(PORT, () => {
-  console.log(`User service listening on port ${PORT}`);
-});
+async function main() {
+  await redis.connect();
+  logger.info('Connected to Redis');
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  server.close(async () => {
-    await prisma.$disconnect();
-    await redis.quit();
-    process.exit(0);
+  await prisma.$connect();
+  logger.info('Connected to PostgreSQL');
+
+  const PORT = process.env.PORT ?? 3001;
+  app.listen(PORT, () => {
+    logger.info(`UserService running on port ${PORT}`);
   });
+}
+
+main().catch((error) => {
+  logger.error('Failed to start service', { error });
+  process.exit(1);
 });
 ```
 
 ---
 
-## 3. Complete TypeScript OrderService
+## 99.3 TypeScript OrderService
+
+OrderService จัดการ orders และ publish events ไปยัง Kafka:
 
 ```typescript
-// services/order/src/index.ts
+// order-service/src/index.ts
 import express from 'express';
-import { PrismaClient } from '@prisma/client';
-import { Kafka, Producer, Partitioners } from 'kafkajs';
-import { createClient } from 'redis';
+import { Pool } from 'pg';
+import { Kafka, Producer, Consumer } from 'kafkajs';
 import { z } from 'zod';
-import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
+import { createLogger, transports, format } from 'winston';
+import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
 app.use(express.json());
 
-const prisma = new PrismaClient();
-const redis = createClient({ url: process.env.REDIS_URL });
-redis.connect();
+const logger = createLogger({
+  format: format.combine(format.timestamp(), format.json()),
+  transports: [new transports.Console()],
+});
 
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Kafka setup
 const kafka = new Kafka({
   clientId: 'order-service',
-  brokers: (process.env.KAFKA_BROKERS || 'kafka:9092').split(','),
-});
-const producer: Producer = kafka.producer({
-  createPartitioner: Partitioners.LegacyPartitioner,
-  idempotent: true,
-  maxInFlightRequests: 5,
-  transactionTimeout: 30000,
+  brokers: (process.env.KAFKA_BROKERS ?? 'kafka:9092').split(','),
+  retry: {
+    initialRetryTime: 100,
+    retries: 8,
+  },
 });
 
-producer.connect().then(() => console.log('Kafka producer connected'));
+const producer: Producer = kafka.producer({
+  idempotent: true,
+  transactionalId: 'order-service-producer',
+});
 
 // Schemas
 const CreateOrderSchema = z.object({
-  items: z.array(z.object({
-    productId: z.string().uuid(),
-    quantity: z.number().int().min(1),
-  })).min(1).max(50),
-  shippingAddress: z.object({
-    street: z.string(),
-    city: z.string(),
-    province: z.string(),
-    postalCode: z.string(),
-    country: z.string().default('TH'),
-  }),
-  paymentMethod: z.enum(['credit_card', 'promptpay', 'wallet', 'cod']),
+  items: z.array(
+    z.object({
+      productId: z.string(),
+      quantity: z.number().int().positive(),
+      price: z.number().positive(),
+    })
+  ).min(1),
+  shippingAddressId: z.string(),
   couponCode: z.string().optional(),
-  notes: z.string().max(500).optional(),
 });
 
-// Order state machine
-type OrderStatus = 'pending' | 'confirmed' | 'processing' | 'shipped' | 'delivered' | 'cancelled' | 'refunded';
+interface Order {
+  id: string;
+  userId: string;
+  status: 'pending' | 'confirmed' | 'processing' | 'shipped' | 'delivered' | 'cancelled';
+  items: OrderItem[];
+  subtotal: number;
+  discount: number;
+  total: number;
+  shippingAddressId: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
 
-const VALID_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  pending: ['confirmed', 'cancelled'],
-  confirmed: ['processing', 'cancelled'],
-  processing: ['shipped', 'cancelled'],
-  shipped: ['delivered'],
-  delivered: ['refunded'],
-  cancelled: [],
-  refunded: [],
-};
+interface OrderItem {
+  id: string;
+  orderId: string;
+  productId: string;
+  quantity: number;
+  price: number;
+  total: number;
+}
 
-const authenticateJWT = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Token required' });
+// Auth middleware (validates JWT with UserService)
+const authenticate = async (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): Promise<void> => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
 
   try {
-    const response = await axios.post(
-      `${process.env.USER_SERVICE_URL}/internal/validate-token`,
-      { token },
-      { headers: { 'x-internal-key': process.env.INTERNAL_API_KEY } }
+    // Validate token with UserService
+    const response = await axios.get(
+      `${process.env.USER_SERVICE_URL}/users/me`,
+      { headers: { Authorization: authHeader }, timeout: 2000 }
     );
-    (req as any).user = response.data;
+    (req as express.Request & { user: { id: string; role: string } }).user = response.data;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
   }
 };
 
-// Create order with Saga pattern
-app.post('/api/v1/orders', authenticateJWT, async (req, res) => {
+// Outbox pattern: save event to DB atomically with order
+async function createOrderWithEvent(
+  client: import('pg').PoolClient,
+  userId: string,
+  orderData: z.infer<typeof CreateOrderSchema>
+): Promise<Order> {
+  const orderId = uuidv4();
+  const subtotal = orderData.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  let discount = 0;
+
+  // Apply coupon (simplified)
+  if (orderData.couponCode === 'SAVE10') {
+    discount = subtotal * 0.1;
+  }
+  const total = subtotal - discount;
+
+  // Create order
+  await client.query(
+    `INSERT INTO orders (id, user_id, status, subtotal, discount, total, shipping_address_id)
+     VALUES ($1, $2, 'pending', $3, $4, $5, $6)`,
+    [orderId, userId, subtotal, discount, total, orderData.shippingAddressId]
+  );
+
+  // Create order items
+  for (const item of orderData.items) {
+    await client.query(
+      `INSERT INTO order_items (id, order_id, product_id, quantity, price, total)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [uuidv4(), orderId, item.productId, item.quantity, item.price, item.price * item.quantity]
+    );
+  }
+
+  // Outbox: save event to be published
+  const event = {
+    orderId,
+    userId,
+    items: orderData.items,
+    total,
+    timestamp: new Date().toISOString(),
+  };
+
+  await client.query(
+    `INSERT INTO outbox (id, event_type, aggregate_id, payload, status)
+     VALUES ($1, 'order.created', $2, $3, 'pending')`,
+    [uuidv4(), orderId, JSON.stringify(event)]
+  );
+
+  const result = await client.query<Order>(
+    `SELECT o.*, json_agg(
+      json_build_object(
+        'id', oi.id, 'productId', oi.product_id, 'quantity', oi.quantity,
+        'price', oi.price, 'total', oi.total
+      )
+    ) as items
+    FROM orders o
+    LEFT JOIN order_items oi ON o.id = oi.order_id
+    WHERE o.id = $1
+    GROUP BY o.id`,
+    [orderId]
+  );
+
+  return result.rows[0];
+}
+
+// Routes
+app.post('/orders', authenticate, async (req, res): Promise<void> => {
+  const user = (req as express.Request & { user: { id: string } }).user;
+
+  const body = CreateOrderSchema.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: 'Validation failed', details: body.error.errors });
+    return;
+  }
+
+  const client = await pool.connect();
   try {
-    const body = CreateOrderSchema.parse(req.body);
-    const { userId } = (req as any).user;
-    const orderId = uuidv4();
-    const sagaId = uuidv4();
+    await client.query('BEGIN');
+    const order = await createOrderWithEvent(client, user.id, body.data);
+    await client.query('COMMIT');
 
-    // Step 1: Validate products and get prices
-    let totalAmount = 0;
-    const orderItems: Array<{
-      productId: string;
-      productName: string;
-      quantity: number;
-      unitPrice: number;
-      totalPrice: number;
-    }> = [];
-
-    for (const item of body.items) {
-      const productResponse = await axios.get(
-        `${process.env.PRODUCT_SERVICE_URL}/internal/products/${item.productId}`,
-        { headers: { 'x-internal-key': process.env.INTERNAL_API_KEY } }
-      );
-      const product = productResponse.data;
-
-      if (!product.inStock || product.stockQuantity < item.quantity) {
-        return res.status(400).json({
-          error: `Product ${product.name} is out of stock or insufficient quantity`,
-        });
-      }
-
-      const itemTotal = product.price * item.quantity;
-      totalAmount += itemTotal;
-      orderItems.push({
-        productId: item.productId,
-        productName: product.name,
-        quantity: item.quantity,
-        unitPrice: product.price,
-        totalPrice: itemTotal,
-      });
-    }
-
-    // Step 2: Apply coupon if provided
-    let discountAmount = 0;
-    if (body.couponCode) {
-      const couponResponse = await axios.post(
-        `${process.env.PRODUCT_SERVICE_URL}/internal/coupons/validate`,
-        { code: body.couponCode, amount: totalAmount },
-        { headers: { 'x-internal-key': process.env.INTERNAL_API_KEY } }
-      ).catch(() => null);
-
-      if (couponResponse?.data?.valid) {
-        discountAmount = couponResponse.data.discountAmount;
-      }
-    }
-
-    const finalAmount = totalAmount - discountAmount;
-
-    // Step 3: Create order in DB (pending state)
-    const order = await prisma.order.create({
-      data: {
-        id: orderId,
-        userId,
-        status: 'pending',
-        totalAmount,
-        discountAmount,
-        finalAmount,
-        shippingAddress: body.shippingAddress as any,
-        paymentMethod: body.paymentMethod,
-        couponCode: body.couponCode,
-        notes: body.notes,
-        sagaId,
-        items: {
-          create: orderItems,
-        },
-      },
-      include: { items: true },
-    });
-
-    // Step 4: Reserve inventory (Saga step)
-    await producer.send({
-      topic: 'order.inventory.reserve',
-      messages: [{
-        key: orderId,
-        value: JSON.stringify({
-          sagaId,
-          orderId,
-          items: orderItems.map(i => ({ productId: i.productId, quantity: i.quantity })),
-        }),
-        headers: { event_type: 'INVENTORY_RESERVE_REQUEST', saga_id: sagaId },
-      }],
-    });
-
-    // Step 5: Publish order.created event
-    await producer.send({
-      topic: 'order.created',
-      messages: [{
-        key: orderId,
-        value: JSON.stringify({
-          orderId: order.id,
-          userId: order.userId,
-          items: orderItems,
-          totalAmount: order.totalAmount,
-          finalAmount: order.finalAmount,
-          paymentMethod: order.paymentMethod,
-          shippingAddress: order.shippingAddress,
-          createdAt: order.createdAt.toISOString(),
-        }),
-        headers: { event_type: 'ORDER_CREATED' },
-      }],
-    });
-
-    res.status(201).json({
-      orderId: order.id,
-      status: order.status,
-      totalAmount: order.totalAmount,
-      finalAmount: order.finalAmount,
-      items: order.items,
-      estimatedDelivery: this.calculateDeliveryDate(body.shippingAddress.province),
-    });
+    logger.info('Order created', { orderId: order.id, userId: user.id });
+    res.status(201).json(order);
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Validation failed', details: error.errors });
-    }
-    console.error('Create order error:', error);
+    await client.query('ROLLBACK');
+    logger.error('Failed to create order', { error });
     res.status(500).json({ error: 'Failed to create order' });
+  } finally {
+    client.release();
   }
 });
 
-app.get('/api/v1/orders', authenticateJWT, async (req, res) => {
-  const { userId } = (req as any).user;
-  const page = parseInt(req.query.page as string) || 1;
-  const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+app.get('/orders', authenticate, async (req, res): Promise<void> => {
+  const user = (req as express.Request & { user: { id: string } }).user;
+  const page = parseInt(String(req.query.page ?? '1'));
+  const limit = Math.min(parseInt(String(req.query.limit ?? '10')), 50);
+  const offset = (page - 1) * limit;
 
-  const [orders, total] = await Promise.all([
-    prisma.order.findMany({
-      where: { userId },
-      include: { items: true },
-      orderBy: { createdAt: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
-    }),
-    prisma.order.count({ where: { userId } }),
+  const [ordersResult, countResult] = await Promise.all([
+    pool.query(
+      `SELECT o.*, json_agg(
+        json_build_object('id', oi.id, 'productId', oi.product_id, 'quantity', oi.quantity, 'price', oi.price)
+        ORDER BY oi.id
+      ) as items
+      FROM orders o
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      WHERE o.user_id = $1
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+      LIMIT $2 OFFSET $3`,
+      [user.id, limit, offset]
+    ),
+    pool.query('SELECT COUNT(*) FROM orders WHERE user_id = $1', [user.id]),
   ]);
 
   res.json({
-    orders,
-    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    data: ordersResult.rows,
+    pagination: {
+      total: parseInt(countResult.rows[0].count),
+      page,
+      limit,
+      pages: Math.ceil(parseInt(countResult.rows[0].count) / limit),
+    },
   });
 });
 
-app.get('/api/v1/orders/:orderId', authenticateJWT, async (req, res) => {
-  const { userId } = (req as any).user;
+app.get('/orders/:id', authenticate, async (req, res): Promise<void> => {
+  const user = (req as express.Request & { user: { id: string; role: string } }).user;
 
-  const order = await prisma.order.findFirst({
-    where: { id: req.params.orderId, userId },
-    include: { items: true },
-  });
+  const result = await pool.query(
+    `SELECT o.*, json_agg(
+      json_build_object('id', oi.id, 'productId', oi.product_id, 'quantity', oi.quantity, 'price', oi.price, 'total', oi.total)
+      ORDER BY oi.id
+    ) as items
+    FROM orders o
+    LEFT JOIN order_items oi ON o.id = oi.order_id
+    WHERE o.id = $1 AND (o.user_id = $2 OR $3 = 'ADMIN')
+    GROUP BY o.id`,
+    [req.params.id, user.id, user.role]
+  );
 
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  res.json(order);
-});
-
-app.patch('/api/v1/orders/:orderId/status', authenticateJWT, async (req, res) => {
-  const { userId, role } = (req as any).user;
-  const { status } = req.body as { status: OrderStatus };
-
-  const order = await prisma.order.findFirst({
-    where: { id: req.params.orderId, ...(role !== 'admin' ? { userId } : {}) },
-  });
-
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-
-  const validNext = VALID_TRANSITIONS[order.status as OrderStatus];
-  if (!validNext.includes(status)) {
-    return res.status(400).json({
-      error: `Cannot transition from ${order.status} to ${status}`,
-      validTransitions: validNext,
-    });
+  if (!result.rows[0]) {
+    res.status(404).json({ error: 'Order not found' });
+    return;
   }
 
-  const updated = await prisma.order.update({
-    where: { id: order.id },
-    data: {
-      status,
-      ...(status === 'cancelled' ? { cancelledAt: new Date() } : {}),
-      ...(status === 'delivered' ? { deliveredAt: new Date() } : {}),
-    },
-    include: { items: true },
-  });
+  res.json(result.rows[0]);
+});
 
-  // Publish status change event
+app.patch('/orders/:id/cancel', authenticate, async (req, res): Promise<void> => {
+  const user = (req as express.Request & { user: { id: string } }).user;
+
+  const result = await pool.query(
+    `UPDATE orders SET status = 'cancelled', updated_at = NOW()
+     WHERE id = $1 AND user_id = $2 AND status IN ('pending', 'confirmed')
+     RETURNING *`,
+    [req.params.id, user.id]
+  );
+
+  if (!result.rows[0]) {
+    res.status(400).json({ error: 'Cannot cancel order' });
+    return;
+  }
+
+  // Publish cancellation event
   await producer.send({
-    topic: 'order.status.changed',
-    messages: [{
-      key: order.id,
-      value: JSON.stringify({
-        orderId: order.id,
-        userId: order.userId,
-        previousStatus: order.status,
-        newStatus: status,
-        timestamp: new Date().toISOString(),
-      }),
-      headers: { event_type: 'ORDER_STATUS_CHANGED' },
-    }],
+    topic: 'orders.cancelled',
+    messages: [{ key: req.params.id, value: JSON.stringify(result.rows[0]) }],
   });
 
-  res.json(updated);
+  res.json(result.rows[0]);
 });
 
-// Kafka consumer for Saga compensation
-const consumer = kafka.consumer({ groupId: 'order-saga-group' });
+// Outbox processor - polls DB and publishes events
+async function processOutbox() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT * FROM outbox WHERE status = 'pending' ORDER BY created_at LIMIT 100`
+    );
 
-async function setupSagaConsumer(): Promise<void> {
-  await consumer.connect();
-  await consumer.subscribe({
-    topics: ['order.inventory.reserved', 'order.inventory.reserve_failed', 'payment.completed', 'payment.failed'],
-  });
+    for (const row of result.rows) {
+      try {
+        await producer.send({
+          topic: row.event_type.replace('.', '.'),
+          messages: [{ key: row.aggregate_id, value: row.payload }],
+        });
 
-  await consumer.run({
-    eachMessage: async ({ topic, message }) => {
-      const data = JSON.parse(message.value?.toString() || '{}');
-
-      switch (topic) {
-        case 'order.inventory.reserved':
-          await prisma.order.update({
-            where: { id: data.orderId },
-            data: { status: 'confirmed' },
-          });
-          // Trigger payment
-          await producer.send({
-            topic: 'order.payment.initiate',
-            messages: [{
-              key: data.orderId,
-              value: JSON.stringify(data),
-            }],
-          });
-          break;
-
-        case 'order.inventory.reserve_failed':
-          // Compensate: cancel order
-          await prisma.order.update({
-            where: { id: data.orderId },
-            data: { status: 'cancelled', cancelReason: 'Inventory unavailable' },
-          });
-          break;
-
-        case 'payment.completed':
-          await prisma.order.update({
-            where: { id: data.orderId },
-            data: { status: 'processing', paidAt: new Date() },
-          });
-          break;
-
-        case 'payment.failed':
-          // Compensate: release inventory + cancel order
-          await producer.send({
-            topic: 'order.inventory.release',
-            messages: [{
-              key: data.orderId,
-              value: message.value!,
-            }],
-          });
-          await prisma.order.update({
-            where: { id: data.orderId },
-            data: { status: 'cancelled', cancelReason: 'Payment failed' },
-          });
-          break;
+        await client.query(
+          `UPDATE outbox SET status = 'published', published_at = NOW() WHERE id = $1`,
+          [row.id]
+        );
+      } catch (err) {
+        logger.error('Failed to publish outbox event', { id: row.id, error: err });
       }
-    },
-  });
+    }
+  } finally {
+    client.release();
+  }
 }
 
-function calculateDeliveryDate(province: string): string {
-  const bangkokProvinces = ['กรุงเทพมหานคร', 'นนทบุรี', 'ปทุมธานี', 'สมุทรปราการ'];
-  const days = bangkokProvinces.includes(province) ? 1 : 3;
-  const date = new Date();
-  date.setDate(date.getDate() + days);
-  return date.toISOString().split('T')[0];
+app.get('/health', (_, res) => {
+  res.json({ status: 'ok', service: 'order-service' });
+});
+
+async function main() {
+  await producer.connect();
+  logger.info('Kafka producer connected');
+
+  // Start outbox processor
+  setInterval(processOutbox, 5000);
+
+  const PORT = process.env.PORT ?? 3003;
+  app.listen(PORT, () => logger.info(`OrderService on port ${PORT}`));
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'healthy', service: 'order-service' });
-});
-
-const PORT = process.env.PORT || 3003;
-app.listen(PORT, async () => {
-  await setupSagaConsumer();
-  console.log(`Order service on port ${PORT}`);
-});
+main().catch((err) => { logger.error('Startup failed', { err }); process.exit(1); });
 ```
 
 ---
 
-## 4. Complete TypeScript PaymentService
+## 99.4 TypeScript PaymentService
+
+PaymentService จัดการ payment processing ด้วย Stripe + idempotency key:
 
 ```typescript
-// services/payment/src/index.ts
+// payment-service/src/index.ts
 import express from 'express';
-import { PrismaClient } from '@prisma/client';
 import Stripe from 'stripe';
-import { Kafka, Producer, Partitioners } from 'kafkajs';
-import { createClient } from 'redis';
-import { createHash } from 'crypto';
+import { Pool } from 'pg';
+import { Kafka, Producer } from 'kafkajs';
+import crypto from 'crypto';
 import { z } from 'zod';
+import { createLogger, transports, format } from 'winston';
 
 const app = express();
+const logger = createLogger({
+  format: format.combine(format.timestamp(), format.json()),
+  transports: [new transports.Console()],
+});
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2024-06-20',
+});
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const kafka = new Kafka({
+  clientId: 'payment-service',
+  brokers: (process.env.KAFKA_BROKERS ?? 'kafka:9092').split(','),
+});
+const producer: Producer = kafka.producer();
+
+// Use raw body for Stripe webhook signature verification
+app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
-
-const prisma = new PrismaClient();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' });
-const redis = createClient({ url: process.env.REDIS_URL });
-redis.connect();
-
-const kafka = new Kafka({ clientId: 'payment-service', brokers: (process.env.KAFKA_BROKERS || 'kafka:9092').split(',') });
-const producer: Producer = kafka.producer({ createPartitioner: Partitioners.LegacyPartitioner, idempotent: true });
-producer.connect();
 
 const ProcessPaymentSchema = z.object({
   orderId: z.string().uuid(),
   amount: z.number().positive(),
-  currency: z.string().default('thb'),
-  paymentMethod: z.enum(['credit_card', 'promptpay', 'wallet']),
-  stripePaymentMethodId: z.string().optional(), // For card payments
+  currency: z.string().length(3).default('usd'),
+  paymentMethodId: z.string(),
+  customerId: z.string().optional(),
 });
 
-// Idempotency key middleware
-const idempotencyMiddleware = async (
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction
-) => {
-  const idempotencyKey = req.headers['idempotency-key'] as string;
-  if (!idempotencyKey) return next();
+// Idempotency: Generate deterministic key from orderId
+function generateIdempotencyKey(orderId: string, attempt: number = 1): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${orderId}:${attempt}`)
+    .digest('hex')
+    .substring(0, 36);
+}
 
-  const cacheKey = `idempotency:${idempotencyKey}`;
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    return res.json(JSON.parse(cached));
+// Check if payment already processed (idempotency)
+async function findExistingPayment(orderId: string) {
+  const result = await pool.query(
+    'SELECT * FROM payments WHERE order_id = $1 AND status != $2',
+    [orderId, 'failed']
+  );
+  return result.rows[0] ?? null;
+}
+
+async function recordPayment(
+  orderId: string,
+  userId: string,
+  amount: number,
+  currency: string,
+  stripePaymentIntentId: string,
+  status: 'pending' | 'succeeded' | 'failed'
+) {
+  const result = await pool.query(
+    `INSERT INTO payments (id, order_id, user_id, amount, currency, stripe_payment_intent_id, status)
+     VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+     ON CONFLICT (order_id) DO UPDATE
+     SET status = EXCLUDED.status, updated_at = NOW()
+     RETURNING *`,
+    [orderId, userId, amount, currency, stripePaymentIntentId, status]
+  );
+  return result.rows[0];
+}
+
+// Routes
+app.post('/payments/process', async (req, res): Promise<void> => {
+  const userId = req.headers['x-user-id'] as string;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
   }
 
-  const originalJson = res.json.bind(res);
-  res.json = (body: any) => {
-    if (res.statusCode < 400) {
-      redis.setEx(cacheKey, 86400, JSON.stringify(body));
-    }
-    return originalJson(body);
-  };
+  const body = ProcessPaymentSchema.safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: 'Validation failed', details: body.error.errors });
+    return;
+  }
 
-  next();
-};
+  const { orderId, amount, currency, paymentMethodId, customerId } = body.data;
 
-app.post('/api/v1/payments/process', idempotencyMiddleware, async (req, res) => {
+  // Idempotency check
+  const existing = await findExistingPayment(orderId);
+  if (existing?.status === 'succeeded') {
+    logger.info('Duplicate payment request - returning existing', { orderId });
+    res.status(200).json({ payment: existing, idempotent: true });
+    return;
+  }
+
+  const idempotencyKey = generateIdempotencyKey(orderId);
+
   try {
-    const body = ProcessPaymentSchema.parse(req.body);
-    const { orderId, amount, currency, paymentMethod } = body;
-
-    // Check for duplicate payment
-    const existing = await prisma.payment.findUnique({ where: { orderId } });
-    if (existing && existing.status === 'succeeded') {
-      return res.json({ payment: existing, message: 'Payment already processed' });
-    }
-
-    // Create payment intent
-    let paymentIntentId: string | null = null;
-    let clientSecret: string | null = null;
-    let status: 'pending' | 'succeeded' | 'failed' = 'pending';
-
-    if (paymentMethod === 'credit_card' && body.stripePaymentMethodId) {
-      const intent = await stripe.paymentIntents.create({
-        amount: Math.round(amount * 100), // Stripe uses smallest currency unit
+    const paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: Math.round(amount * 100), // Convert to cents
         currency,
-        payment_method: body.stripePaymentMethodId,
+        payment_method: paymentMethodId,
+        customer: customerId,
         confirm: true,
-        metadata: { orderId, service: 'ecommerce-platform' },
-        return_url: `${process.env.FRONTEND_URL}/orders/${orderId}/complete`,
-        automatic_payment_methods: { enabled: false },
-      });
-
-      paymentIntentId = intent.id;
-      clientSecret = intent.client_secret;
-      status = intent.status === 'succeeded' ? 'succeeded' : 'pending';
-    } else if (paymentMethod === 'promptpay') {
-      const intent = await stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency: 'thb',
-        payment_method_types: ['promptpay'],
-        confirm: true,
-        metadata: { orderId },
-      });
-
-      paymentIntentId = intent.id;
-      clientSecret = intent.client_secret;
-    }
-
-    // Save payment record
-    const payment = await prisma.payment.upsert({
-      where: { orderId },
-      create: {
-        orderId,
-        amount,
-        currency,
-        method: paymentMethod,
-        status,
-        stripePaymentIntentId: paymentIntentId,
-        reference: `PAY-${Date.now()}-${orderId.substring(0, 8).toUpperCase()}`,
+        return_url: `${process.env.FRONTEND_URL}/orders/${orderId}`,
+        metadata: {
+          orderId,
+          userId,
+        },
       },
-      update: {
-        stripePaymentIntentId: paymentIntentId,
-        status,
-      },
-    });
+      { idempotencyKey }
+    );
 
-    // Publish event
+    const status = paymentIntent.status === 'succeeded' ? 'succeeded'
+      : paymentIntent.status === 'requires_action' ? 'pending'
+      : 'failed';
+
+    const payment = await recordPayment(orderId, userId, amount, currency, paymentIntent.id, status);
+
     if (status === 'succeeded') {
       await producer.send({
-        topic: 'payment.completed',
+        topic: 'payments.processed',
         messages: [{
           key: orderId,
           value: JSON.stringify({
             orderId,
+            userId,
             paymentId: payment.id,
             amount,
             currency,
-            method: paymentMethod,
+            status: 'succeeded',
             timestamp: new Date().toISOString(),
           }),
-          headers: { event_type: 'PAYMENT_COMPLETED' },
         }],
       });
     }
 
-    res.json({ payment, clientSecret });
+    logger.info('Payment processed', { orderId, status, paymentIntentId: paymentIntent.id });
+    res.status(status === 'succeeded' ? 200 : 202).json({
+      payment,
+      requiresAction: paymentIntent.status === 'requires_action',
+      clientSecret: paymentIntent.status === 'requires_action' ? paymentIntent.client_secret : undefined,
+    });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Validation failed', details: error.errors });
-    }
-
     if (error instanceof Stripe.errors.StripeCardError) {
-      // Payment failed - publish event
-      await producer.send({
-        topic: 'payment.failed',
-        messages: [{
-          key: req.body.orderId,
-          value: JSON.stringify({
-            orderId: req.body.orderId,
-            error: error.message,
-            code: error.code,
-          }),
-        }],
-      });
-      return res.status(402).json({ error: error.message, code: error.code });
+      await recordPayment(orderId, userId, amount, currency, 'failed', 'failed');
+      res.status(400).json({ error: error.message, code: error.code });
+      return;
     }
-
-    console.error('Payment error:', error);
+    logger.error('Payment processing error', { error });
     res.status(500).json({ error: 'Payment processing failed' });
   }
 });
 
+app.post('/payments/:id/refund', async (req, res): Promise<void> => {
+  const { id } = req.params;
+  const { amount, reason } = req.body;
+
+  const payment = await pool.query('SELECT * FROM payments WHERE id = $1', [id]);
+  if (!payment.rows[0]) {
+    res.status(404).json({ error: 'Payment not found' });
+    return;
+  }
+
+  if (payment.rows[0].status !== 'succeeded') {
+    res.status(400).json({ error: 'Can only refund succeeded payments' });
+    return;
+  }
+
+  try {
+    const refund = await stripe.refunds.create({
+      payment_intent: payment.rows[0].stripe_payment_intent_id,
+      amount: amount ? Math.round(amount * 100) : undefined,
+      reason: reason ?? 'requested_by_customer',
+    });
+
+    await pool.query(
+      `INSERT INTO refunds (id, payment_id, stripe_refund_id, amount, status)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+      [id, refund.id, amount ?? payment.rows[0].amount, refund.status]
+    );
+
+    res.json({ refundId: refund.id, status: refund.status });
+  } catch (error) {
+    logger.error('Refund failed', { error, paymentId: id });
+    res.status(500).json({ error: 'Refund failed' });
+  }
+});
+
 // Stripe webhook handler
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/webhooks/stripe', async (req, res): Promise<void> => {
   const sig = req.headers['stripe-signature'] as string;
 
   let event: Stripe.Event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET!);
-  } catch (err) {
-    console.error('Stripe webhook signature verification failed:', err);
-    return res.status(400).json({ error: 'Invalid signature' });
+  } catch {
+    res.status(400).send('Webhook signature verification failed');
+    return;
   }
 
   switch (event.type) {
-    case 'payment_intent.succeeded': {
-      const intent = event.data.object as Stripe.PaymentIntent;
-      const orderId = intent.metadata.orderId;
-
-      await prisma.payment.update({
-        where: { stripePaymentIntentId: intent.id },
-        data: { status: 'succeeded', paidAt: new Date() },
-      });
-
-      await producer.send({
-        topic: 'payment.completed',
-        messages: [{
-          key: orderId,
-          value: JSON.stringify({
-            orderId,
-            stripeIntentId: intent.id,
-            amount: intent.amount / 100,
-            timestamp: new Date().toISOString(),
-          }),
-        }],
-      });
+    case 'payment_intent.succeeded':
+      const pi = event.data.object as Stripe.PaymentIntent;
+      await pool.query(
+        'UPDATE payments SET status = $1 WHERE stripe_payment_intent_id = $2',
+        ['succeeded', pi.id]
+      );
       break;
-    }
 
-    case 'payment_intent.payment_failed': {
-      const intent = event.data.object as Stripe.PaymentIntent;
-      const orderId = intent.metadata.orderId;
-
-      await prisma.payment.update({
-        where: { stripePaymentIntentId: intent.id },
-        data: { status: 'failed' },
-      });
-
-      await producer.send({
-        topic: 'payment.failed',
-        messages: [{
-          key: orderId,
-          value: JSON.stringify({
-            orderId,
-            error: intent.last_payment_error?.message,
-          }),
-        }],
-      });
+    case 'payment_intent.payment_failed':
+      const failedPi = event.data.object as Stripe.PaymentIntent;
+      await pool.query(
+        'UPDATE payments SET status = $1 WHERE stripe_payment_intent_id = $2',
+        ['failed', failedPi.id]
+      );
       break;
-    }
-
-    case 'charge.refunded': {
-      const charge = event.data.object as Stripe.Charge;
-      await prisma.payment.update({
-        where: { stripePaymentIntentId: charge.payment_intent as string },
-        data: { status: 'refunded', refundedAt: new Date() },
-      });
-      break;
-    }
   }
 
   res.json({ received: true });
 });
 
-app.get('/health', (_req, res) => res.json({ status: 'healthy', service: 'payment-service' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', service: 'payment-service' }));
 
-const PORT = process.env.PORT || 3004;
-app.listen(PORT, () => console.log(`Payment service on port ${PORT}`));
+async function main() {
+  await producer.connect();
+  const PORT = process.env.PORT ?? 3004;
+  app.listen(PORT, () => logger.info(`PaymentService on port ${PORT}`));
+}
+
+main().catch((err) => { logger.error('Startup failed', { err }); process.exit(1); });
 ```
 
 ---
 
-## 5. Docker Compose: All Services
+## 99.5 Docker Compose: Infrastructure Complete
 
 ```yaml
 # docker-compose.yml
-version: '3.9'
+version: '3.8'
 
 services:
-  kong:
-    image: kong:3.4
+  # ============= Databases =============
+  users-db:
+    image: postgres:15-alpine
+    container_name: users-db
     environment:
-      KONG_DATABASE: 'off'
-      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
-      KONG_PROXY_ACCESS_LOG: /dev/stdout
-      KONG_ADMIN_ACCESS_LOG: /dev/stdout
-      KONG_PROXY_ERROR_LOG: /dev/stderr
-      KONG_ADMIN_ERROR_LOG: /dev/stderr
-      KONG_ADMIN_LISTEN: '0.0.0.0:8001'
-    volumes:
-      - ./kong/kong.yml:/kong/declarative/kong.yml
-    ports:
-      - '8000:8000'
-      - '8001:8001'
-    depends_on:
-      - user-service
-      - product-service
-      - order-service
-      - payment-service
-
-  user-service:
-    build: ./services/user
-    environment:
-      PORT: '3001'
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/users
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: dev-jwt-secret-change-in-prod
-      JWT_REFRESH_SECRET: dev-refresh-secret-change-in-prod
-      INTERNAL_API_KEY: internal-dev-key
-    ports:
-      - '3001:3001'
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  product-service:
-    build: ./services/product
-    environment:
-      PORT: '3002'
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/products
-      REDIS_URL: redis://redis:6379
-      ELASTICSEARCH_URL: http://elasticsearch:9200
-      INTERNAL_API_KEY: internal-dev-key
-    ports:
-      - '3002:3002'
-
-  order-service:
-    build: ./services/order
-    environment:
-      PORT: '3003'
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/orders
-      REDIS_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:9092
-      USER_SERVICE_URL: http://user-service:3001
-      PRODUCT_SERVICE_URL: http://product-service:3002
-      INTERNAL_API_KEY: internal-dev-key
-    ports:
-      - '3003:3003'
-    depends_on:
-      kafka:
-        condition: service_healthy
-
-  payment-service:
-    build: ./services/payment
-    environment:
-      PORT: '3004'
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/payments
-      REDIS_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:9092
-      STRIPE_SECRET_KEY: sk_test_your_stripe_key
-      STRIPE_WEBHOOK_SECRET: whsec_your_webhook_secret
-      FRONTEND_URL: http://localhost:3000
-    ports:
-      - '3004:3004'
-
-  notification-service:
-    build: ./services/notification
-    environment:
-      PORT: '3005'
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/notifications
-      KAFKA_BROKERS: kafka:9092
-      SMTP_HOST: mailhog
-      SMTP_PORT: '1025'
-      FCM_SERVER_KEY: your-fcm-key
-    ports:
-      - '3005:3005'
-
-  search-service:
-    build: ./services/search
-    environment:
-      PORT: '3006'
-      ELASTICSEARCH_URL: http://elasticsearch:9200
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/products
-      KAFKA_BROKERS: kafka:9092
-    ports:
-      - '3006:3006'
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: users_db
       POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./db/init-databases.sql:/docker-entrypoint-initdb.d/init.sql
+      - users-db-data:/var/lib/postgresql/data
+      - ./init-scripts/users:/docker-entrypoint-initdb.d
     ports:
-      - '5432:5432'
+      - "5432:5432"
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      test: ["CMD-SHELL", "pg_isready -U postgres -d users_db"]
       interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices
+
+  products-db:
+    image: postgres:15-alpine
+    container_name: products-db
+    environment:
+      POSTGRES_DB: products_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
+    volumes:
+      - products-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d products_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices
+
+  orders-db:
+    image: postgres:15-alpine
+    container_name: orders-db
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
+    volumes:
+      - orders-db-data:/var/lib/postgresql/data
+      - ./init-scripts/orders:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices
+
+  payments-db:
+    image: postgres:15-alpine
+    container_name: payments-db
+    environment:
+      POSTGRES_DB: payments_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
+    volumes:
+      - payments-db-data:/var/lib/postgresql/data
+      - ./init-scripts/payments:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payments_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices
+
+  # ============= Redis =============
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis123} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis123}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - microservices
+
+  # ============= Kafka =============
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - microservices
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    ports:
-      - '6379:6379'
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      retries: 5
-
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-    ports:
-      - '29092:29092'
-    healthcheck:
-      test: ['CMD', 'kafka-topics', '--bootstrap-server', 'kafka:9092', '--list']
-      interval: 10s
-      retries: 5
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.4
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
-    ports:
-      - '9200:9200'
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - microservices
     healthcheck:
-      test: ['CMD-SHELL', 'curl -s http://localhost:9200/_cluster/health | grep -q "green\\|yellow"']
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
       interval: 30s
+      timeout: 10s
       retries: 5
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+    networks:
+      - microservices
+
+  # ============= Application Services =============
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: user-service
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-secret123}@users-db:5432/users_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-min-32-chars}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-your-refresh-secret-key-min-32}
+      ALLOWED_ORIGINS: http://localhost:3000
+    depends_on:
+      users-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  product-service:
+    build:
+      context: ./product-service
+      dockerfile: Dockerfile
+    container_name: product-service
+    ports:
+      - "3002:3002"
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-secret123}@products-db:5432/products_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379
+      USER_SERVICE_URL: http://user-service:3001
+    depends_on:
+      products-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: order-service
+    ports:
+      - "3003:3003"
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-secret123}@orders-db:5432/orders_db
+      KAFKA_BROKERS: kafka:29092
+      USER_SERVICE_URL: http://user-service:3001
+      PRODUCT_SERVICE_URL: http://product-service:3002
+    depends_on:
+      orders-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  payment-service:
+    build:
+      context: ./payment-service
+      dockerfile: Dockerfile
+    container_name: payment-service
+    ports:
+      - "3004:3004"
+    environment:
+      NODE_ENV: development
+      PORT: 3004
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-secret123}@payments-db:5432/payments_db
+      KAFKA_BROKERS: kafka:29092
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      FRONTEND_URL: http://localhost:3000
+    depends_on:
+      payments-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    ports:
+      - "3005:3005"
+    environment:
+      NODE_ENV: development
+      PORT: 3005
+      KAFKA_BROKERS: kafka:29092
+      SMTP_HOST: ${SMTP_HOST:-mailhog}
+      SMTP_PORT: 1025
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  # ============= Monitoring =============
   prometheus:
-    image: prom/prometheus:v2.47.2
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=15d'
-    ports:
-      - '9090:9090'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - microservices
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3006:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin123
-      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana:/etc/grafana/provisioning
-    ports:
-      - '3000:3000'
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - microservices
+    restart: unless-stopped
 
-  mailhog:
-    image: mailhog/mailhog
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: jaeger
     ports:
-      - '1025:1025'
-      - '8025:8025'
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: :9411
+    networks:
+      - microservices
+    restart: unless-stopped
+
+  # Development tools
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - microservices
 
 volumes:
-  postgres_data:
-  redis_data:
-  elasticsearch_data:
-  prometheus_data:
-  grafana_data:
+  users-db-data:
+  products-db-data:
+  orders-db-data:
+  payments-db-data:
+  redis-data:
+  kafka-data:
+  zookeeper-data:
+  zookeeper-logs:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  microservices:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 ```
 
 ---
 
-## 6. Kubernetes Manifests
+## 99.6 Kubernetes Deployment YAML
 
 ```yaml
-# k8s/base/user-service/deployment.yaml
+# k8s/user-service/deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: user-service
-  namespace: ecommerce
+  namespace: production
   labels:
     app: user-service
-    version: v1
+    version: "1.0.0"
     team: platform
 spec:
   replicas: 3
@@ -1204,13 +1445,58 @@ spec:
     metadata:
       labels:
         app: user-service
-        version: v1
+        version: "1.0.0"
       annotations:
-        prometheus.io/scrape: 'true'
-        prometheus.io/port: '3001'
-        prometheus.io/path: '/metrics'
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3001"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: user-service
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: user-service
+          image: myregistry.azurecr.io/user-service:1.0.0
+          ports:
+            - containerPort: 3001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: user-service-config
+            - secretRef:
+                name: user-service-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -1223,77 +1509,6 @@ spec:
                       values:
                         - user-service
                 topologyKey: kubernetes.io/hostname
-      containers:
-        - name: user-service
-          image: 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/user-service:latest
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 3001
-              name: http
-          env:
-            - name: PORT
-              value: '3001'
-            - name: NODE_ENV
-              value: production
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: user-service-secrets
-                  key: database-url
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: shared-secrets
-                  key: redis-url
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: user-service-secrets
-                  key: jwt-secret
-            - name: JWT_REFRESH_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: user-service-secrets
-                  key: jwt-refresh-secret
-            - name: INTERNAL_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: shared-secrets
-                  key: internal-api-key
-          resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 3001
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            failureThreshold: 3
-            timeoutSeconds: 5
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 3001
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 3
-          lifecycle:
-            preStop:
-              exec:
-                command: ['/bin/sh', '-c', 'sleep 5']
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 1001
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
@@ -1301,40 +1516,56 @@ spec:
           labelSelector:
             matchLabels:
               app: user-service
-
 ---
-# k8s/base/user-service/service.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: user-service
-  namespace: ecommerce
-  labels:
-    app: user-service
+  namespace: production
 spec:
   selector:
     app: user-service
   ports:
-    - name: http
-      port: 3001
+    - port: 80
       targetPort: 3001
-      protocol: TCP
+      name: http
   type: ClusterIP
-
 ---
-# k8s/base/user-service/hpa.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: production
+data:
+  NODE_ENV: "production"
+  PORT: "3001"
+  ALLOWED_ORIGINS: "https://myshop.example.com"
+  LOG_LEVEL: "info"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-service-secrets
+  namespace: production
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://postgres:$(POSTGRES_PASSWORD)@users-db:5432/users_db"
+  REDIS_URL: "redis://:$(REDIS_PASSWORD)@redis:6379"
+  JWT_SECRET: "$(JWT_SECRET)"
+  JWT_REFRESH_SECRET: "$(JWT_REFRESH_SECRET)"
+---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: user-service
-  namespace: ecommerce
+  namespace: production
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: user-service
-  minReplicas: 2
-  maxReplicas: 20
+  minReplicas: 3
+  maxReplicas: 10
   metrics:
     - type: Resource
       resource:
@@ -1348,203 +1579,217 @@ spec:
         target:
           type: Utilization
           averageUtilization: 80
-    - type: Pods
-      pods:
-        metric:
-          name: http_requests_total
-        target:
-          type: AverageValue
-          averageValue: 100
   behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
     scaleUp:
       stabilizationWindowSeconds: 60
       policies:
         - type: Pods
           value: 2
           periodSeconds: 60
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-        - type: Pods
-          value: 1
-          periodSeconds: 120
-
 ---
-# k8s/base/user-service/configmap.yaml
-apiVersion: v1
-kind: ConfigMap
+# NetworkPolicy: only allow traffic from API gateway and other services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
 metadata:
-  name: user-service-config
-  namespace: ecommerce
-data:
-  NODE_ENV: production
-  PORT: '3001'
-  LOG_LEVEL: info
-  RATE_LIMIT_WINDOW_MS: '900000'
-  RATE_LIMIT_MAX_REQUESTS: '100'
-
----
-# k8s/base/user-service/secret.yaml (values managed by external-secrets)
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: user-service-secrets
-  namespace: ecommerce
+  name: user-service-network-policy
+  namespace: production
 spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: aws-secrets-manager
-    kind: ClusterSecretStore
-  target:
-    name: user-service-secrets
-    creationPolicy: Owner
-  data:
-    - secretKey: database-url
-      remoteRef:
-        key: ecommerce/production/user-service
-        property: database_url
-    - secretKey: jwt-secret
-      remoteRef:
-        key: ecommerce/production/user-service
-        property: jwt_secret
-    - secretKey: jwt-refresh-secret
-      remoteRef:
-        key: ecommerce/production/user-service
-        property: jwt_refresh_secret
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+        - podSelector:
+            matchLabels:
+              app: order-service
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: users-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
 ```
 
 ---
 
-## 7. GitHub Actions CI/CD Pipeline
+## 99.7 GitHub Actions CI/CD Pipeline
 
 ```yaml
-# .github/workflows/deploy.yml
+# .github/workflows/ci-cd.yml
 name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 env:
-  AWS_REGION: ap-southeast-1
-  ECR_REGISTRY: 123456789.dkr.ecr.ap-southeast-1.amazonaws.com
-  EKS_CLUSTER: ecommerce-production
+  REGISTRY: myregistry.azurecr.io
+  CLUSTER_NAME: production-cluster
+  CLUSTER_RESOURCE_GROUP: production-rg
 
 jobs:
-  test:
-    name: Test ${{ matrix.service }}
+  detect-changes:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        service: [user, product, order, payment, notification, search]
-      fail-fast: false
-
+    outputs:
+      user-service: ${{ steps.filter.outputs.user-service }}
+      order-service: ${{ steps.filter.outputs.order-service }}
+      payment-service: ${{ steps.filter.outputs.payment-service }}
+      product-service: ${{ steps.filter.outputs.product-service }}
+      notification-service: ${{ steps.filter.outputs.notification-service }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            user-service:
+              - 'user-service/**'
+            order-service:
+              - 'order-service/**'
+            payment-service:
+              - 'payment-service/**'
+            product-service:
+              - 'product-service/**'
+            notification-service:
+              - 'notification-service/**'
 
-      - name: Set up Node.js
+  test:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    strategy:
+      matrix:
+        service:
+          - name: user-service
+            changed: ${{ needs.detect-changes.outputs.user-service }}
+          - name: order-service
+            changed: ${{ needs.detect-changes.outputs.order-service }}
+          - name: payment-service
+            changed: ${{ needs.detect-changes.outputs.payment-service }}
+    steps:
+      - uses: actions/checkout@v4
+        if: matrix.service.changed == 'true'
+
+      - name: Setup Node.js
+        if: matrix.service.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
-          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+          cache: 'npm'
+          cache-dependency-path: '${{ matrix.service.name }}/package-lock.json'
 
       - name: Install dependencies
+        if: matrix.service.changed == 'true'
         run: npm ci
-        working-directory: services/${{ matrix.service }}
+        working-directory: ${{ matrix.service.name }}
 
-      - name: Run linting
+      - name: Run linter
+        if: matrix.service.changed == 'true'
         run: npm run lint
-        working-directory: services/${{ matrix.service }}
+        working-directory: ${{ matrix.service.name }}
 
       - name: Run type check
-        run: npm run type-check
-        working-directory: services/${{ matrix.service }}
+        if: matrix.service.changed == 'true'
+        run: npm run typecheck
+        working-directory: ${{ matrix.service.name }}
 
       - name: Run unit tests
+        if: matrix.service.changed == 'true'
         run: npm run test:unit -- --coverage
-        working-directory: services/${{ matrix.service }}
+        working-directory: ${{ matrix.service.name }}
 
       - name: Run integration tests
-        run: npm run test:integration
-        working-directory: services/${{ matrix.service }}
-        env:
-          DATABASE_URL: postgresql://postgres:password@localhost:5432/test
-          REDIS_URL: redis://localhost:6379
+        if: matrix.service.changed == 'true'
+        run: |
+          docker compose -f docker-compose.test.yml up -d
+          sleep 10
+          npm run test:integration
+          docker compose -f docker-compose.test.yml down
+        working-directory: ${{ matrix.service.name }}
 
       - name: Upload coverage
+        if: matrix.service.changed == 'true'
         uses: codecov/codecov-action@v3
         with:
-          directory: services/${{ matrix.service }}/coverage
-          flags: ${{ matrix.service }}
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: password
-          POSTGRES_USER: postgres
-          POSTGRES_DB: test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          directory: ${{ matrix.service.name }}/coverage
 
   security-scan:
-    name: Security Scan
     runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-
-      - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: trivy-results.sarif
-
-  build-and-push:
-    name: Build & Push ${{ matrix.service }}
-    runs-on: ubuntu-latest
-    needs: [test, security-scan]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: detect-changes
     strategy:
       matrix:
-        service: [user, product, order, payment, notification, search]
-
+        service: [user-service, order-service, payment-service]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@master
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          scan-type: 'fs'
+          scan-ref: '${{ matrix.service }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [user-service, order-service, payment-service, product-service, notification-service]
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -1553,442 +1798,345 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ECR_REGISTRY }}/${{ matrix.service }}-service
+          images: ${{ env.REGISTRY }}/${{ matrix.service }}
           tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,suffix=,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Docker image
+        id: push
         uses: docker/build-push-action@v5
         with:
-          context: services/${{ matrix.service }}
+          context: ./${{ matrix.service }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            GIT_COMMIT=${{ github.sha }}
+          platforms: linux/amd64,linux/arm64
+          provenance: true
+          sbom: true
 
-      - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.ECR_REGISTRY }}/${{ matrix.service }}-service:${{ github.sha }}
-          format: table
-          exit-code: '1'
-          severity: CRITICAL
+      - name: Sign container image
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/${{ matrix.service }}@${{ steps.push.outputs.digest }}
 
-  deploy:
-    name: Deploy to Production
+  deploy-staging:
     runs-on: ubuntu-latest
     needs: build-and-push
-    environment:
-      name: production
-      url: https://api.myecommerce.com
-
+    environment: staging
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          resource-group: staging-rg
+          cluster-name: staging-cluster
+          admin: false
 
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
-
-      - name: Update image tags in kustomization
+      - name: Deploy to staging
         run: |
-          cd k8s/overlays/production
-          for service in user product order payment notification search; do
-            kustomize edit set image \
-              ${service}-service=${{ env.ECR_REGISTRY }}/${service}-service:sha-${{ github.sha }}
-          done
-
-      - name: Apply Kubernetes manifests
-        run: |
-          kubectl apply -k k8s/overlays/production
-          kubectl rollout status deployment/user-service -n ecommerce --timeout=5m
-          kubectl rollout status deployment/order-service -n ecommerce --timeout=5m
-          kubectl rollout status deployment/payment-service -n ecommerce --timeout=5m
-
-      - name: Verify deployment
-        run: |
-          for service in user-service product-service order-service payment-service notification-service search-service; do
-            kubectl get deployment $service -n ecommerce -o jsonpath='{.status.readyReplicas}'
-            echo " replicas ready for $service"
+          IMAGE_TAG=$(echo ${{ github.sha }} | cut -c1-7)
+          for SERVICE in user-service order-service payment-service product-service notification-service; do
+            kubectl set image deployment/$SERVICE \
+              $SERVICE=${{ env.REGISTRY }}/$SERVICE:$IMAGE_TAG \
+              -n staging
+            kubectl rollout status deployment/$SERVICE -n staging --timeout=5m
           done
 
       - name: Run smoke tests
         run: |
-          curl -f https://api.myecommerce.com/health || exit 1
-          curl -f https://api.myecommerce.com/api/v1/products?limit=1 || exit 1
+          npm ci
+          npm run test:smoke -- --env=staging
+        working-directory: tests
 
-      - name: Notify Slack on success
-        if: success()
+      - name: Notify deployment
         uses: slackapi/slack-github-action@v1
         with:
           payload: |
             {
-              "text": "✅ Deployment successful! SHA: ${{ github.sha }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "✅ *Production deployment successful!*\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
-                  }
-                }
-              ]
+              "text": "Staging deployment completed for commit ${{ github.sha }}"
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-      - name: Notify Slack on failure
-        if: failure()
-        uses: slackapi/slack-github-action@v1
-        with:
-          payload: '{"text": "❌ Deployment FAILED! SHA: ${{ github.sha }}"}'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-```
-
----
-
-## 8. Prometheus + Grafana Setup
-
-```yaml
-# monitoring/prometheus.yml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-  external_labels:
-    cluster: production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
     environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
 
-rule_files:
-  - /etc/prometheus/rules/*.yml
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ['alertmanager:9093']
-      timeout: 10s
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.CLUSTER_RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+          admin: false
 
-scrape_configs:
-  - job_name: 'user-service'
-    static_configs:
-      - targets: ['user-service:3001']
-    metrics_path: /metrics
+      - name: Deploy to production (canary)
+        run: |
+          IMAGE_TAG=$(echo ${{ github.sha }} | cut -c1-7)
+          for SERVICE in user-service order-service payment-service product-service notification-service; do
+            # Deploy canary (10% traffic)
+            helm upgrade --install $SERVICE-canary ./helm/charts/$SERVICE \
+              --namespace production \
+              --set image.tag=$IMAGE_TAG \
+              --set replicaCount=1 \
+              --set canary.enabled=true \
+              --set canary.weight=10 \
+              --wait
 
-  - job_name: 'order-service'
-    static_configs:
-      - targets: ['order-service:3003']
+            echo "Canary deployed for $SERVICE"
+          done
 
-  - job_name: 'payment-service'
-    static_configs:
-      - targets: ['payment-service:3004']
+      - name: Monitor canary (5 minutes)
+        run: |
+          sleep 300
+          # Check error rates
+          for SERVICE in user-service order-service payment-service; do
+            ERROR_RATE=$(curl -s "https://prometheus.example.com/api/v1/query?query=rate(http_requests_total{service=\"$SERVICE\",code=~\"5..\"}[5m])/rate(http_requests_total{service=\"$SERVICE\"}[5m])" | jq '.data.result[0].value[1]' -r)
+            if (( $(echo "$ERROR_RATE > 0.05" | bc -l) )); then
+              echo "ERROR: $SERVICE canary error rate is $ERROR_RATE - aborting!"
+              # Rollback
+              helm rollback $SERVICE-canary -n production
+              exit 1
+            fi
+            echo "$SERVICE canary OK: $ERROR_RATE error rate"
+          done
 
-  - job_name: 'search-service'
-    static_configs:
-      - targets: ['search-service:3006']
-
-  - job_name: 'kubernetes-pods'
-    kubernetes_sd_configs:
-      - role: pod
-    relabel_configs:
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-        action: keep
-        regex: 'true'
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-        action: replace
-        target_label: __metrics_path__
-        regex: (.+)
-      - source_labels: [__meta_kubernetes_namespace]
-        action: replace
-        target_label: kubernetes_namespace
-      - source_labels: [__meta_kubernetes_pod_name]
-        action: replace
-        target_label: kubernetes_pod_name
-
----
-# monitoring/alertmanager.yml
-global:
-  smtp_smarthost: 'smtp.gmail.com:587'
-  smtp_from: 'alerts@myecommerce.com'
-  slack_api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
-
-route:
-  group_by: ['alertname', 'cluster', 'service']
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
-  receiver: 'slack-general'
-  routes:
-    - match:
-        severity: critical
-      receiver: 'pagerduty-critical'
-      continue: true
-    - match:
-        severity: critical
-      receiver: 'slack-critical'
-
-receivers:
-  - name: 'slack-general'
-    slack_configs:
-      - channel: '#platform-alerts'
-        title: '{{ .CommonAnnotations.summary }}'
-        text: '{{ .CommonAnnotations.description }}'
-        send_resolved: true
-
-  - name: 'slack-critical'
-    slack_configs:
-      - channel: '#platform-critical'
-        title: '🚨 CRITICAL: {{ .CommonAnnotations.summary }}'
-        text: '{{ .CommonAnnotations.description }}'
-        color: '#FF0000'
-        send_resolved: true
-
-  - name: 'pagerduty-critical'
-    pagerduty_configs:
-      - routing_key: 'YOUR_PAGERDUTY_KEY'
-        description: '{{ .CommonAnnotations.summary }}'
+      - name: Promote canary to full production
+        run: |
+          IMAGE_TAG=$(echo ${{ github.sha }} | cut -c1-7)
+          for SERVICE in user-service order-service payment-service product-service notification-service; do
+            helm upgrade $SERVICE ./helm/charts/$SERVICE \
+              --namespace production \
+              --set image.tag=$IMAGE_TAG \
+              --set canary.enabled=false \
+              --wait
+          done
 ```
 
 ---
 
-## 9. Step-by-Step Local Development Guide
+## 99.8 Step-by-Step Getting Started Guide
+
+### Prerequisites
+
+ก่อนเริ่มต้น ตรวจสอบว่ามีเครื่องมือเหล่านี้:
 
 ```bash
-#!/bin/bash
-# scripts/setup-local.sh
-
-echo "=== Setting up local development environment ==="
-
-# 1. Check prerequisites
-check_prerequisites() {
-  echo "Checking prerequisites..."
-  commands=("docker" "docker-compose" "node" "npm" "kubectl" "helm")
-  for cmd in "${commands[@]}"; do
-    if ! command -v "$cmd" &> /dev/null; then
-      echo "❌ $cmd not found. Please install it."
-      exit 1
-    fi
-    echo "✅ $cmd found"
-  done
-}
-
-# 2. Start infrastructure
-start_infrastructure() {
-  echo "Starting infrastructure..."
-  docker-compose up -d postgres redis kafka zookeeper elasticsearch
-  
-  echo "Waiting for postgres..."
-  until docker-compose exec postgres pg_isready -U postgres; do sleep 2; done
-  
-  echo "Waiting for elasticsearch..."
-  until curl -s http://localhost:9200/_cluster/health | grep -q '"status":"green"\|"status":"yellow"'; do
-    sleep 5
-  done
-  
-  echo "✅ Infrastructure ready"
-}
-
-# 3. Run database migrations
-run_migrations() {
-  echo "Running database migrations..."
-  
-  # Create databases
-  docker-compose exec postgres psql -U postgres -c "
-    CREATE DATABASE IF NOT EXISTS users;
-    CREATE DATABASE IF NOT EXISTS products;
-    CREATE DATABASE IF NOT EXISTS orders;
-    CREATE DATABASE IF NOT EXISTS payments;
-    CREATE DATABASE IF NOT EXISTS notifications;
-  " 2>/dev/null || true
-  
-  # Run Prisma migrations
-  for service in user product order payment notification; do
-    echo "Migrating $service service..."
-    cd services/$service
-    DATABASE_URL="postgresql://postgres:password@localhost:5432/${service}s" \
-      npx prisma migrate dev --name init 2>/dev/null || true
-    cd ../..
-  done
-  
-  echo "✅ Migrations complete"
-}
-
-# 4. Install dependencies
-install_dependencies() {
-  echo "Installing dependencies..."
-  for service in user product order payment notification search; do
-    echo "Installing $service service dependencies..."
-    cd services/$service && npm install && cd ../..
-  done
-  echo "✅ Dependencies installed"
-}
-
-# 5. Start services in dev mode
-start_services() {
-  echo "Starting services..."
-  docker-compose up -d user-service product-service order-service payment-service notification-service search-service
-  echo "✅ All services started"
-  echo ""
-  echo "Services:"
-  echo "  API Gateway:    http://localhost:8000"
-  echo "  User Service:   http://localhost:3001"
-  echo "  Product Service: http://localhost:3002"
-  echo "  Order Service:  http://localhost:3003"
-  echo "  Payment Service: http://localhost:3004"
-  echo "  Prometheus:     http://localhost:9090"
-  echo "  Grafana:        http://localhost:3000 (admin/admin123)"
-  echo "  MailHog:        http://localhost:8025"
-}
-
-check_prerequisites
-start_infrastructure
-install_dependencies
-run_migrations
-start_services
-echo "=== Local development environment ready! ==="
+# ตรวจสอบ versions
+node --version        # >= 20.x
+npm --version         # >= 9.x
+docker --version      # >= 24.x
+docker compose version # >= 2.x
+kubectl version       # >= 1.28.x
 ```
 
----
-
-## 10. Production Deployment Guide
+### Step 1: Clone และ Setup
 
 ```bash
-#!/bin/bash
-# scripts/deploy-production.sh
+git clone https://github.com/your-org/microservices-ecommerce.git
+cd microservices-ecommerce
 
-echo "=== Production Deployment Guide ==="
+# Copy environment files
+cp .env.example .env
 
-# Step 1: Pre-deployment checks
-pre_deployment_checks() {
-  echo "Running pre-deployment checks..."
-  
-  # Check cluster access
-  kubectl cluster-info || { echo "❌ Cannot connect to cluster"; exit 1; }
-  
-  # Check namespaces
-  kubectl get namespace ecommerce || kubectl create namespace ecommerce
-  kubectl get namespace monitoring || kubectl create namespace monitoring
-  
-  # Check secrets exist
-  kubectl get secret user-service-secrets -n ecommerce || {
-    echo "❌ Secrets not configured. Run: ./scripts/setup-secrets.sh"
-    exit 1
-  }
-  
-  echo "✅ Pre-deployment checks passed"
-}
+# แก้ไขค่าใน .env
+# - POSTGRES_PASSWORD
+# - REDIS_PASSWORD
+# - JWT_SECRET (ต้องมี >= 32 chars)
+# - JWT_REFRESH_SECRET
+# - STRIPE_SECRET_KEY (จาก https://dashboard.stripe.com/test/apikeys)
+```
 
-# Step 2: Deploy infrastructure
-deploy_infrastructure() {
-  echo "Deploying infrastructure..."
-  
-  # Deploy PostgreSQL (using Helm)
-  helm upgrade --install postgres bitnami/postgresql \
-    --namespace ecommerce \
-    --values helm/postgres-values.yaml \
-    --wait
-  
-  # Deploy Redis Cluster
-  helm upgrade --install redis bitnami/redis \
-    --namespace ecommerce \
-    --values helm/redis-values.yaml \
-    --wait
-  
-  # Deploy Kafka
-  helm upgrade --install kafka bitnami/kafka \
-    --namespace ecommerce \
-    --values helm/kafka-values.yaml \
-    --wait
-  
-  # Deploy Elasticsearch
-  helm upgrade --install elasticsearch elastic/elasticsearch \
-    --namespace ecommerce \
-    --values helm/elasticsearch-values.yaml \
-    --wait
-  
-  echo "✅ Infrastructure deployed"
-}
+### Step 2: Start Infrastructure
 
-# Step 3: Deploy services
-deploy_services() {
-  echo "Deploying microservices..."
-  kubectl apply -k k8s/overlays/production
-  
-  # Wait for rollouts
-  for service in user product order payment notification search; do
-    echo "Waiting for ${service}-service..."
-    kubectl rollout status deployment/${service}-service -n ecommerce --timeout=5m
-  done
-  
-  echo "✅ Services deployed"
-}
+```bash
+# Start all infrastructure services first
+docker compose up -d users-db products-db orders-db payments-db redis zookeeper kafka
 
-# Step 4: Verify deployment
-verify_deployment() {
-  echo "Verifying deployment..."
-  
-  # Check pods are running
-  kubectl get pods -n ecommerce
-  
-  # Run health checks
-  GATEWAY_URL=$(kubectl get svc kong -n ecommerce -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-  
-  for endpoint in "/health" "/api/v1/products?limit=1"; do
-    response=$(curl -s -o /dev/null -w "%{http_code}" "http://${GATEWAY_URL}${endpoint}")
-    if [ "$response" != "200" ]; then
-      echo "❌ Health check failed for ${endpoint}: HTTP ${response}"
-      exit 1
-    fi
-    echo "✅ ${endpoint} - OK"
-  done
-  
-  echo "✅ Deployment verified"
-}
+# รอให้ services ready (ประมาณ 30 วินาที)
+docker compose ps
 
-pre_deployment_checks
-deploy_infrastructure
-deploy_services
-verify_deployment
+# ตรวจสอบ health
+docker compose exec users-db pg_isready -U postgres
+docker compose exec redis redis-cli ping
+```
 
-echo ""
-echo "=== 🎉 Production deployment complete! ==="
-echo "API Gateway: https://api.myecommerce.com"
-echo "Grafana: https://grafana.myecommerce.com"
-echo "Prometheus: https://prometheus.myecommerce.com"
+### Step 3: Run Database Migrations
+
+```bash
+# User Service migrations
+cd user-service
+npm install
+DATABASE_URL=postgresql://postgres:secret123@localhost:5432/users_db npx prisma migrate dev --name init
+npx prisma generate
+
+# Orders Service migrations
+cd ../order-service
+npm install
+psql postgresql://postgres:secret123@localhost:5432/orders_db < migrations/001_init.sql
+
+# Payments Service migrations
+cd ../payment-service
+npm install
+psql postgresql://postgres:secret123@localhost:5432/payments_db < migrations/001_init.sql
+
+cd ..
+```
+
+### Step 4: Start All Services
+
+```bash
+# Build all services
+docker compose build
+
+# Start everything
+docker compose up -d
+
+# ดู logs
+docker compose logs -f user-service order-service payment-service
+
+# ตรวจสอบ health ของทุก service
+for service in user-service product-service order-service payment-service notification-service; do
+  echo -n "$service: "
+  curl -s http://localhost:$(docker compose port $service 2>/dev/null | cut -d: -f2)/health | jq '.status' 2>/dev/null || echo "not ready"
+done
+```
+
+### Step 5: Test the System
+
+```bash
+# Register a user
+curl -X POST http://localhost:3001/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "test@example.com",
+    "password": "password123",
+    "firstName": "Test",
+    "lastName": "User"
+  }'
+
+# Login
+TOKEN=$(curl -s -X POST http://localhost:3001/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "test@example.com", "password": "password123"}' \
+  | jq -r '.accessToken')
+
+echo "JWT Token: $TOKEN"
+
+# Create an order
+curl -X POST http://localhost:3003/orders \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [{"productId": "prod-001", "quantity": 2, "price": 29.99}],
+    "shippingAddressId": "addr-001"
+  }'
+```
+
+### Step 6: Access Monitoring Tools
+
+| Tool | URL | Credentials |
+|------|-----|-------------|
+| Grafana | http://localhost:3006 | admin / admin |
+| Prometheus | http://localhost:9090 | - |
+| Jaeger (Tracing) | http://localhost:16686 | - |
+| Kafka UI | http://localhost:8090 | - |
+| Mailhog (Email) | http://localhost:8025 | - |
+
+### Step 7: Deploy to Kubernetes
+
+```bash
+# Create namespace
+kubectl create namespace production
+
+# Create secrets (ใช้ Sealed Secrets หรือ External Secrets ใน production จริง)
+kubectl create secret generic user-service-secrets \
+  --from-literal=DATABASE_URL="postgresql://postgres:secret@users-db:5432/users_db" \
+  --from-literal=JWT_SECRET="your-jwt-secret-here-min-32-chars" \
+  --from-literal=JWT_REFRESH_SECRET="your-refresh-secret-here" \
+  --from-literal=REDIS_URL="redis://:redis123@redis:6379" \
+  -n production
+
+# Deploy with Helm
+helm install user-service ./helm/charts/user-service \
+  --namespace production \
+  --values ./helm/values/production/user-service.yaml
+
+# Check deployment
+kubectl get pods -n production
+kubectl get svc -n production
+```
+
+### Troubleshooting
+
+```bash
+# Service ไม่ start
+docker compose logs <service-name>
+
+# Database connection failed
+docker compose exec <service-name> env | grep DATABASE_URL
+docker compose exec users-db pg_isready -U postgres
+
+# Kafka connection issues
+docker compose exec kafka kafka-topics --bootstrap-server localhost:29092 --list
+
+# Pod crashlooping ใน Kubernetes
+kubectl describe pod <pod-name> -n production
+kubectl logs <pod-name> -n production --previous
+
+# ดู events
+kubectl get events -n production --sort-by='.metadata.creationTimestamp'
 ```
 
 ---
 
-## สรุป
+## 99.9 สรุปโปรเจกต์
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| UserService | Express + Prisma + Redis + JWT | Authentication & User Management |
-| OrderService | Express + Prisma + Kafka Saga | Order Processing with Distributed Transaction |
-| PaymentService | Express + Stripe + Kafka | Secure Payment Processing |
-| ProductService | Express + Prisma + Elasticsearch | Product Catalog & Inventory |
-| NotificationService | Kafka Consumer + NodeMailer + FCM | Multi-channel Notifications |
-| SearchService | Express + Elasticsearch | Product Search & Autocomplete |
-| API Gateway | Kong | Rate Limiting, Auth, Routing |
-| Database | PostgreSQL (Prisma) | Persistent Data Storage |
-| Cache | Redis | Sessions, Rate Limiting, Cache |
-| Events | Apache Kafka | Async Communication, Saga |
-| Search | Elasticsearch | Full-text Search |
-| Monitoring | Prometheus + Grafana | Metrics & Alerting |
-| CI/CD | GitHub Actions | Automated Testing & Deployment |
-| Container | Docker + Kubernetes | Containerization & Orchestration |
+ระบบ e-commerce microservices ที่เราสร้างมีคุณสมบัติ:
 
-> "A complete microservices system is not just code — it's testing, monitoring, deployment, security, and team practices working together"
+### Reliability
+- Health checks ทุก service
+- Graceful shutdown
+- Retry logic สำหรับ external calls
+- Circuit breakers (ผ่าน Istio หรือ Resilience4j)
+
+### Scalability
+- Kubernetes HPA สำหรับ horizontal scaling
+- Stateless services
+- Redis สำหรับ session storage
+- Kafka สำหรับ async communication
+
+### Security
+- JWT authentication
+- Rate limiting
+- NetworkPolicy ใน Kubernetes
+- Secret management
+
+### Observability
+- Prometheus metrics
+- Structured logging
+- Distributed tracing (Jaeger)
+- Grafana dashboards
+
+### DevOps
+- GitHub Actions CI/CD
+- Canary deployments
+- Docker multi-stage builds
+- Kubernetes deployments with rollback
 
 ---
 
-*ถัดไป: Part 100 - Course Summary and Next Steps*
+*ต่อไปใน Part 100: Course Summary and Next Steps - สรุปทุกสิ่งที่เรียนมาตลอดหลักสูตร 100 Parts*
