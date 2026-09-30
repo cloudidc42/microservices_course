@@ -2,1103 +2,1718 @@
 
 ## บทนำ
 
-API คือ "contract" ระหว่าง services และ clients การออกแบบ API ที่ดีนั้นไม่ใช่แค่เรื่อง technical แต่เป็นเรื่องของ developer experience, backward compatibility, และ business agility บทนี้จะให้ guidance ที่ครอบคลุมทุกด้านของ API design
+การออกแบบ API ที่ดีเป็นรากฐานสำคัญของระบบ Microservices ที่ประสบความสำเร็จ ในบทนี้เราจะเรียนรู้หลักการและแนวปฏิบัติที่ดีที่สุดสำหรับการออกแบบ RESTful API รวมถึงการใช้ OpenAPI 3.0 สำหรับเขียน specification การจัดการ versioning และ patterns ต่างๆ ที่ใช้ในการสร้าง API ระดับ production
 
 ---
 
-## REST vs GraphQL vs gRPC: Decision Guide
+## 1. RESTful API Design Principles
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    API PROTOCOL DECISION MATRIX                         │
-├─────────────────┬─────────────────┬─────────────────┬───────────────────┤
-│                 │      REST       │    GraphQL      │       gRPC        │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Use case        │ Public APIs,    │ Complex queries,│ Internal service  │
-│                 │ CRUD resources  │ mobile apps     │ communication     │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Performance     │ Good            │ Can be slow     │ Excellent         │
-│                 │                 │ (N+1 risk)      │ (binary, HTTP/2)  │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Learning curve  │ Low             │ Medium          │ High              │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Caching         │ Easy (HTTP)     │ Complex         │ Manual            │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Type safety     │ Manual/OpenAPI  │ Built-in        │ Built-in (proto)  │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Streaming       │ SSE/WS          │ Subscriptions   │ Native            │
-├─────────────────┼─────────────────┼─────────────────┼───────────────────┤
-│ Browser support │ Native          │ Native          │ gRPC-web needed   │
-└─────────────────┴─────────────────┴─────────────────┴───────────────────┘
+### 1.1 หลักการพื้นฐานของ REST
 
-เมื่อไหร่ควรใช้ REST?
-✓ Public-facing API (third-party developers)
-✓ Simple CRUD operations
-✓ ต้องการ HTTP caching
-✓ Team คุ้นเคยกับ REST
+REST (Representational State Transfer) มีหลักการสำคัญ 6 ประการ:
 
-เมื่อไหร่ควรใช้ GraphQL?
-✓ Mobile apps ที่ต้องการ bandwidth optimization
-✓ Complex queries ที่ต้องการ flexibility
-✓ Rapid iteration ของ frontend
-✓ Aggregation layer (BFF pattern)
+1. **Client-Server**: แยก client กับ server ออกจากกัน
+2. **Stateless**: ทุก request ต้องมีข้อมูลครบถ้วนในตัวเอง
+3. **Cacheable**: response ต้องระบุว่า cacheable หรือไม่
+4. **Uniform Interface**: interface ที่สม่ำเสมอ
+5. **Layered System**: ระบบสามารถมี layer ได้
+6. **Code on Demand** (optional): server สามารถส่ง code ให้ client ได้
 
-เมื่อไหร่ควรใช้ gRPC?
-✓ Internal service-to-service communication
-✓ High performance ต้องการ low latency
-✓ Streaming data (real-time)
-✓ Polyglot environment
-```
-
----
-
-## REST API Design Best Practices
-
-### Resource Naming Conventions
-
-```
-Resource Naming Rules:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ DO:
-GET    /api/v1/orders              - list all orders
-POST   /api/v1/orders              - create order
-GET    /api/v1/orders/{orderId}    - get specific order
-PUT    /api/v1/orders/{orderId}    - replace order
-PATCH  /api/v1/orders/{orderId}    - partial update
-DELETE /api/v1/orders/{orderId}    - delete order
-
-GET    /api/v1/orders/{orderId}/items          - get order items (sub-resource)
-POST   /api/v1/orders/{orderId}/items          - add item to order
-DELETE /api/v1/orders/{orderId}/items/{itemId} - remove item
-
-❌ DON'T:
-GET  /api/v1/getOrders         - ใช้ HTTP method แทน verb ใน URL
-POST /api/v1/createOrder       - ไม่ควรมี verb ใน URL
-GET  /api/v1/order             - ใช้ plural
-GET  /api/v1/Orders            - lowercase เสมอ
-GET  /api/v1/order_items       - ใช้ kebab-case ไม่ใช่ snake_case
-```
+### 1.2 Resource Naming Conventions
 
 ```typescript
-// ✅ GOOD: Well-designed REST Controller
-// services/order/src/controllers/order.controller.ts
+// ✅ Good: ใช้ nouns (คำนาม) ไม่ใช่ verbs (คำกริยา)
+GET    /api/v1/users           // ดึงรายการ users
+GET    /api/v1/users/:id       // ดึง user คนเดียว
+POST   /api/v1/users           // สร้าง user ใหม่
+PUT    /api/v1/users/:id       // อัปเดต user ทั้งหมด
+PATCH  /api/v1/users/:id       // อัปเดต user บางส่วน
+DELETE /api/v1/users/:id       // ลบ user
 
-import {
-  Controller,
-  Get,
-  Post,
-  Put,
-  Patch,
-  Delete,
-  Body,
-  Param,
-  Query,
-  HttpCode,
-  HttpStatus,
-  UseGuards,
-  Request,
-  VERSION_NEUTRAL,
-} from '@nestjs/common';
-import {
-  ApiTags,
-  ApiOperation,
-  ApiResponse,
-  ApiBearerAuth,
-} from '@nestjs/swagger';
+// ✅ Good: Nested resources
+GET    /api/v1/users/:userId/orders
+POST   /api/v1/users/:userId/orders
+GET    /api/v1/users/:userId/orders/:orderId
 
-@ApiTags('orders')
-@ApiBearerAuth()
-@Controller({ path: 'orders', version: '1' })
-export class OrderV1Controller {
-  constructor(private readonly orderService: OrderService) {}
+// ❌ Bad: ใช้ verbs ใน URL
+GET    /api/v1/getUsers
+POST   /api/v1/createUser
+PUT    /api/v1/updateUser/:id
+DELETE /api/v1/deleteUser/:id
 
-  @Get()
-  @ApiOperation({ summary: 'List all orders for authenticated user' })
-  @ApiResponse({ status: 200, type: PaginatedOrdersResponse })
-  async listOrders(
-    @Request() req: AuthenticatedRequest,
-    @Query() query: ListOrdersQueryDto,
-  ): Promise<PaginatedOrdersResponse> {
-    return this.orderService.listOrders(req.user.id, query);
-  }
-
-  @Post()
-  @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Create a new order' })
-  @ApiResponse({ status: 201, type: OrderResponse })
-  @ApiResponse({ status: 400, type: ErrorResponse })
-  @ApiResponse({ status: 422, type: ValidationErrorResponse })
-  async createOrder(
-    @Request() req: AuthenticatedRequest,
-    @Body() dto: CreateOrderDto,
-  ): Promise<OrderResponse> {
-    return this.orderService.createOrder(req.user.id, dto);
-  }
-
-  @Get(':orderId')
-  @ApiOperation({ summary: 'Get a specific order' })
-  @ApiResponse({ status: 200, type: OrderResponse })
-  @ApiResponse({ status: 404, type: ErrorResponse })
-  async getOrder(
-    @Request() req: AuthenticatedRequest,
-    @Param('orderId') orderId: string,
-  ): Promise<OrderResponse> {
-    return this.orderService.getOrder(orderId, req.user.id);
-  }
-
-  @Patch(':orderId')
-  @ApiOperation({ summary: 'Partially update an order' })
-  async updateOrder(
-    @Request() req: AuthenticatedRequest,
-    @Param('orderId') orderId: string,
-    @Body() dto: UpdateOrderDto,
-  ): Promise<OrderResponse> {
-    return this.orderService.updateOrder(orderId, req.user.id, dto);
-  }
-
-  @Delete(':orderId')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Cancel an order' })
-  @ApiResponse({ status: 204 })
-  async cancelOrder(
-    @Request() req: AuthenticatedRequest,
-    @Param('orderId') orderId: string,
-  ): Promise<void> {
-    await this.orderService.cancelOrder(orderId, req.user.id);
-  }
-
-  // Sub-resource: Order Items
-  @Get(':orderId/items')
-  async listOrderItems(
-    @Param('orderId') orderId: string,
-  ): Promise<OrderItem[]> {
-    return this.orderService.listOrderItems(orderId);
-  }
-}
+// ❌ Bad: ใช้ singular nouns
+GET    /api/v1/user
+POST   /api/v1/order
 ```
 
----
-
-## API Versioning Strategies
-
-### Strategy 1: URL Path Versioning (แนะนำสำหรับ REST)
+### 1.3 HTTP Methods และ Status Codes
 
 ```typescript
-// main.ts
-import { VersioningType } from '@nestjs/common';
+// HTTP Status Codes ที่สำคัญ
+const HTTP_STATUS = {
+  // 2xx Success
+  OK: 200,                    // GET, PUT, PATCH, DELETE สำเร็จ
+  CREATED: 201,               // POST สร้างสำเร็จ
+  ACCEPTED: 202,              // Async operation accepted
+  NO_CONTENT: 204,            // DELETE สำเร็จ ไม่มี body
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // 3xx Redirection
+  MOVED_PERMANENTLY: 301,     // URL เปลี่ยนถาวร
+  NOT_MODIFIED: 304,          // Cache ยังใช้ได้
+
+  // 4xx Client Errors
+  BAD_REQUEST: 400,           // Request ไม่ถูกต้อง
+  UNAUTHORIZED: 401,          // ยังไม่ได้ authenticate
+  FORBIDDEN: 403,             // ไม่มีสิทธิ์
+  NOT_FOUND: 404,             // ไม่พบ resource
+  METHOD_NOT_ALLOWED: 405,    // HTTP method ไม่รองรับ
+  CONFLICT: 409,              // ข้อมูลขัดแย้ง
+  GONE: 410,                  // Resource ถูกลบถาวร
+  UNPROCESSABLE_ENTITY: 422,  // Validation failed
+  TOO_MANY_REQUESTS: 429,     // Rate limit exceeded
+
+  // 5xx Server Errors
+  INTERNAL_SERVER_ERROR: 500,
+  BAD_GATEWAY: 502,
+  SERVICE_UNAVAILABLE: 503,
+  GATEWAY_TIMEOUT: 504,
+} as const;
+
+// Express.js handler example
+import express, { Request, Response, NextFunction } from 'express';
+
+const router = express.Router();
+
+// GET /users/:id
+router.get('/users/:id', async (req: Request, res: Response) => {
+  const { id } = req.params;
   
-  app.enableVersioning({
-    type: VersioningType.URI,
-    prefix: 'v',
-    defaultVersion: '1',
+  const user = await userService.findById(id);
+  
+  if (!user) {
+    return res.status(HTTP_STATUS.NOT_FOUND).json({
+      error: {
+        code: 'USER_NOT_FOUND',
+        message: `User with id ${id} not found`,
+        timestamp: new Date().toISOString(),
+      }
+    });
+  }
+  
+  return res.status(HTTP_STATUS.OK).json({
+    data: user,
+    meta: {
+      timestamp: new Date().toISOString(),
+    }
   });
-  
-  await app.listen(3000);
-}
-
-// URL examples:
-// GET /api/v1/orders
-// GET /api/v2/orders
-```
-
-### Strategy 2: Header Versioning
-
-```typescript
-app.enableVersioning({
-  type: VersioningType.HEADER,
-  header: 'API-Version',
-  defaultVersion: '1',
 });
 
-// Request headers:
-// API-Version: 2
-```
-
-### Deprecation Strategy
-
-```typescript
-// services/order/src/middlewares/deprecation.middleware.ts
-
-import { Injectable, NestMiddleware } from '@nestjs/common';
-import { Request, Response, NextFunction } from 'express';
-
-@Injectable()
-export class DeprecationMiddleware implements NestMiddleware {
-  private readonly deprecatedVersions: Map<string, DeprecationInfo> = new Map([
-    ['v1', {
-      sunset: new Date('2025-06-01'),
-      alternative: '/api/v2',
-      migrationGuide: 'https://docs.company.com/api/v1-to-v2-migration',
-    }],
-  ]);
-
-  use(req: Request, res: Response, next: NextFunction): void {
-    const version = this.extractVersion(req.path);
-    const deprecationInfo = this.deprecatedVersions.get(version);
-
-    if (deprecationInfo) {
-      // Add Deprecation headers (RFC 8594)
-      res.setHeader('Deprecation', deprecationInfo.sunset.toUTCString());
-      res.setHeader('Sunset', deprecationInfo.sunset.toUTCString());
-      res.setHeader('Link', `<${deprecationInfo.alternative}>; rel="successor-version"`);
-      
-      if (deprecationInfo.migrationGuide) {
-        res.setHeader(
-          'Link',
-          `${res.getHeader('Link')}, <${deprecationInfo.migrationGuide}>; rel="deprecation"`
-        );
-      }
-    }
-
-    next();
-  }
-
-  private extractVersion(path: string): string {
-    const match = path.match(/^\/api\/(v\d+)\//);
-    return match ? match[1] : '';
-  }
-}
-```
-
----
-
-## Error Response Format
-
-### Standard Error Format (RFC 7807 Problem Details)
-
-```typescript
-// shared/src/errors/problem-details.ts
-
-export interface ProblemDetails {
-  type: string;         // URI ที่ identify ประเภทของ error
-  title: string;        // Short human-readable summary
-  status: number;       // HTTP status code
-  detail: string;       // Human-readable explanation
-  instance?: string;    // URI ที่ identify specific occurrence
+// POST /users
+router.post('/users', async (req: Request, res: Response) => {
+  const { name, email } = req.body;
   
-  // Extension fields
-  errors?: ValidationError[];
-  traceId?: string;
-  requestId?: string;
-}
-
-export interface ValidationError {
-  field: string;
-  message: string;
-  rejectedValue?: unknown;
-  code: string;
-}
-```
-
-```typescript
-// shared/src/filters/http-exception.filter.ts
-
-import {
-  ExceptionFilter,
-  Catch,
-  ArgumentsHost,
-  HttpException,
-  HttpStatus,
-  Logger,
-} from '@nestjs/common';
-import { Response, Request } from 'express';
-import { v4 as uuidv4 } from 'uuid';
-
-@Catch()
-export class GlobalExceptionFilter implements ExceptionFilter {
-  private readonly logger = new Logger(GlobalExceptionFilter.name);
-
-  catch(exception: unknown, host: ArgumentsHost): void {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest<Request>();
-
-    const requestId = request.headers['x-request-id'] as string || uuidv4();
-    const traceId = request.headers['x-trace-id'] as string;
-
-    if (exception instanceof HttpException) {
-      const status = exception.getStatus();
-      const exceptionResponse = exception.getResponse();
-
-      const problemDetails: ProblemDetails = {
-        type: this.getErrorType(status),
-        title: this.getErrorTitle(status),
-        status,
-        detail: typeof exceptionResponse === 'string' 
-          ? exceptionResponse 
-          : (exceptionResponse as any).message || 'An error occurred',
-        instance: request.url,
-        requestId,
-        traceId,
-        ...(this.isValidationError(exceptionResponse) && {
-          errors: this.extractValidationErrors(exceptionResponse),
-        }),
-      };
-
-      this.logger.warn(`HTTP ${status} on ${request.method} ${request.url}`, {
-        requestId,
-        error: problemDetails.detail,
-      });
-
-      response
-        .status(status)
-        .contentType('application/problem+json')
-        .json(problemDetails);
-    } else {
-      this.logger.error('Unhandled exception', exception as Error, {
-        requestId,
-        method: request.method,
-        url: request.url,
-      });
-
-      response
-        .status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .contentType('application/problem+json')
-        .json({
-          type: 'https://docs.company.com/errors/internal-server-error',
-          title: 'Internal Server Error',
-          status: 500,
-          detail: 'An unexpected error occurred. Please try again later.',
-          instance: request.url,
-          requestId,
-          traceId,
-        } as ProblemDetails);
+  const existingUser = await userService.findByEmail(email);
+  if (existingUser) {
+    return res.status(HTTP_STATUS.CONFLICT).json({
+      error: {
+        code: 'EMAIL_ALREADY_EXISTS',
+        message: 'A user with this email already exists',
+        field: 'email',
+      }
+    });
+  }
+  
+  const user = await userService.create({ name, email });
+  
+  return res.status(HTTP_STATUS.CREATED).json({
+    data: user,
+    meta: {
+      timestamp: new Date().toISOString(),
     }
-  }
-
-  private getErrorType(status: number): string {
-    const types: Record<number, string> = {
-      400: 'https://docs.company.com/errors/bad-request',
-      401: 'https://docs.company.com/errors/unauthorized',
-      403: 'https://docs.company.com/errors/forbidden',
-      404: 'https://docs.company.com/errors/not-found',
-      409: 'https://docs.company.com/errors/conflict',
-      422: 'https://docs.company.com/errors/unprocessable-entity',
-      429: 'https://docs.company.com/errors/too-many-requests',
-      500: 'https://docs.company.com/errors/internal-server-error',
-    };
-    return types[status] || `https://docs.company.com/errors/${status}`;
-  }
-
-  private getErrorTitle(status: number): string {
-    const titles: Record<number, string> = {
-      400: 'Bad Request',
-      401: 'Unauthorized',
-      403: 'Forbidden',
-      404: 'Not Found',
-      409: 'Conflict',
-      422: 'Unprocessable Entity',
-      429: 'Too Many Requests',
-      500: 'Internal Server Error',
-    };
-    return titles[status] || 'Error';
-  }
-
-  private isValidationError(response: unknown): boolean {
-    return (
-      typeof response === 'object' &&
-      response !== null &&
-      'message' in response &&
-      Array.isArray((response as any).message)
-    );
-  }
-
-  private extractValidationErrors(response: unknown): ValidationError[] {
-    const messages = (response as any).message as string[];
-    return messages.map(msg => ({
-      field: msg.split(' ')[0],
-      message: msg,
-      code: 'VALIDATION_ERROR',
-    }));
-  }
-}
-```
-
-```json
-// ตัวอย่าง Error Response:
-{
-  "type": "https://docs.company.com/errors/unprocessable-entity",
-  "title": "Unprocessable Entity",
-  "status": 422,
-  "detail": "Request validation failed",
-  "instance": "/api/v1/orders",
-  "requestId": "req-123e4567-e89b-12d3-a456-426614174000",
-  "traceId": "abc123def456",
-  "errors": [
-    {
-      "field": "items[0].quantity",
-      "message": "items[0].quantity must be a positive integer",
-      "rejectedValue": -1,
-      "code": "MIN_VALUE"
-    },
-    {
-      "field": "shippingAddress.zipCode",
-      "message": "shippingAddress.zipCode must match Thai postal code format",
-      "rejectedValue": "ABC",
-      "code": "PATTERN_MISMATCH"
-    }
-  ]
-}
+  });
+});
 ```
 
 ---
 
-## Pagination Patterns
+## 2. OpenAPI 3.0 Specification
 
-### Cursor-based Pagination (แนะนำสำหรับ large datasets)
+### 2.1 โครงสร้างพื้นฐานของ OpenAPI
 
-```typescript
-// shared/src/pagination/cursor-pagination.ts
-
-export interface CursorPaginationParams {
-  cursor?: string;    // Base64 encoded cursor
-  limit: number;      // max 100
-  direction?: 'forward' | 'backward';
-}
-
-export interface CursorPaginatedResponse<T> {
-  data: T[];
-  pagination: {
-    hasNextPage: boolean;
-    hasPreviousPage: boolean;
-    startCursor: string | null;
-    endCursor: string | null;
-    totalCount?: number;  // optional, expensive to compute
-  };
-}
-
-@Injectable()
-export class CursorPaginationService {
-  encodeCursor(value: string | number | Date): string {
-    return Buffer.from(String(value)).toString('base64url');
-  }
-
-  decodeCursor(cursor: string): string {
-    return Buffer.from(cursor, 'base64url').toString('utf-8');
-  }
-
-  async paginate<T extends { id: string; createdAt: Date }>(
-    queryBuilder: SelectQueryBuilder<T>,
-    params: CursorPaginationParams,
-  ): Promise<CursorPaginatedResponse<T>> {
-    const limit = Math.min(params.limit || 20, 100);
-
-    if (params.cursor) {
-      const decodedCursor = this.decodeCursor(params.cursor);
-      
-      if (params.direction === 'backward') {
-        queryBuilder.andWhere('entity.id > :cursor', { cursor: decodedCursor });
-      } else {
-        queryBuilder.andWhere('entity.id < :cursor', { cursor: decodedCursor });
-      }
-    }
-
-    queryBuilder
-      .orderBy('entity.createdAt', 'DESC')
-      .addOrderBy('entity.id', 'DESC')
-      .limit(limit + 1); // fetch one extra to check hasNextPage
-
-    const items = await queryBuilder.getMany();
-    const hasNextPage = items.length > limit;
+```yaml
+# openapi.yaml
+openapi: 3.0.3
+info:
+  title: User Service API
+  description: |
+    API สำหรับจัดการข้อมูล Users ในระบบ Microservices
     
-    if (hasNextPage) {
-      items.pop(); // remove the extra item
-    }
-
-    const startCursor = items.length > 0 
-      ? this.encodeCursor(items[0].id)
-      : null;
+    ## Authentication
+    ใช้ Bearer token ใน Authorization header
     
-    const endCursor = items.length > 0 
-      ? this.encodeCursor(items[items.length - 1].id)
-      : null;
+    ## Rate Limiting
+    - 1000 requests ต่อ minute สำหรับ authenticated users
+    - 100 requests ต่อ minute สำหรับ anonymous
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: api-support@example.com
+    url: https://developers.example.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
 
-    return {
-      data: items,
-      pagination: {
-        hasNextPage,
-        hasPreviousPage: !!params.cursor,
-        startCursor,
-        endCursor,
-      },
-    };
-  }
-}
+servers:
+  - url: https://api.example.com/v1
+    description: Production
+  - url: https://staging-api.example.com/v1
+    description: Staging
+  - url: http://localhost:3000/v1
+    description: Local Development
+
+tags:
+  - name: Users
+    description: User management operations
+  - name: Orders
+    description: Order management operations
+
+paths:
+  /users:
+    get:
+      tags: [Users]
+      summary: List users
+      description: ดึงรายการ users พร้อม pagination
+      operationId: listUsers
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [name, email, createdAt]
+            default: createdAt
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - name: search
+          in: query
+          description: ค้นหาด้วย name หรือ email
+          schema:
+            type: string
+            maxLength: 100
+      responses:
+        '200':
+          description: รายการ users
+          headers:
+            X-Total-Count:
+              description: จำนวน users ทั้งหมด
+              schema:
+                type: integer
+            X-Rate-Limit-Remaining:
+              description: จำนวน requests ที่เหลือ
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+              examples:
+                success:
+                  $ref: '#/components/examples/UserListExample'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+
+    post:
+      tags: [Users]
+      summary: Create user
+      operationId: createUser
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+            examples:
+              basic:
+                summary: Basic user creation
+                value:
+                  name: John Doe
+                  email: john@example.com
+      responses:
+        '201':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdParam'
+    
+    get:
+      tags: [Users]
+      summary: Get user by ID
+      operationId: getUserById
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: User data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+    patch:
+      tags: [Users]
+      summary: Update user
+      operationId: updateUser
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: User updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+
+    delete:
+      tags: [Users]
+      summary: Delete user
+      operationId: deleteUser
+      security:
+        - BearerAuth: []
+      responses:
+        '204':
+          description: User deleted
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: John Doe
+        email:
+          type: string
+          format: email
+          example: john@example.com
+        role:
+          type: string
+          enum: [admin, user, moderator]
+          default: user
+        isActive:
+          type: boolean
+          default: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [id, name, email, role, isActive, createdAt, updatedAt]
+
+    CreateUserRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, user, moderator]
+          default: user
+      required: [name, email]
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        role:
+          type: string
+          enum: [admin, user, moderator]
+      minProperties: 1
+
+    UserResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/User'
+        meta:
+          $ref: '#/components/schemas/ResponseMeta'
+
+    UserListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    ResponseMeta:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+          format: uuid
+
+    PaginationMeta:
+      allOf:
+        - $ref: '#/components/schemas/ResponseMeta'
+        - type: object
+          properties:
+            pagination:
+              type: object
+              properties:
+                page:
+                  type: integer
+                  minimum: 1
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                total:
+                  type: integer
+                  minimum: 0
+                totalPages:
+                  type: integer
+                  minimum: 0
+                hasNext:
+                  type: boolean
+                hasPrev:
+                  type: boolean
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  message:
+                    type: string
+            timestamp:
+              type: string
+              format: date-time
+            requestId:
+              type: string
+              format: uuid
+          required: [code, message, timestamp]
+
+  parameters:
+    UserIdParam:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PageParam:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    LimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  responses:
+    UnauthorizedError:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: Authentication token is missing or invalid
+              timestamp: '2024-01-01T00:00:00Z'
+    
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    BadRequestError:
+      description: Invalid request data
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ConflictError:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    TooManyRequestsError:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          description: Seconds until rate limit resets
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  examples:
+    UserListExample:
+      summary: Example user list response
+      value:
+        data:
+          - id: 550e8400-e29b-41d4-a716-446655440000
+            name: John Doe
+            email: john@example.com
+            role: user
+            isActive: true
+            createdAt: '2024-01-01T00:00:00Z'
+            updatedAt: '2024-01-01T00:00:00Z'
+        meta:
+          timestamp: '2024-01-01T00:00:00Z'
+          requestId: 660e8400-e29b-41d4-a716-446655440001
+          pagination:
+            page: 1
+            limit: 20
+            total: 100
+            totalPages: 5
+            hasNext: true
+            hasPrev: false
 ```
 
-### Offset-based Pagination (สำหรับ simple cases)
+### 2.2 TypeScript Types จาก OpenAPI
 
 ```typescript
-// shared/src/pagination/offset-pagination.ts
+// tools/generate-types.ts
+import { execSync } from 'child_process';
+import fs from 'fs';
 
-export interface OffsetPaginationParams {
-  page?: number;    // 1-based
-  limit?: number;   // max 100
+// Generate TypeScript types from OpenAPI spec
+execSync('npx openapi-typescript openapi.yaml --output src/types/api.ts');
+
+// Generated types (ตัวอย่าง)
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: 'admin' | 'user' | 'moderator';
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export interface OffsetPaginatedResponse<T> {
-  data: T[];
+export interface CreateUserRequest {
+  name: string;
+  email: string;
+  role?: 'admin' | 'user' | 'moderator';
+}
+
+export interface UserListResponse {
+  data: User[];
+  meta: PaginationMeta;
+}
+
+export interface PaginationMeta {
+  timestamp: string;
+  requestId: string;
   pagination: {
     page: number;
     limit: number;
-    totalCount: number;
+    total: number;
     totalPages: number;
-    hasNextPage: boolean;
-    hasPreviousPage: boolean;
+    hasNext: boolean;
+    hasPrev: boolean;
   };
-}
-
-@Injectable()
-export class OffsetPaginationService {
-  async paginate<T>(
-    queryBuilder: SelectQueryBuilder<T>,
-    params: OffsetPaginationParams,
-  ): Promise<OffsetPaginatedResponse<T>> {
-    const page = Math.max(1, params.page || 1);
-    const limit = Math.min(params.limit || 20, 100);
-    const offset = (page - 1) * limit;
-
-    const [data, totalCount] = await queryBuilder
-      .skip(offset)
-      .take(limit)
-      .getManyAndCount();
-
-    const totalPages = Math.ceil(totalCount / limit);
-
-    return {
-      data,
-      pagination: {
-        page,
-        limit,
-        totalCount,
-        totalPages,
-        hasNextPage: page < totalPages,
-        hasPreviousPage: page > 1,
-      },
-    };
-  }
-}
-```
-
-```json
-// Response format สำหรับ Cursor Pagination:
-{
-  "data": [
-    { "id": "order-1", "status": "COMPLETED" },
-    { "id": "order-2", "status": "PENDING" }
-  ],
-  "pagination": {
-    "hasNextPage": true,
-    "hasPreviousPage": false,
-    "startCursor": "b3JkZXItMQ==",
-    "endCursor": "b3JkZXItMjA=="
-  }
 }
 ```
 
 ---
 
-## Idempotency Keys
+## 3. API Versioning Strategies
 
-### การ implement Idempotency สำหรับ POST requests
+### 3.1 URL Path Versioning (แนะนำ)
 
 ```typescript
-// shared/src/idempotency/idempotency.service.ts
+// src/app.ts
+import express from 'express';
+import { routerV1 } from './routes/v1';
+import { routerV2 } from './routes/v2';
 
-import { Injectable, ConflictException } from '@nestjs/common';
-import { InjectRedis } from '@liaoliaots/nestjs-redis';
-import Redis from 'ioredis';
+const app = express();
 
-export interface IdempotencyRecord {
-  requestId: string;
-  response: unknown;
-  statusCode: number;
-  createdAt: Date;
-  expiresAt: Date;
+// Version 1 - stable
+app.use('/api/v1', routerV1);
+
+// Version 2 - new features
+app.use('/api/v2', routerV2);
+
+// Redirect root to latest
+app.use('/api', (req, res) => {
+  res.redirect('/api/v2' + req.path);
+});
+```
+
+### 3.2 Header-Based Versioning
+
+```typescript
+// src/middleware/version.ts
+import { Request, Response, NextFunction } from 'express';
+
+export const versionMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const version = req.headers['api-version'] || 
+                  req.headers['accept']?.match(/version=(\d+)/)?.[1] ||
+                  '1';
+  
+  req.apiVersion = parseInt(version as string);
+  next();
+};
+
+// Usage
+app.use(versionMiddleware);
+app.use('/api/users', (req, res) => {
+  switch (req.apiVersion) {
+    case 2:
+      return usersV2Handler(req, res);
+    default:
+      return usersV1Handler(req, res);
+  }
+});
+
+// src/routes/users.ts - Versioned handlers
+export const usersV1Handler = async (req: Request, res: Response) => {
+  const users = await userService.findAll();
+  // V1: ส่ง array ตรงๆ
+  return res.json(users);
+};
+
+export const usersV2Handler = async (req: Request, res: Response) => {
+  const users = await userService.findAll();
+  // V2: ส่งพร้อม metadata
+  return res.json({
+    data: users,
+    meta: { total: users.length, timestamp: new Date().toISOString() }
+  });
+};
+```
+
+### 3.3 Deprecation Headers
+
+```typescript
+// src/middleware/deprecation.ts
+import { Request, Response, NextFunction } from 'express';
+
+interface DeprecationInfo {
+  deprecatedAt: string;
+  sunsetAt: string;
+  link?: string;
+  message?: string;
 }
 
-@Injectable()
-export class IdempotencyService {
-  private readonly TTL_SECONDS = 86400; // 24 hours
-
-  constructor(
-    @InjectRedis() private readonly redis: Redis,
-  ) {}
-
-  private getKey(idempotencyKey: string): string {
-    return `idempotency:${idempotencyKey}`;
+const DEPRECATED_VERSIONS: Record<string, DeprecationInfo> = {
+  'v1': {
+    deprecatedAt: '2024-01-01',
+    sunsetAt: '2024-07-01',
+    link: 'https://docs.example.com/migration/v1-to-v2',
+    message: 'Please migrate to API v2',
   }
+};
 
-  async getStoredResponse(
-    idempotencyKey: string
-  ): Promise<IdempotencyRecord | null> {
-    const stored = await this.redis.get(this.getKey(idempotencyKey));
-    if (!stored) return null;
-    return JSON.parse(stored);
-  }
-
-  async storeResponse(
-    idempotencyKey: string,
-    statusCode: number,
-    response: unknown,
-  ): Promise<void> {
-    const record: IdempotencyRecord = {
-      requestId: idempotencyKey,
-      response,
-      statusCode,
-      createdAt: new Date(),
-      expiresAt: new Date(Date.now() + this.TTL_SECONDS * 1000),
-    };
-
-    await this.redis.setex(
-      this.getKey(idempotencyKey),
-      this.TTL_SECONDS,
-      JSON.stringify(record),
+export const deprecationMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const version = req.path.match(/^\/v(\d+)/)?.[0]?.slice(1);
+  
+  if (version && DEPRECATED_VERSIONS[version]) {
+    const info = DEPRECATED_VERSIONS[version];
+    
+    // ตาม RFC 8594
+    res.setHeader('Deprecation', info.deprecatedAt);
+    res.setHeader('Sunset', info.sunsetAt);
+    
+    if (info.link) {
+      res.setHeader('Link', `<${info.link}>; rel="successor-version"`);
+    }
+    
+    // Warning header
+    res.setHeader(
+      'Warning',
+      `299 - "Deprecated API ${version}: ${info.message}"`
     );
   }
+  
+  next();
+};
+```
 
-  async acquireLock(idempotencyKey: string): Promise<boolean> {
-    // Set lock with NX (only if not exists)
-    const result = await this.redis.set(
-      `${this.getKey(idempotencyKey)}:lock`,
-      '1',
-      'EX',
-      30,   // lock expires in 30 seconds
-      'NX', // only set if not exists
-    );
-    return result === 'OK';
-  }
+---
 
-  async releaseLock(idempotencyKey: string): Promise<void> {
-    await this.redis.del(`${this.getKey(idempotencyKey)}:lock`);
-  }
+## 4. Pagination Patterns
+
+### 4.1 Offset Pagination
+
+```typescript
+// src/services/pagination.ts
+import { Repository, FindManyOptions } from 'typeorm';
+
+interface OffsetPaginationOptions {
+  page: number;
+  limit: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+}
+
+interface PaginatedResult<T> {
+  data: T[];
+  meta: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
+}
+
+export async function paginateOffset<T>(
+  repository: Repository<T>,
+  options: OffsetPaginationOptions,
+  where?: FindManyOptions<T>['where']
+): Promise<PaginatedResult<T>> {
+  const { page, limit, sort = 'createdAt', order = 'desc' } = options;
+  const offset = (page - 1) * limit;
+
+  const [data, total] = await repository.findAndCount({
+    where,
+    take: limit,
+    skip: offset,
+    order: { [sort]: order.toUpperCase() } as any,
+  });
+
+  const totalPages = Math.ceil(total / limit);
+
+  return {
+    data,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages,
+      hasNext: page < totalPages,
+      hasPrev: page > 1,
+    },
+  };
 }
 ```
 
+### 4.2 Cursor Pagination (สำหรับ Real-time data)
+
 ```typescript
-// shared/src/idempotency/idempotency.interceptor.ts
+// src/services/cursor-pagination.ts
+import { DataSource } from 'typeorm';
+import { encode, decode } from 'base64url';
 
-import {
-  Injectable,
-  NestInterceptor,
-  ExecutionContext,
-  CallHandler,
-  ConflictException,
-  HttpException,
-  Logger,
-} from '@nestjs/common';
-import { Observable, from } from 'rxjs';
-import { switchMap, tap } from 'rxjs/operators';
-import { Request, Response } from 'express';
+interface CursorPaginationOptions {
+  limit: number;
+  cursor?: string;
+  direction?: 'next' | 'prev';
+}
 
-@Injectable()
-export class IdempotencyInterceptor implements NestInterceptor {
-  private readonly logger = new Logger(IdempotencyInterceptor.name);
+interface CursorInfo {
+  id: string;
+  createdAt: string;
+}
 
-  constructor(
-    private readonly idempotencyService: IdempotencyService,
-  ) {}
+interface CursorPaginatedResult<T> {
+  data: T[];
+  meta: {
+    limit: number;
+    nextCursor?: string;
+    prevCursor?: string;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
+}
 
-  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
-    const request = context.switchToHttp().getRequest<Request>();
-    const response = context.switchToHttp().getResponse<Response>();
+export function encodeCursor(cursor: CursorInfo): string {
+  return encode(JSON.stringify(cursor));
+}
+
+export function decodeCursor(cursor: string): CursorInfo {
+  return JSON.parse(decode(cursor));
+}
+
+export async function paginateCursor<T extends { id: string; createdAt: Date }>(
+  dataSource: DataSource,
+  tableName: string,
+  options: CursorPaginationOptions
+): Promise<CursorPaginatedResult<T>> {
+  const { limit, cursor, direction = 'next' } = options;
+  
+  let query = dataSource
+    .createQueryBuilder<T>(tableName, 't')
+    .orderBy('t.createdAt', direction === 'next' ? 'DESC' : 'ASC')
+    .addOrderBy('t.id', direction === 'next' ? 'DESC' : 'ASC')
+    .take(limit + 1); // ดึงเพิ่ม 1 เพื่อเช็ค hasNext
+
+  if (cursor) {
+    const cursorInfo = decodeCursor(cursor);
     
-    const idempotencyKey = request.headers['idempotency-key'] as string;
-    
-    // Only apply to POST, PUT, PATCH
-    if (!['POST', 'PUT', 'PATCH'].includes(request.method) || !idempotencyKey) {
-      return next.handle();
-    }
-
-    return from(this.handleIdempotency(idempotencyKey, response, next));
-  }
-
-  private async handleIdempotency(
-    idempotencyKey: string,
-    response: Response,
-    next: CallHandler,
-  ): Promise<unknown> {
-    // Check if we already have a response
-    const stored = await this.idempotencyService.getStoredResponse(idempotencyKey);
-    if (stored) {
-      this.logger.debug(`Returning cached response for key: ${idempotencyKey}`);
-      response.setHeader('Idempotency-Key-Replay', 'true');
-      response.status(stored.statusCode);
-      return stored.response;
-    }
-
-    // Try to acquire lock (prevent concurrent requests with same key)
-    const locked = await this.idempotencyService.acquireLock(idempotencyKey);
-    if (!locked) {
-      throw new ConflictException(
-        'A request with this idempotency key is currently being processed'
+    if (direction === 'next') {
+      query = query.where(
+        '(t.createdAt, t.id) < (:createdAt, :id)',
+        { createdAt: cursorInfo.createdAt, id: cursorInfo.id }
+      );
+    } else {
+      query = query.where(
+        '(t.createdAt, t.id) > (:createdAt, :id)',
+        { createdAt: cursorInfo.createdAt, id: cursorInfo.id }
       );
     }
-
-    try {
-      const result = await next.handle().toPromise();
-      const statusCode = response.statusCode || 200;
-      
-      await this.idempotencyService.storeResponse(
-        idempotencyKey,
-        statusCode,
-        result,
-      );
-      
-      return result;
-    } finally {
-      await this.idempotencyService.releaseLock(idempotencyKey);
-    }
   }
+
+  const items = await query.getMany();
+  const hasMore = items.length > limit;
+  
+  if (hasMore) items.pop();
+  
+  if (direction === 'prev') items.reverse();
+
+  const nextCursor = hasMore && direction === 'next' && items.length > 0
+    ? encodeCursor({
+        id: items[items.length - 1].id,
+        createdAt: items[items.length - 1].createdAt.toISOString(),
+      })
+    : undefined;
+
+  const prevCursor = cursor && items.length > 0
+    ? encodeCursor({
+        id: items[0].id,
+        createdAt: items[0].createdAt.toISOString(),
+      })
+    : undefined;
+
+  return {
+    data: items,
+    meta: {
+      limit,
+      nextCursor,
+      prevCursor,
+      hasNext: hasMore && direction === 'next',
+      hasPrev: !!cursor,
+    },
+  };
 }
 ```
 
+### 4.3 Keyset Pagination (สำหรับ Large Datasets)
+
 ```typescript
-// ใช้ Idempotency Interceptor ใน controller
-@Controller({ path: 'orders', version: '1' })
-@UseInterceptors(IdempotencyInterceptor)
-export class OrderController {
-  @Post()
-  @HttpCode(HttpStatus.CREATED)
-  async createOrder(@Body() dto: CreateOrderDto): Promise<Order> {
-    // Client ส่ง header: Idempotency-Key: unique-uuid-per-request
-    // ถ้า retry ด้วย key เดิม จะได้ response เดิมกลับมา
-    return this.orderService.createOrder(dto);
+// src/services/keyset-pagination.ts
+interface KeysetOptions {
+  limit: number;
+  lastId?: string;
+  lastCreatedAt?: string;
+}
+
+export async function paginateKeyset(
+  db: any,
+  options: KeysetOptions
+) {
+  const { limit, lastId, lastCreatedAt } = options;
+  
+  let query = `
+    SELECT * FROM users
+    WHERE 1=1
+  `;
+  
+  const params: any[] = [];
+  
+  // Keyset condition
+  if (lastId && lastCreatedAt) {
+    query += `
+      AND (created_at, id) < ($1, $2)
+    `;
+    params.push(lastCreatedAt, lastId);
   }
+  
+  query += `
+    ORDER BY created_at DESC, id DESC
+    LIMIT $${params.length + 1}
+  `;
+  params.push(limit + 1);
+  
+  const rows = await db.query(query, params);
+  const hasMore = rows.length > limit;
+  
+  if (hasMore) rows.pop();
+  
+  const lastRow = rows[rows.length - 1];
+  
+  return {
+    data: rows,
+    meta: {
+      hasNext: hasMore,
+      lastId: lastRow?.id,
+      lastCreatedAt: lastRow?.createdAt,
+    },
+  };
 }
 ```
 
 ---
 
-## Webhook Design
+## 5. Filtering and Sorting Patterns
 
-### Webhook Payload Structure
+### 5.1 Advanced Filtering
 
 ```typescript
-// shared/src/webhooks/webhook.types.ts
+// src/utils/query-builder.ts
+import { SelectQueryBuilder } from 'typeorm';
 
-export interface WebhookPayload<T = unknown> {
-  // Event identification
-  id: string;           // Unique webhook event ID
-  type: string;         // Event type: "order.created", "payment.completed"
-  version: string;      // Payload schema version: "1.0"
+type FilterOperator = 
+  | 'eq' | 'ne'           // Equal, Not Equal
+  | 'gt' | 'gte'          // Greater Than, Greater or Equal
+  | 'lt' | 'lte'          // Less Than, Less or Equal
+  | 'in' | 'nin'          // In, Not In
+  | 'like' | 'ilike'      // Like, Case-insensitive Like
+  | 'between'             // Between
+  | 'isNull' | 'isNotNull'; // Null checks
+
+interface FilterCondition {
+  field: string;
+  operator: FilterOperator;
+  value: any;
+}
+
+interface SortCondition {
+  field: string;
+  direction: 'ASC' | 'DESC';
+}
+
+export function applyFilters<T>(
+  queryBuilder: SelectQueryBuilder<T>,
+  filters: FilterCondition[],
+  alias: string = 't'
+): SelectQueryBuilder<T> {
+  filters.forEach((filter, index) => {
+    const paramName = `param_${index}`;
+    const fieldPath = `${alias}.${filter.field}`;
+    
+    switch (filter.operator) {
+      case 'eq':
+        queryBuilder.andWhere(`${fieldPath} = :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'ne':
+        queryBuilder.andWhere(`${fieldPath} != :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'gt':
+        queryBuilder.andWhere(`${fieldPath} > :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'gte':
+        queryBuilder.andWhere(`${fieldPath} >= :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'lt':
+        queryBuilder.andWhere(`${fieldPath} < :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'lte':
+        queryBuilder.andWhere(`${fieldPath} <= :${paramName}`, { [paramName]: filter.value });
+        break;
+      case 'in':
+        queryBuilder.andWhere(`${fieldPath} IN (:...${paramName})`, { [paramName]: filter.value });
+        break;
+      case 'nin':
+        queryBuilder.andWhere(`${fieldPath} NOT IN (:...${paramName})`, { [paramName]: filter.value });
+        break;
+      case 'like':
+        queryBuilder.andWhere(`${fieldPath} LIKE :${paramName}`, { [paramName]: `%${filter.value}%` });
+        break;
+      case 'ilike':
+        queryBuilder.andWhere(`${fieldPath} ILIKE :${paramName}`, { [paramName]: `%${filter.value}%` });
+        break;
+      case 'between':
+        queryBuilder.andWhere(
+          `${fieldPath} BETWEEN :${paramName}_start AND :${paramName}_end`,
+          { [`${paramName}_start`]: filter.value[0], [`${paramName}_end`]: filter.value[1] }
+        );
+        break;
+      case 'isNull':
+        queryBuilder.andWhere(`${fieldPath} IS NULL`);
+        break;
+      case 'isNotNull':
+        queryBuilder.andWhere(`${fieldPath} IS NOT NULL`);
+        break;
+    }
+  });
   
-  // Timing
-  createdAt: string;    // ISO 8601
+  return queryBuilder;
+}
+
+// src/utils/parse-filters.ts
+export function parseQueryFilters(query: Record<string, string>): FilterCondition[] {
+  const filters: FilterCondition[] = [];
+  const filterPattern = /^filter\[(.+)\]\[(.+)\]$/;
   
-  // Source
-  source: {
-    service: string;    // "order-service"
-    environment: string;// "production"
-  };
+  for (const [key, value] of Object.entries(query)) {
+    const match = key.match(filterPattern);
+    if (!match) continue;
+    
+    const [, field, operator] = match;
+    
+    let parsedValue: any = value;
+    
+    // Parse special values
+    if (['in', 'nin'].includes(operator)) {
+      parsedValue = value.split(',');
+    } else if (operator === 'between') {
+      parsedValue = value.split(',').map(v => new Date(v));
+    } else if (!isNaN(Number(value))) {
+      parsedValue = Number(value);
+    } else if (value === 'true' || value === 'false') {
+      parsedValue = value === 'true';
+    }
+    
+    filters.push({
+      field,
+      operator: operator as FilterOperator,
+      value: parsedValue,
+    });
+  }
   
-  // Payload
+  return filters;
+}
+
+// ตัวอย่างการใช้งาน:
+// GET /users?filter[role][eq]=admin&filter[createdAt][gte]=2024-01-01&filter[name][ilike]=john
+```
+
+---
+
+## 6. HATEOAS Implementation
+
+```typescript
+// src/utils/hateoas.ts
+interface Link {
+  href: string;
+  rel: string;
+  method?: string;
+  title?: string;
+}
+
+interface HATEOASResponse<T> {
   data: T;
-  
-  // Retry info
-  attempt: number;      // 1 = first attempt
-  maxAttempts: number;
+  _links: Record<string, Link>;
+  _embedded?: Record<string, any>;
 }
 
-// ตัวอย่าง Order Created Webhook
-export interface OrderCreatedWebhookPayload {
-  orderId: string;
-  userId: string;
-  totalAmount: number;
-  currency: string;
-  items: Array<{
-    productId: string;
-    quantity: number;
-    unitPrice: number;
-  }>;
-  shippingAddress: Address;
+export function createHATEOASResponse<T>(
+  data: T,
+  links: Record<string, Link>
+): HATEOASResponse<T> {
+  return { data, _links: links };
 }
-```
 
-```typescript
-// services/order/src/webhooks/webhook.service.ts
-
-@Injectable()
-export class WebhookService {
-  private readonly logger = new Logger(WebhookService.name);
-
-  constructor(
-    @InjectRepository(WebhookSubscription)
-    private readonly subscriptionRepo: Repository<WebhookSubscription>,
-    private readonly httpService: HttpService,
-    @InjectQueue('webhook-delivery')
-    private readonly webhookQueue: Queue,
-  ) {}
-
-  async deliver(
-    eventType: string,
-    data: unknown,
-  ): Promise<void> {
-    // Find all active subscriptions for this event type
-    const subscriptions = await this.subscriptionRepo.find({
-      where: {
-        events: Like(`%${eventType}%`),
-        isActive: true,
+// src/controllers/users.ts
+export class UsersController {
+  async getUser(req: Request, res: Response) {
+    const user = await userService.findById(req.params.id);
+    const baseUrl = `${req.protocol}://${req.get('host')}/api/v1`;
+    
+    const response = createHATEOASResponse(user, {
+      self: {
+        href: `${baseUrl}/users/${user.id}`,
+        rel: 'self',
+        method: 'GET',
+      },
+      update: {
+        href: `${baseUrl}/users/${user.id}`,
+        rel: 'update',
+        method: 'PATCH',
+        title: 'Update user',
+      },
+      delete: {
+        href: `${baseUrl}/users/${user.id}`,
+        rel: 'delete',
+        method: 'DELETE',
+        title: 'Delete user',
+      },
+      orders: {
+        href: `${baseUrl}/users/${user.id}/orders`,
+        rel: 'orders',
+        method: 'GET',
+        title: "User's orders",
       },
     });
-
-    for (const subscription of subscriptions) {
-      const payload: WebhookPayload = {
-        id: uuidv4(),
-        type: eventType,
-        version: '1.0',
-        createdAt: new Date().toISOString(),
-        source: {
-          service: 'order-service',
-          environment: process.env.NODE_ENV || 'production',
-        },
-        data,
-        attempt: 1,
-        maxAttempts: 5,
-      };
-
-      // Queue the delivery with retry logic
-      await this.webhookQueue.add(
-        'deliver',
-        {
-          subscriptionId: subscription.id,
-          webhookUrl: subscription.url,
-          signingSecret: subscription.signingSecret,
-          payload,
-        },
-        {
-          attempts: 5,
-          backoff: {
-            type: 'exponential',
-            delay: 1000, // 1s, 2s, 4s, 8s, 16s
-          },
-          removeOnComplete: 100,
-          removeOnFail: 200,
-        }
-      );
-    }
+    
+    return res.json(response);
   }
 
-  // HMAC signature สำหรับ webhook security
-  private signPayload(payload: WebhookPayload, secret: string): string {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const signedContent = `${timestamp}.${JSON.stringify(payload)}`;
+  async listUsers(req: Request, res: Response) {
+    const { page = 1, limit = 20 } = req.query;
+    const result = await userService.findAll({ page: Number(page), limit: Number(limit) });
+    const baseUrl = `${req.protocol}://${req.get('host')}/api/v1`;
     
-    return `t=${timestamp},v1=${
-      crypto
-        .createHmac('sha256', secret)
-        .update(signedContent)
-        .digest('hex')
-    }`;
-  }
-
-  async sendWebhook(
-    url: string,
-    payload: WebhookPayload,
-    signingSecret: string,
-  ): Promise<void> {
-    const signature = this.signPayload(payload, signingSecret);
-    
-    await this.httpService.post(url, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Webhook-Signature': signature,
-        'X-Webhook-ID': payload.id,
-        'X-Webhook-Timestamp': new Date().toISOString(),
+    const links: Record<string, Link> = {
+      self: {
+        href: `${baseUrl}/users?page=${page}&limit=${limit}`,
+        rel: 'self',
+        method: 'GET',
       },
-      timeout: 30000, // 30 second timeout
-    }).toPromise();
-  }
-}
-```
-
-```typescript
-// ตัวอย่าง Webhook Verification ฝั่ง consumer:
-// services/delivery/src/webhooks/order-webhook.handler.ts
-
-@Controller('webhooks')
-export class OrderWebhookHandler {
-  @Post('orders')
-  async handleOrderEvent(
-    @Body() payload: WebhookPayload,
-    @Headers('x-webhook-signature') signature: string,
-    @RawBody() rawBody: Buffer,
-  ): Promise<void> {
-    // Verify signature
-    const isValid = this.verifySignature(rawBody, signature);
-    if (!isValid) {
-      throw new UnauthorizedException('Invalid webhook signature');
-    }
-
-    // Process idempotently using webhook ID
-    const alreadyProcessed = await this.redis.get(`webhook:${payload.id}`);
-    if (alreadyProcessed) {
-      return; // Already processed
-    }
-
-    await this.processWebhook(payload);
+    };
     
-    // Mark as processed (expire after 24 hours)
-    await this.redis.setex(`webhook:${payload.id}`, 86400, '1');
-  }
-
-  private verifySignature(body: Buffer, signature: string): boolean {
-    const [timestampPart, signaturePart] = signature.split(',');
-    const timestamp = timestampPart.replace('t=', '');
-    const receivedSig = signaturePart.replace('v1=', '');
-
-    // Reject webhooks older than 5 minutes
-    const webhookAge = Math.abs(
-      Date.now() / 1000 - parseInt(timestamp)
-    );
-    if (webhookAge > 300) {
-      return false;
+    if (result.meta.hasNext) {
+      links.next = {
+        href: `${baseUrl}/users?page=${Number(page) + 1}&limit=${limit}`,
+        rel: 'next',
+        method: 'GET',
+      };
     }
-
-    const expectedSig = crypto
-      .createHmac('sha256', process.env.WEBHOOK_SECRET)
-      .update(`${timestamp}.${body.toString('utf-8')}`)
-      .digest('hex');
-
-    return crypto.timingSafeEqual(
-      Buffer.from(receivedSig),
-      Buffer.from(expectedSig)
-    );
+    
+    if (result.meta.hasPrev) {
+      links.prev = {
+        href: `${baseUrl}/users?page=${Number(page) - 1}&limit=${limit}`,
+        rel: 'prev',
+        method: 'GET',
+      };
+    }
+    
+    links.first = {
+      href: `${baseUrl}/users?page=1&limit=${limit}`,
+      rel: 'first',
+      method: 'GET',
+    };
+    
+    links.last = {
+      href: `${baseUrl}/users?page=${result.meta.totalPages}&limit=${limit}`,
+      rel: 'last',
+      method: 'GET',
+    };
+    
+    return res.json({
+      data: result.data,
+      _links: links,
+      _meta: result.meta,
+    });
   }
 }
 ```
 
 ---
 
-## OpenAPI Documentation Best Practices
+## 7. API Response Formats and Error Codes
+
+### 7.1 Standardized Response Format
 
 ```typescript
-// main.ts - OpenAPI setup
-
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-
-  const config = new DocumentBuilder()
-    .setTitle('Order Service API')
-    .setDescription(`
-      ## Overview
-      The Order Service manages the complete order lifecycle from creation to delivery.
-      
-      ## Authentication
-      All endpoints require Bearer token authentication.
-      Use the \`/auth/login\` endpoint to obtain a token.
-      
-      ## Versioning
-      This API uses URL versioning: \`/api/v1/...\`, \`/api/v2/...\`
-      
-      ## Rate Limiting
-      - Standard: 100 requests/minute
-      - Premium: 1000 requests/minute
-      
-      ## Idempotency
-      POST endpoints support idempotency via the \`Idempotency-Key\` header.
-    `)
-    .setVersion('1.0')
-    .addBearerAuth()
-    .addServer('https://api.company.com', 'Production')
-    .addServer('https://api-staging.company.com', 'Staging')
-    .addTag('orders', 'Order management')
-    .addTag('order-items', 'Order item management')
-    .build();
-
-  const document = SwaggerModule.createDocument(app, config);
-  
-  SwaggerModule.setup('api/docs', app, document, {
-    swaggerOptions: {
-      persistAuthorization: true,
-      tagsSorter: 'alpha',
-      operationsSorter: 'alpha',
-    },
-  });
+// src/utils/response.ts
+interface ApiSuccess<T> {
+  success: true;
+  data: T;
+  meta?: {
+    timestamp: string;
+    requestId: string;
+    version: string;
+  };
 }
+
+interface ApiError {
+  success: false;
+  error: {
+    code: string;
+    message: string;
+    details?: ErrorDetail[];
+    timestamp: string;
+    requestId: string;
+    documentation?: string;
+  };
+}
+
+interface ErrorDetail {
+  field?: string;
+  code: string;
+  message: string;
+}
+
+type ApiResponse<T> = ApiSuccess<T> | ApiError;
+
+export class ResponseBuilder {
+  static success<T>(data: T, requestId: string): ApiSuccess<T> {
+    return {
+      success: true,
+      data,
+      meta: {
+        timestamp: new Date().toISOString(),
+        requestId,
+        version: process.env.API_VERSION || '1.0.0',
+      },
+    };
+  }
+
+  static error(
+    code: string,
+    message: string,
+    requestId: string,
+    details?: ErrorDetail[]
+  ): ApiError {
+    return {
+      success: false,
+      error: {
+        code,
+        message,
+        details,
+        timestamp: new Date().toISOString(),
+        requestId,
+        documentation: `https://docs.example.com/errors/${code}`,
+      },
+    };
+  }
+}
+
+// Error codes ที่ใช้บ่อย
+export const ERROR_CODES = {
+  // Authentication
+  AUTH_TOKEN_MISSING: 'AUTH_TOKEN_MISSING',
+  AUTH_TOKEN_INVALID: 'AUTH_TOKEN_INVALID',
+  AUTH_TOKEN_EXPIRED: 'AUTH_TOKEN_EXPIRED',
+  
+  // Authorization
+  PERMISSION_DENIED: 'PERMISSION_DENIED',
+  INSUFFICIENT_SCOPE: 'INSUFFICIENT_SCOPE',
+  
+  // Validation
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  INVALID_FIELD: 'INVALID_FIELD',
+  REQUIRED_FIELD_MISSING: 'REQUIRED_FIELD_MISSING',
+  
+  // Resource
+  RESOURCE_NOT_FOUND: 'RESOURCE_NOT_FOUND',
+  RESOURCE_ALREADY_EXISTS: 'RESOURCE_ALREADY_EXISTS',
+  RESOURCE_CONFLICT: 'RESOURCE_CONFLICT',
+  RESOURCE_DELETED: 'RESOURCE_DELETED',
+  
+  // Rate Limiting
+  RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
+  QUOTA_EXCEEDED: 'QUOTA_EXCEEDED',
+  
+  // Server
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  DATABASE_ERROR: 'DATABASE_ERROR',
+} as const;
+```
+
+### 7.2 Global Error Handler
+
+```typescript
+// src/middleware/error-handler.ts
+import { Request, Response, NextFunction } from 'express';
+import { ResponseBuilder, ERROR_CODES } from '../utils/response';
+
+export class AppError extends Error {
+  constructor(
+    public statusCode: number,
+    public code: string,
+    message: string,
+    public details?: any[]
+  ) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
+
+export const errorHandler = (
+  err: Error,
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  const requestId = req.headers['x-request-id'] as string || 'unknown';
+
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json(
+      ResponseBuilder.error(err.code, err.message, requestId, err.details)
+    );
+  }
+
+  // Zod validation error
+  if (err.name === 'ZodError') {
+    const details = (err as any).errors.map((e: any) => ({
+      field: e.path.join('.'),
+      code: 'INVALID_FIELD',
+      message: e.message,
+    }));
+    
+    return res.status(422).json(
+      ResponseBuilder.error(
+        ERROR_CODES.VALIDATION_ERROR,
+        'Validation failed',
+        requestId,
+        details
+      )
+    );
+  }
+
+  // Default: Internal server error
+  console.error('Unhandled error:', err);
+  
+  return res.status(500).json(
+    ResponseBuilder.error(
+      ERROR_CODES.INTERNAL_ERROR,
+      'An unexpected error occurred',
+      requestId
+    )
+  );
+};
 ```
 
 ---
 
-## Rate Limiting
+## 8. Idempotency Keys
 
 ```typescript
-// shared/src/rate-limit/rate-limit.guard.ts
-
-import { Injectable, ExecutionContext, TooManyRequestsException } from '@nestjs/common';
-import { InjectRedis } from '@liaoliaots/nestjs-redis';
+// src/middleware/idempotency.ts
+import { Request, Response, NextFunction } from 'express';
 import Redis from 'ioredis';
 
-@Injectable()
-export class RateLimitGuard implements CanActivate {
-  constructor(
-    @InjectRedis() private readonly redis: Redis,
-    private readonly reflector: Reflector,
-  ) {}
+const redis = new Redis(process.env.REDIS_URL);
 
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest();
-    const response = context.switchToHttp().getResponse();
-    
-    const rateLimit = this.reflector.getAllAndOverride<RateLimitConfig>(
-      'rateLimit',
-      [context.getHandler(), context.getClass()]
-    ) || { limit: 100, window: 60 };
-
-    const key = `rate:${request.user?.id || request.ip}:${request.path}`;
-    
-    const [count] = await this.redis
-      .multi()
-      .incr(key)
-      .expire(key, rateLimit.window)
-      .exec();
-
-    const currentCount = count[1] as number;
-    const remaining = Math.max(0, rateLimit.limit - currentCount);
-    
-    response.setHeader('X-RateLimit-Limit', rateLimit.limit);
-    response.setHeader('X-RateLimit-Remaining', remaining);
-    response.setHeader(
-      'X-RateLimit-Reset',
-      Math.floor(Date.now() / 1000) + rateLimit.window
-    );
-
-    if (currentCount > rateLimit.limit) {
-      response.setHeader(
-        'Retry-After',
-        rateLimit.window.toString()
-      );
-      throw new TooManyRequestsException(
-        `Rate limit exceeded. Try again in ${rateLimit.window} seconds.`
-      );
-    }
-
-    return true;
-  }
+interface CachedResponse {
+  statusCode: number;
+  body: any;
+  headers: Record<string, string>;
+  createdAt: string;
 }
+
+export const idempotencyMiddleware = (ttlSeconds: number = 86400) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    // Only apply to POST, PUT, PATCH
+    if (!['POST', 'PUT', 'PATCH'].includes(req.method)) {
+      return next();
+    }
+    
+    const idempotencyKey = req.headers['idempotency-key'] as string;
+    if (!idempotencyKey) return next();
+    
+    // Validate key format (UUID v4)
+    const uuidV4Pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidV4Pattern.test(idempotencyKey)) {
+      return res.status(400).json({
+        error: {
+          code: 'INVALID_IDEMPOTENCY_KEY',
+          message: 'Idempotency-Key must be a valid UUID v4',
+        }
+      });
+    }
+    
+    const cacheKey = `idempotency:${req.path}:${idempotencyKey}`;
+    
+    // Check for existing response
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      const cachedResponse: CachedResponse = JSON.parse(cached);
+      
+      res.setHeader('Idempotency-Replayed', 'true');
+      res.setHeader('Idempotency-Key', idempotencyKey);
+      
+      Object.entries(cachedResponse.headers).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+      
+      return res.status(cachedResponse.statusCode).json(cachedResponse.body);
+    }
+    
+    // Check for in-flight request (concurrent requests with same key)
+    const inFlight = await redis.get(`${cacheKey}:in-flight`);
+    if (inFlight) {
+      return res.status(409).json({
+        error: {
+          code: 'IDEMPOTENCY_KEY_IN_USE',
+          message: 'A request with this idempotency key is already being processed',
+        }
+      });
+    }
+    
+    // Mark as in-flight
+    await redis.setex(`${cacheKey}:in-flight`, 30, '1');
+    
+    // Intercept response
+    const originalJson = res.json.bind(res);
+    res.json = (body: any) => {
+      const response: CachedResponse = {
+        statusCode: res.statusCode,
+        body,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        createdAt: new Date().toISOString(),
+      };
+      
+      // Cache successful responses only (2xx)
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        redis.setex(cacheKey, ttlSeconds, JSON.stringify(response));
+      }
+      
+      // Remove in-flight marker
+      redis.del(`${cacheKey}:in-flight`);
+      
+      res.setHeader('Idempotency-Key', idempotencyKey);
+      return originalJson(body);
+    };
+    
+    next();
+  };
+};
+
+// ใช้งาน:
+// POST /orders
+// Headers: Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 ```
 
 ---
 
-## สรุป
+## 9. API Deprecation Strategy
 
-การออกแบบ API ที่ดีต้องพิจารณาหลายมิติ:
+### 9.1 Deprecation Notice System
 
-| หัวข้อ | Best Practice | เหตุผล |
-|--------|---------------|--------|
-| Protocol | REST (public), gRPC (internal) | Performance + compatibility |
-| Resource Naming | Plural, lowercase, kebab-case | Consistency |
-| Versioning | URL path versioning | ชัดเจน, explicit |
-| Error Format | RFC 7807 Problem Details | Standard, machine-readable |
-| Pagination | Cursor-based for large datasets | Performance, consistency |
-| Idempotency | Idempotency-Key header | Safe retries |
-| Webhooks | HMAC signature + retry queue | Security + reliability |
-| Documentation | OpenAPI 3.0 | Developer experience |
+```typescript
+// src/services/deprecation.ts
+interface DeprecatedEndpoint {
+  path: string;
+  method: string;
+  deprecatedAt: Date;
+  sunsetAt: Date;
+  successor?: string;
+  migrationGuide?: string;
+  reason: string;
+}
 
-จำไว้ว่า API คือ "product" — ออกแบบโดยคำนึงถึง developer experience ของ consumer เสมอ และ backward compatibility คือ non-negotiable เมื่อ API อยู่ใน production แล้ว
+export const DEPRECATED_ENDPOINTS: DeprecatedEndpoint[] = [
+  {
+    path: '/api/v1/users',
+    method: 'GET',
+    deprecatedAt: new Date('2024-01-01'),
+    sunsetAt: new Date('2024-07-01'),
+    successor: '/api/v2/users',
+    migrationGuide: 'https://docs.example.com/migration/users-v1-to-v2',
+    reason: 'V2 includes cursor-based pagination and better performance',
+  },
+  {
+    path: '/api/v1/users/:id/profile',
+    method: 'GET',
+    deprecatedAt: new Date('2024-02-01'),
+    sunsetAt: new Date('2024-08-01'),
+    successor: '/api/v2/users/:id',
+    reason: 'Profile data merged into user object in v2',
+  },
+];
+
+export class DeprecationService {
+  findDeprecated(method: string, path: string): DeprecatedEndpoint | null {
+    return DEPRECATED_ENDPOINTS.find(endpoint => {
+      const pathPattern = endpoint.path.replace(/:[^/]+/g, '[^/]+');
+      const regex = new RegExp(`^${pathPattern}$`);
+      return endpoint.method === method && regex.test(path);
+    }) || null;
+  }
+  
+  isExpired(endpoint: DeprecatedEndpoint): boolean {
+    return new Date() > endpoint.sunsetAt;
+  }
+  
+  getDaysUntilSunset(endpoint: DeprecatedEndpoint): number {
+    const diff = endpoint.sunsetAt.getTime() - Date.now();
+    return Math.ceil(diff / (1000 * 60 * 60 * 24));
+  }
+}
+
+// Middleware
+export const deprecationMiddleware = (service: DeprecationService) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const deprecated = service.findDeprecated(req.method, req.path);
+    
+    if (!deprecated) return next();
+    
+    if (service.isExpired(deprecated)) {
+      return res.status(410).json({
+        error: {
+          code: 'ENDPOINT_GONE',
+          message: `This endpoint was removed on ${deprecated.sunsetAt.toISOString()}`,
+          successor: deprecated.successor,
+          migrationGuide: deprecated.migrationGuide,
+        }
+      });
+    }
+    
+    const daysLeft = service.getDaysUntilSunset(deprecated);
+    
+    res.setHeader('Deprecation', deprecated.deprecatedAt.toUTCString());
+    res.setHeader('Sunset', deprecated.sunsetAt.toUTCString());
+    res.setHeader('X-Deprecation-Days-Remaining', daysLeft.toString());
+    
+    if (deprecated.successor) {
+      res.setHeader('Link', `<${deprecated.successor}>; rel="successor-version"`);
+    }
+    
+    next();
+  };
+};
+```
+
+---
+
+## 10. API Mocking with Prism
+
+### 10.1 Setup Prism สำหรับ Mock Server
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  prism:
+    image: stoplight/prism:4
+    command: mock -h 0.0.0.0 /api/openapi.yaml
+    volumes:
+      - ./openapi.yaml:/api/openapi.yaml:ro
+    ports:
+      - "4010:4010"
+    environment:
+      - LOG_LEVEL=info
+  
+  # Prism as proxy (validates real requests)
+  prism-proxy:
+    image: stoplight/prism:4
+    command: proxy /api/openapi.yaml http://api:3000 -h 0.0.0.0
+    volumes:
+      - ./openapi.yaml:/api/openapi.yaml:ro
+    ports:
+      - "4011:4010"
+```
+
+### 10.2 Test Suite with Prism
+
+```typescript
+// tests/contract/prism-test.ts
+import axios from 'axios';
+import { spawn, ChildProcess } from 'child_process';
+
+const PRISM_PORT = 4010;
+const PRISM_URL = `http://localhost:${PRISM_PORT}`;
+
+let prismProcess: ChildProcess;
+
+beforeAll(async () => {
+  prismProcess = spawn('npx', [
+    '@stoplight/prism-cli',
+    'mock',
+    '-p', PRISM_PORT.toString(),
+    '-h', '0.0.0.0',
+    'openapi.yaml'
+  ]);
+  
+  // Wait for Prism to start
+  await new Promise(resolve => setTimeout(resolve, 2000));
+});
+
+afterAll(() => {
+  prismProcess.kill();
+});
+
+describe('Users API Contract Tests', () => {
+  test('GET /users returns valid response', async () => {
+    const response = await axios.get(`${PRISM_URL}/api/v1/users`, {
+      headers: { Authorization: 'Bearer mock-token' }
+    });
+    
+    expect(response.status).toBe(200);
+    expect(response.data).toHaveProperty('data');
+    expect(Array.isArray(response.data.data)).toBe(true);
+  });
+
+  test('POST /users creates user', async () => {
+    const response = await axios.post(
+      `${PRISM_URL}/api/v1/users`,
+      { name: 'Test User', email: 'test@example.com' },
+      { headers: { Authorization: 'Bearer mock-token' } }
+    );
+    
+    expect(response.status).toBe(201);
+    expect(response.data.data).toHaveProperty('id');
+  });
+
+  test('GET /users/:id returns 404 for unknown id', async () => {
+    try {
+      await axios.get(
+        `${PRISM_URL}/api/v1/users/00000000-0000-0000-0000-000000000000`,
+        { headers: { Authorization: 'Bearer mock-token' } }
+      );
+    } catch (error: any) {
+      expect(error.response.status).toBe(404);
+    }
+  });
+});
+```
+
+### 10.3 Consumer-Driven Contract Testing
+
+```typescript
+// tests/contract/pact-test.ts
+import { Pact, Interaction } from '@pact-foundation/pact';
+import axios from 'axios';
+import path from 'path';
+
+const provider = new Pact({
+  consumer: 'OrderService',
+  provider: 'UserService',
+  port: 4011,
+  dir: path.resolve(process.cwd(), 'pacts'),
+  log: path.resolve(process.cwd(), 'pacts/logs'),
+});
+
+describe('UserService Contract', () => {
+  beforeAll(() => provider.setup());
+  afterEach(() => provider.verify());
+  afterAll(() => provider.finalize());
+
+  describe('GET /users/:id', () => {
+    const userId = '550e8400-e29b-41d4-a716-446655440000';
+    
+    beforeEach(() => {
+      const interaction: Interaction = {
+        state: 'User exists',
+        uponReceiving: 'A request for user',
+        withRequest: {
+          method: 'GET',
+          path: `/api/v1/users/${userId}`,
+          headers: {
+            Authorization: 'Bearer token',
+          },
+        },
+        willRespondWith: {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: {
+            data: {
+              id: userId,
+              name: 'John Doe',
+              email: 'john@example.com',
+              role: 'user',
+            },
+          },
+        },
+      };
+      
+      return provider.addInteraction(interaction);
+    });
+
+    test('returns user data', async () => {
+      const response = await axios.get(
+        `http://localhost:4011/api/v1/users/${userId}`,
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      
+      expect(response.data.data.id).toBe(userId);
+      expect(response.data.data.name).toBe('John Doe');
+    });
+  });
+});
+```
+
+---
+
+## สรุปท้ายบท
+
+| หัวข้อ | แนวปฏิบัติที่ดีที่สุด | เครื่องมือ |
+|--------|---------------------|-----------|
+| RESTful Design | ใช้ nouns, HTTP methods ถูกต้อง, Status codes ถูกต้อง | - |
+| OpenAPI Specification | เขียน spec ก่อน code, ใช้ $ref สำหรับ reuse | swagger-ui, redoc |
+| Versioning | URL path versioning แนะนำสำหรับ public APIs | - |
+| Pagination | Cursor สำหรับ real-time, Offset สำหรับ simple cases | - |
+| Filtering | Standard filter syntax, sanitize inputs | - |
+| HATEOAS | ใส่ _links ใน response | - |
+| Error Handling | Standard error format, machine-readable codes | - |
+| Idempotency | UUID keys, Redis caching | Redis |
+| Deprecation | RFC 8594 headers, sunset dates | - |
+| API Mocking | Prism สำหรับ mock และ validation | Stoplight Prism |
+
+### คำแนะนำสำหรับ Production
+
+1. **เสมอใช้ HTTPS** - ไม่มี HTTP ใน production
+2. **Rate Limiting** - ทุก endpoint ต้องมี rate limit
+3. **Request Validation** - validate ที่ edge ก่อนถึง business logic
+4. **Response Compression** - ใช้ gzip/brotli compression
+5. **API Gateway** - ใช้สำหรับ centralized authentication, rate limiting, logging
+6. **Monitoring** - ติดตาม latency, error rates, traffic patterns
+7. **Documentation** - อัปเดต OpenAPI spec ทุกครั้งที่เปลี่ยน API
