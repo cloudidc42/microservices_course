@@ -1,161 +1,270 @@
-# Part 55: Configuration Management
+# Part 55: Configuration Management — Kubernetes Secrets, External Secrets, Hot-reload, และ Feature Flags
 
-## บทนำ
-
-Configuration Management ใน Microservices เป็นเรื่องสำคัญมาก เพราะ Service หลายสิบตัวต้องจัดการ Config ที่แตกต่างกันในแต่ละ Environment (dev/staging/production) ปัญหาที่พบบ่อยคือ Config Drift, Secret Management, และการ Reload Config โดยไม่ต้อง Restart Service
+ในบทนี้เราจะเรียนรู้การจัดการ Configuration ใน Microservices อย่างครบถ้วน ตั้งแต่ Kubernetes ConfigMaps/Secrets, External Secrets Operator, Hot-reload Config, Feature Flags ด้วย Flagsmith, ไปจนถึง Config Validation
 
 ---
 
-## 1. Kubernetes ConfigMaps
+## 1. Kubernetes ConfigMaps และ Secrets Best Practices
 
-### 1.1 สร้าง ConfigMap
+### 1.1 ConfigMap สำหรับ Non-sensitive Config
 
 ```yaml
-# k8s/configmaps/order-service.yaml
+# kubernetes/config/order-service-config.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: order-service-config
-  namespace: microservices
+  namespace: production
   labels:
     app: order-service
-    managed-by: helm
+    version: "1.5.0"
+  annotations:
+    config.kubernetes.io/last-applied-configuration: "managed-by-gitops"
 data:
-  # Simple key-value
+  # Application config
+  APP_PORT: "3000"
   LOG_LEVEL: "info"
-  MAX_CONNECTIONS: "100"
-  REQUEST_TIMEOUT_MS: "30000"
-  ENABLE_METRICS: "true"
+  LOG_FORMAT: "json"
+  NODE_ENV: "production"
+  SERVICE_NAME: "order-service"
+  SERVICE_VERSION: "1.5.0"
   
-  # JSON config
-  rate-limit.json: |
+  # Feature flags (non-sensitive)
+  FEATURE_NEW_CHECKOUT: "true"
+  FEATURE_LOYALTY_POINTS: "false"
+  
+  # Performance tuning
+  DB_POOL_MIN: "5"
+  DB_POOL_MAX: "20"
+  DB_STATEMENT_TIMEOUT: "30000"
+  REDIS_POOL_SIZE: "10"
+  
+  # Timeouts
+  HTTP_TIMEOUT_MS: "30000"
+  EXTERNAL_SERVICE_TIMEOUT_MS: "5000"
+  
+  # Business rules
+  MAX_ORDER_ITEMS: "50"
+  MAX_ORDER_VALUE_USD: "10000"
+  ORDER_EXPIRY_MINUTES: "30"
+  
+  # OpenTelemetry
+  OTEL_COLLECTOR_URL: "http://otel-collector.observability:4318"
+  OTEL_SAMPLE_RATE: "0.1"
+  
+  # Mounted as file for complex config
+  app-config.json: |
     {
-      "windowMs": 60000,
-      "maxRequests": 1000,
-      "skipFailedRequests": false,
-      "keyBy": "userId"
+      "rateLimiting": {
+        "windowMs": 900000,
+        "maxRequests": 100,
+        "skipSuccessfulRequests": false
+      },
+      "cors": {
+        "allowedOrigins": [
+          "https://app.example.com",
+          "https://admin.example.com"
+        ],
+        "allowedMethods": ["GET", "POST", "PUT", "DELETE"]
+      },
+      "pagination": {
+        "defaultLimit": 20,
+        "maxLimit": 100
+      }
     }
-  
-  # YAML config
-  features.yaml: |
-    features:
-      new_checkout_flow: false
-      loyalty_points: true
-      express_delivery: true
-      cod_payment: false
-    
-    ab_tests:
-      checkout_v2:
-        enabled: true
-        percentage: 20
+
+---
+# Separate ConfigMap for database config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-db-config
+  namespace: production
+data:
+  DB_HOST: "postgres-primary.database:5432"
+  DB_READ_HOST: "postgres-replica.database:5432"
+  DB_NAME: "orders"
+  DB_SSL_MODE: "require"
+  DB_SSL_CA_CERT_PATH: "/etc/ssl/certs/rds-ca.pem"
 ```
 
-### 1.2 Mount ConfigMap ใน Pod
+### 1.2 Secrets Management Best Practices
 
 ```yaml
-# k8s/deployments/order-service.yaml
+# kubernetes/secrets/order-service-secrets.yaml
+# NEVER commit actual secrets to git
+# Use sealed-secrets or external-secrets instead
+
+# Option 1: Sealed Secrets (encrypted at rest in git)
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: order-service-secrets
+  namespace: production
+spec:
+  encryptedData:
+    # Encrypted with cluster's public key
+    DB_PASSWORD: AgBy8hCl...truncated...
+    JWT_SECRET: AgCX8pqr...truncated...
+    STRIPE_SECRET_KEY: AgDY7mnp...truncated...
+
+---
+# Option 2: ExternalSecret (recommended for production)
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: order-service-secrets
+  namespace: production
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  target:
+    name: order-service-secrets
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      metadata:
+        labels:
+          app: order-service
+      data:
+        # Template to transform secret values if needed
+        DATABASE_URL: "postgresql://{{ .username }}:{{ .password }}@{{ .host }}/{{ .database }}?ssl=true"
+  data:
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: production/order-service/database
+        property: password
+    - secretKey: DB_USERNAME
+      remoteRef:
+        key: production/order-service/database
+        property: username
+    - secretKey: JWT_SECRET
+      remoteRef:
+        key: production/order-service/jwt
+        property: secret
+    - secretKey: STRIPE_SECRET_KEY
+      remoteRef:
+        key: production/order-service/stripe
+        property: secret_key
+    - secretKey: REDIS_PASSWORD
+      remoteRef:
+        key: production/infrastructure/redis
+        property: password
+  dataFrom:
+    # Bulk import all fields from a secret
+    - extract:
+        key: production/order-service/oauth
+        conversionStrategy: Default
+        decodingStrategy: None
+```
+
+### 1.3 Deployment ที่ใช้ ConfigMap และ Secrets
+
+```yaml
+# kubernetes/deployments/order-service.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: order-service
-  namespace: microservices
+  namespace: production
 spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
   template:
+    metadata:
+      labels:
+        app: order-service
+        version: "1.5.0"
+      annotations:
+        # Force pod restart when config changes
+        checksum/config: "{{ include (print $.Template.BasePath '/configmap.yaml') . | sha256sum }}"
+        checksum/secret: "{{ include (print $.Template.BasePath '/secret.yaml') . | sha256sum }}"
     spec:
+      containers:
+        - name: order-service
+          image: order-service:1.5.0
+          ports:
+            - containerPort: 3000
+          
+          # Environment variables from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: order-service-config
+            - configMapRef:
+                name: order-service-db-config
+            - secretRef:
+                name: order-service-secrets
+          
+          # Additional specific env vars
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          
+          # Mount config file
+          volumeMounts:
+            - name: app-config
+              mountPath: /app/config
+              readOnly: true
+            - name: ssl-certs
+              mountPath: /etc/ssl/certs
+              readOnly: true
+          
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      
       volumes:
-        - name: config
+        - name: app-config
           configMap:
             name: order-service-config
             items:
-              - key: rate-limit.json
-                path: rate-limit.json
-              - key: features.yaml
-                path: features.yaml
-      containers:
-        - name: order-service
-          image: myrepo/order-service:1.0.0
-          env:
-            # Environment variables from ConfigMap
-            - name: LOG_LEVEL
-              valueFrom:
-                configMapKeyRef:
-                  name: order-service-config
-                  key: LOG_LEVEL
-            - name: MAX_CONNECTIONS
-              valueFrom:
-                configMapKeyRef:
-                  name: order-service-config
-                  key: MAX_CONNECTIONS
-          volumeMounts:
-            - name: config
-              mountPath: /app/config
-              readOnly: true
+              - key: app-config.json
+                path: app-config.json
+        - name: ssl-certs
+          secret:
+            secretName: rds-ca-certs
 ```
 
 ---
 
-## 2. Kubernetes Secrets
+## 2. External Secrets Operator กับ AWS Secrets Manager
+
+### 2.1 ClusterSecretStore Setup
 
 ```yaml
-# k8s/secrets/order-service.yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: order-service-secrets
-  namespace: microservices
-  annotations:
-    # ใช้ External Secrets Operator annotations
-    externalsecrets.io/source: aws-secrets-manager
-type: Opaque
-stringData:
-  DATABASE_URL: "postgresql://user:pass@postgres:5432/orders"
-  JWT_SECRET: "change-me-in-production"
-  STRIPE_SECRET_KEY: "sk_live_..."
----
-# RBAC สำหรับ Service Account
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: order-service-sa
-  namespace: microservices
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/order-service-role
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: order-service-role
-  namespace: microservices
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: ["order-service-config"]
-    verbs: ["get", "watch", "list"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["order-service-secrets"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: order-service-role-binding
-  namespace: microservices
-subjects:
-  - kind: ServiceAccount
-    name: order-service-sa
-roleRef:
-  kind: Role
-  name: order-service-role
-  apiGroup: rbac.authorization.k8s.io
-```
-
----
-
-## 3. External Secrets Operator กับ AWS Secrets Manager
-
-```yaml
-# k8s/external-secrets/secret-store.yaml
+# kubernetes/external-secrets/cluster-secret-store.yaml
 apiVersion: external-secrets.io/v1beta1
 kind: ClusterSecretStore
 metadata:
@@ -164,1120 +273,847 @@ spec:
   provider:
     aws:
       service: SecretsManager
-      region: ap-southeast-1
+      region: us-east-1
+      # Use IRSA (IAM Roles for Service Accounts)
       auth:
         jwt:
           serviceAccountRef:
             name: external-secrets-sa
             namespace: external-secrets
+
 ---
-# ExternalSecret สำหรับ Order Service
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  name: order-service-secrets
-  namespace: microservices
-spec:
-  refreshInterval: 5m  # ดึงใหม่ทุก 5 นาที
-  secretStoreRef:
-    name: aws-secrets-manager
-    kind: ClusterSecretStore
-  target:
-    name: order-service-secrets
-    creationPolicy: Owner
-    deletionPolicy: Retain
-    template:
-      type: Opaque
-      data:
-        DATABASE_URL: "{{ .db_url }}"
-        JWT_SECRET: "{{ .jwt_secret }}"
-        STRIPE_SECRET_KEY: "{{ .stripe_key }}"
-  data:
-    - secretKey: db_url
-      remoteRef:
-        key: microservices/production/order-service
-        property: database_url
-    - secretKey: jwt_secret
-      remoteRef:
-        key: microservices/production/shared
-        property: jwt_secret
-    - secretKey: stripe_key
-      remoteRef:
-        key: microservices/production/payment
-        property: stripe_secret_key
+  name: external-secrets-sa
+  namespace: external-secrets
+  annotations:
+    # IRSA annotation pointing to IAM role
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/external-secrets-role
 ```
 
-### 3.1 AWS Secrets Manager Client
+### 2.2 IAM Policy
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSecretManagerRead",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:ListSecretVersionIds"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:us-east-1:123456789:secret:production/*"
+      ]
+    },
+    {
+      "Sid": "AllowKMSDecrypt",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": [
+        "arn:aws:kms:us-east-1:123456789:key/your-kms-key-id"
+      ]
+    }
+  ]
+}
+```
+
+### 2.3 TypeScript Secret Manager Client
 
 ```typescript
-// packages/shared/src/config/secrets.manager.ts
-
+// src/config/secrets-manager.ts
 import {
   SecretsManagerClient,
   GetSecretValueCommand,
-  DescribeSecretCommand,
+  ListSecretVersionIdsCommand,
 } from '@aws-sdk/client-secrets-manager';
+import NodeCache from 'node-cache';
 
-interface SecretCache {
-  value: Record<string, string>;
-  expiresAt: number;
-  versionId: string;
-}
+const secretsCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
 
 export class SecretsManager {
   private readonly client: SecretsManagerClient;
-  private readonly cache: Map<string, SecretCache> = new Map();
-  private readonly ttlMs: number;
-
-  constructor(
-    region = process.env.AWS_REGION ?? 'ap-southeast-1',
-    cacheTtlMs = 5 * 60 * 1000 // 5 minutes
-  ) {
-    this.client = new SecretsManagerClient({ region });
-    this.ttlMs = cacheTtlMs;
-  }
-
-  async getSecret(secretName: string): Promise<Record<string, string>> {
-    const cached = this.cache.get(secretName);
-    if (cached && Date.now() < cached.expiresAt) {
-      return cached.value;
-    }
-
-    const command = new GetSecretValueCommand({
-      SecretId: secretName,
-      VersionStage: 'AWSCURRENT',
+  
+  constructor() {
+    this.client = new SecretsManagerClient({
+      region: process.env.AWS_REGION || 'us-east-1',
+      // Uses IRSA in Kubernetes, instance profile on EC2, or env vars locally
     });
-
-    const response = await this.client.send(command);
-    const secretString = response.SecretString;
-
-    if (!secretString) {
-      throw new Error(`Secret ${secretName} has no string value`);
+  }
+  
+  async getSecret<T = Record<string, string>>(secretId: string): Promise<T> {
+    const cached = secretsCache.get<T>(secretId);
+    if (cached !== undefined) {
+      return cached;
     }
-
-    const value = JSON.parse(secretString) as Record<string, string>;
-
-    this.cache.set(secretName, {
-      value,
-      expiresAt: Date.now() + this.ttlMs,
-      versionId: response.VersionId ?? '',
-    });
-
-    return value;
-  }
-
-  async getSecretValue(secretName: string, key: string): Promise<string> {
-    const secret = await this.getSecret(secretName);
-    const value = secret[key];
-    if (!value) {
-      throw new Error(`Key ${key} not found in secret ${secretName}`);
+    
+    try {
+      const command = new GetSecretValueCommand({ SecretId: secretId });
+      const response = await this.client.send(command);
+      
+      let secret: T;
+      if (response.SecretString) {
+        try {
+          secret = JSON.parse(response.SecretString) as T;
+        } catch {
+          secret = response.SecretString as unknown as T;
+        }
+      } else if (response.SecretBinary) {
+        secret = Buffer.from(response.SecretBinary).toString('base64') as unknown as T;
+      } else {
+        throw new Error(`Secret ${secretId} has no value`);
+      }
+      
+      secretsCache.set(secretId, secret);
+      return secret;
+    } catch (error) {
+      console.error(`Failed to retrieve secret ${secretId}:`, error);
+      throw error;
     }
-    return value;
   }
-
-  // Rotate secret — invalidate cache
-  invalidateCache(secretName: string): void {
-    this.cache.delete(secretName);
-  }
-
-  invalidateAllCaches(): void {
-    this.cache.clear();
+  
+  async invalidateCache(secretId: string): Promise<void> {
+    secretsCache.del(secretId);
   }
 }
+
+export const secretsManager = new SecretsManager();
 ```
 
 ---
 
-## 4. Config Hot-Reloading
+## 3. Hot-reload Config โดยไม่ Restart
 
 ```typescript
-// packages/shared/src/config/config.watcher.ts
-// Watch ConfigMap files สำหรับ hot-reload
-
+// src/config/hot-reload.ts
 import fs from 'fs';
 import path from 'path';
 import { EventEmitter } from 'events';
-import yaml from 'js-yaml';
+import chokidar from 'chokidar';
+import { z } from 'zod';
 
-type ConfigValue = string | number | boolean | Record<string, unknown> | ConfigValue[];
+const AppConfigSchema = z.object({
+  rateLimiting: z.object({
+    windowMs: z.number().int().positive(),
+    maxRequests: z.number().int().positive(),
+    skipSuccessfulRequests: z.boolean(),
+  }),
+  cors: z.object({
+    allowedOrigins: z.array(z.string().url()),
+    allowedMethods: z.array(z.string()),
+  }),
+  pagination: z.object({
+    defaultLimit: z.number().int().positive().max(100),
+    maxLimit: z.number().int().positive().max(1000),
+  }),
+  features: z.record(z.boolean()).optional().default({}),
+});
 
-interface ConfigChangeEvent {
-  key: string;
-  oldValue: ConfigValue;
-  newValue: ConfigValue;
-}
+type AppConfig = z.infer<typeof AppConfigSchema>;
 
-export class ConfigWatcher extends EventEmitter {
-  private readonly watchers: Map<string, fs.FSWatcher> = new Map();
-  private readonly configs: Map<string, ConfigValue> = new Map();
-  private readonly debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-
-  constructor(private readonly configDir: string) {
+class ConfigManager extends EventEmitter {
+  private config: AppConfig;
+  private readonly configPath: string;
+  private watcher?: chokidar.FSWatcher;
+  
+  constructor(configPath: string) {
     super();
+    this.configPath = path.resolve(configPath);
+    this.config = this.loadConfig();
   }
-
-  watch(filename: string, key: string): void {
-    const filePath = path.join(this.configDir, filename);
-
-    // Initial load
-    this.loadFile(filePath, key);
-
-    // Watch for changes (Kubernetes updates ConfigMap files atomically)
-    const watcher = fs.watch(filePath, { persistent: false }, (event) => {
-      if (event === 'change' || event === 'rename') {
-        // Debounce เพราะ Kubernetes อาจ write หลายครั้ง
-        const existing = this.debounceTimers.get(key);
-        if (existing) clearTimeout(existing);
-
-        this.debounceTimers.set(
-          key,
-          setTimeout(() => {
-            this.loadFile(filePath, key);
-            this.debounceTimers.delete(key);
-          }, 100)
-        );
-      }
-    });
-
-    this.watchers.set(key, watcher);
-    console.log(`[ConfigWatcher] Watching: ${filePath} as "${key}"`);
-  }
-
-  get<T = ConfigValue>(key: string): T {
-    return this.configs.get(key) as T;
-  }
-
-  stopAll(): void {
-    for (const [key, watcher] of this.watchers) {
-      watcher.close();
-      this.watchers.delete(key);
-    }
-    for (const timer of this.debounceTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.debounceTimers.clear();
-  }
-
-  private loadFile(filePath: string, key: string): void {
+  
+  private loadConfig(): AppConfig {
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const ext = path.extname(filePath).toLowerCase();
-
-      let newValue: ConfigValue;
-
-      if (ext === '.json') {
-        newValue = JSON.parse(content) as Record<string, unknown>;
-      } else if (ext === '.yaml' || ext === '.yml') {
-        newValue = yaml.load(content) as Record<string, unknown>;
-      } else {
-        newValue = content.trim();
-      }
-
-      const oldValue = this.configs.get(key);
-      this.configs.set(key, newValue);
-
-      if (oldValue !== undefined) {
-        const event: ConfigChangeEvent = { key, oldValue, newValue };
-        this.emit('change', event);
-        this.emit(`change:${key}`, event);
-        console.log(`[ConfigWatcher] Config changed: ${key}`);
-      } else {
-        this.emit('loaded', { key, value: newValue });
-      }
+      const raw = fs.readFileSync(this.configPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      const validated = AppConfigSchema.parse(parsed);
+      console.log(`Config loaded from ${this.configPath}`);
+      return validated;
     } catch (error) {
-      console.error(`[ConfigWatcher] Error loading ${filePath}:`, error);
-      this.emit('error', { key, error });
+      console.error(`Failed to load config from ${this.configPath}:`, error);
+      
+      if (this.config) {
+        console.warn('Using previous config due to load error');
+        return this.config;
+      }
+      
+      throw error;
     }
   }
-}
-
-// ─── Application Config Manager ───────────────────────────────────────────
-
-export class AppConfigManager {
-  private readonly watcher: ConfigWatcher;
-  private readonly rateLimitListeners: Array<(config: RateLimitConfig) => void> = [];
-  private readonly featureFlagListeners: Array<(config: FeatureFlagsConfig) => void> = [];
-
-  constructor(configDir = process.env.CONFIG_DIR ?? '/app/config') {
-    this.watcher = new ConfigWatcher(configDir);
-
-    this.watcher.watch('rate-limit.json', 'rateLimit');
-    this.watcher.watch('features.yaml', 'features');
-
-    this.watcher.on('change:rateLimit', ({ newValue }) => {
-      const config = newValue as RateLimitConfig;
-      console.log('[Config] Rate limit config updated:', config);
-      this.rateLimitListeners.forEach((fn) => fn(config));
+  
+  startWatching(): void {
+    this.watcher = chokidar.watch(this.configPath, {
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: {
+        stabilityThreshold: 500,
+        pollInterval: 100,
+      },
     });
-
-    this.watcher.on('change:features', ({ newValue }) => {
-      const config = newValue as FeatureFlagsConfig;
-      console.log('[Config] Feature flags updated:', config);
-      this.featureFlagListeners.forEach((fn) => fn(config));
+    
+    this.watcher.on('change', (filePath) => {
+      console.log(`Config file changed: ${filePath}`);
+      
+      const oldConfig = { ...this.config };
+      const newConfig = this.loadConfig();
+      
+      if (JSON.stringify(oldConfig) !== JSON.stringify(newConfig)) {
+        this.config = newConfig;
+        this.emit('config:changed', newConfig, oldConfig);
+        console.log('Config reloaded successfully');
+      }
     });
+    
+    this.watcher.on('error', (error) => {
+      console.error('Config watcher error:', error);
+    });
+    
+    console.log(`Watching config file: ${this.configPath}`);
   }
-
-  getRateLimitConfig(): RateLimitConfig {
-    return this.watcher.get<RateLimitConfig>('rateLimit') ?? defaultRateLimitConfig;
+  
+  async stopWatching(): Promise<void> {
+    if (this.watcher) {
+      await this.watcher.close();
+      this.watcher = undefined;
+    }
   }
-
-  getFeatureFlags(): FeatureFlagsConfig {
-    return this.watcher.get<FeatureFlagsConfig>('features') ?? defaultFeatureFlags;
+  
+  get<K extends keyof AppConfig>(key: K): AppConfig[K] {
+    return this.config[key];
   }
-
+  
+  getAll(): Readonly<AppConfig> {
+    return Object.freeze({ ...this.config });
+  }
+  
   isFeatureEnabled(featureName: string): boolean {
-    const flags = this.getFeatureFlags();
-    return flags.features?.[featureName] === true;
-  }
-
-  onRateLimitChange(listener: (config: RateLimitConfig) => void): void {
-    this.rateLimitListeners.push(listener);
-  }
-
-  onFeatureFlagsChange(listener: (config: FeatureFlagsConfig) => void): void {
-    this.featureFlagListeners.push(listener);
-  }
-
-  destroy(): void {
-    this.watcher.stopAll();
+    return this.config.features?.[featureName] ?? false;
   }
 }
 
-interface RateLimitConfig {
-  windowMs: number;
-  maxRequests: number;
-  skipFailedRequests: boolean;
-  keyBy: string;
+export const configManager = new ConfigManager(
+  process.env.APP_CONFIG_PATH || '/app/config/app-config.json'
+);
+
+// Start watching in production
+if (process.env.NODE_ENV === 'production') {
+  configManager.startWatching();
 }
 
-interface FeatureFlagsConfig {
-  features: Record<string, boolean>;
-  ab_tests: Record<string, { enabled: boolean; percentage: number }>;
+// Log config changes
+configManager.on('config:changed', (newConfig: AppConfig, oldConfig: AppConfig) => {
+  console.log('Config change detected:', {
+    changes: detectChanges(oldConfig, newConfig),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+function detectChanges(old: any, next: any, path = ''): string[] {
+  const changes: string[] = [];
+  
+  for (const key of Object.keys({ ...old, ...next })) {
+    const fullPath = path ? `${path}.${key}` : key;
+    
+    if (JSON.stringify(old[key]) !== JSON.stringify(next[key])) {
+      changes.push(fullPath);
+    }
+  }
+  
+  return changes;
 }
 
-const defaultRateLimitConfig: RateLimitConfig = {
-  windowMs: 60000,
-  maxRequests: 1000,
-  skipFailedRequests: false,
-  keyBy: 'ip',
-};
+// Hot-reload middleware for rate limiting
+export function createHotReloadableRateLimiter() {
+  let currentLimiter = createRateLimiter(configManager.get('rateLimiting'));
+  
+  configManager.on('config:changed', (newConfig: AppConfig) => {
+    currentLimiter = createRateLimiter(newConfig.rateLimiting);
+    console.log('Rate limiter config updated', newConfig.rateLimiting);
+  });
+  
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    currentLimiter(req, res, next);
+  };
+}
 
-const defaultFeatureFlags: FeatureFlagsConfig = {
-  features: {},
-  ab_tests: {},
-};
+function createRateLimiter(config: AppConfig['rateLimiting']) {
+  return rateLimit({
+    windowMs: config.windowMs,
+    max: config.maxRequests,
+    skipSuccessfulRequests: config.skipSuccessfulRequests,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+}
 ```
 
 ---
 
-## 5. Feature Flags กับ Flagsmith
+## 4. Feature Flags ด้วย Flagsmith (Self-hosted)
+
+### 4.1 Flagsmith Kubernetes Deployment
+
+```yaml
+# kubernetes/flagsmith/flagsmith.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flagsmith
+  namespace: flagsmith
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flagsmith
+  template:
+    metadata:
+      labels:
+        app: flagsmith
+    spec:
+      containers:
+        - name: flagsmith
+          image: flagsmith/flagsmith:2.95.0
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: flagsmith-secrets
+                  key: DATABASE_URL
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: flagsmith-secrets
+                  key: SECRET_KEY
+            - name: DJANGO_ALLOWED_HOSTS
+              value: "flagsmith.internal.example.com,flagsmith.flagsmith"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: flagsmith-secrets
+                  key: REDIS_URL
+            - name: ALLOW_REGISTRATION_WITHOUT_INVITE
+              value: "false"
+            - name: ENABLE_TELEMETRY
+              value: "false"
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+```
+
+### 4.2 Feature Flag Service TypeScript
 
 ```typescript
-// packages/shared/src/feature-flags/flagsmith.client.ts
-
+// src/config/feature-flags.ts
 import Flagsmith from 'flagsmith-nodejs';
+import { log } from '../telemetry/logger';
 
-interface FeatureFlagContext {
-  userId?: string;
-  email?: string;
-  traits?: Record<string, string | number | boolean>;
+interface FeatureFlag {
+  enabled: boolean;
+  value?: string | number | boolean | null;
 }
 
-export class FeatureFlagService {
-  private readonly flagsmith: Flagsmith;
-  private initialized = false;
+interface FlagsmithConfig {
+  environmentKey: string;
+  apiUrl?: string;
+  enableLocalEvaluation?: boolean;
+  environmentRefreshIntervalSeconds?: number;
+}
 
-  constructor(
-    private readonly environmentKey: string,
-    options: {
-      apiUrl?: string;
-      cacheTtlSeconds?: number;
-      enableLocalEvaluation?: boolean;
-    } = {}
-  ) {
-    this.flagsmith = new Flagsmith({
-      environmentKey,
-      apiUrl: options.apiUrl ?? 'https://edge.api.flagsmith.com/api/v1/',
-      enableLocalEvaluation: options.enableLocalEvaluation ?? true,
-      environmentRefreshIntervalSeconds: options.cacheTtlSeconds ?? 60,
-      onEnvironmentChange: (oldEnv, newEnv) => {
-        console.log('[Flagsmith] Environment updated');
+class FeatureFlagService {
+  private client: ReturnType<typeof Flagsmith.init> | null = null;
+  private localCache = new Map<string, FeatureFlag>();
+  private initialized = false;
+  
+  async initialize(config: FlagsmithConfig): Promise<void> {
+    this.client = Flagsmith.init({
+      environmentKey: config.environmentKey,
+      apiUrl: config.apiUrl || 'https://flagsmith.internal.example.com/api/v1/',
+      enableLocalEvaluation: config.enableLocalEvaluation ?? true,
+      environmentRefreshIntervalSeconds: config.environmentRefreshIntervalSeconds ?? 60,
+      onEnvironmentChange: (flags) => {
+        log.info('Feature flags updated', {
+          flagCount: Object.keys(flags.flags).length,
+        });
       },
     });
+    
+    await this.client.init();
+    this.initialized = true;
+    
+    log.info('Feature flag service initialized');
   }
-
-  async initialize(): Promise<void> {
-    if (!this.initialized) {
-      await this.flagsmith.init();
-      this.initialized = true;
-      console.log('[Flagsmith] Initialized');
+  
+  async isEnabled(featureName: string, userId?: string): Promise<boolean> {
+    if (!this.initialized || !this.client) {
+      return this.localCache.get(featureName)?.enabled ?? false;
     }
-  }
-
-  async isEnabled(
-    featureName: string,
-    context?: FeatureFlagContext
-  ): Promise<boolean> {
-    await this.initialize();
-
-    if (context?.userId) {
-      const flags = await this.flagsmith.getIdentityFlags(
-        context.userId,
-        context.traits
-      );
+    
+    try {
+      if (userId) {
+        const flags = await this.client.getIdentityFlags(userId);
+        return flags.isFeatureEnabled(featureName);
+      }
+      
+      const flags = await this.client.getEnvironmentFlags();
       return flags.isFeatureEnabled(featureName);
+    } catch (error) {
+      log.error('Failed to get feature flag', error as Error, { featureName });
+      // Fall back to cache or default
+      return this.localCache.get(featureName)?.enabled ?? false;
     }
-
-    const flags = await this.flagsmith.getEnvironmentFlags();
+  }
+  
+  async getValue<T = string>(
+    featureName: string,
+    defaultValue: T,
+    userId?: string
+  ): Promise<T> {
+    if (!this.initialized || !this.client) {
+      return (this.localCache.get(featureName)?.value as T) ?? defaultValue;
+    }
+    
+    try {
+      let flags;
+      if (userId) {
+        flags = await this.client.getIdentityFlags(userId);
+      } else {
+        flags = await this.client.getEnvironmentFlags();
+      }
+      
+      const value = flags.getFeatureValue(featureName);
+      return (value as T) ?? defaultValue;
+    } catch (error) {
+      log.error('Failed to get feature flag value', error as Error, { featureName });
+      return defaultValue;
+    }
+  }
+  
+  // Segment-based targeting
+  async isEnabledForUser(
+    featureName: string,
+    user: {
+      id: string;
+      email?: string;
+      plan?: string;
+      country?: string;
+      createdAt?: Date;
+    }
+  ): Promise<boolean> {
+    if (!this.initialized || !this.client) {
+      return false;
+    }
+    
+    const traits: Record<string, string | number | boolean> = {};
+    if (user.email) traits['email'] = user.email;
+    if (user.plan) traits['plan'] = user.plan;
+    if (user.country) traits['country'] = user.country;
+    if (user.createdAt) {
+      traits['days_since_signup'] = Math.floor(
+        (Date.now() - user.createdAt.getTime()) / 86400000
+      );
+    }
+    
+    const flags = await this.client.getIdentityFlags(user.id, traits);
     return flags.isFeatureEnabled(featureName);
   }
-
-  async getValue<T = unknown>(
-    featureName: string,
-    context?: FeatureFlagContext
-  ): Promise<T | null> {
-    await this.initialize();
-
-    if (context?.userId) {
-      const flags = await this.flagsmith.getIdentityFlags(
-        context.userId,
-        context.traits
-      );
-      return flags.getFeatureValue(featureName) as T | null;
-    }
-
-    const flags = await this.flagsmith.getEnvironmentFlags();
-    return flags.getFeatureValue(featureName) as T | null;
+  
+  // Local fallback for testing
+  setLocalFlag(name: string, enabled: boolean, value?: string): void {
+    this.localCache.set(name, { enabled, value });
   }
-
-  // A/B Test helper
-  async getABTestVariant(
-    testName: string,
-    userId: string,
-    variants: string[] = ['control', 'treatment']
-  ): Promise<string> {
-    const value = await this.getValue<string>(testName, { userId });
-    if (value && variants.includes(value)) {
-      return value;
-    }
-
-    // Deterministic assignment based on userId hash
-    const hash = userId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    return variants[hash % variants.length];
+  
+  clearLocalFlags(): void {
+    this.localCache.clear();
   }
 }
 
-// Express Middleware สำหรับ Feature Flags
-import { Request, Response, NextFunction } from 'express';
+export const featureFlags = new FeatureFlagService();
 
-export function createFeatureFlagMiddleware(flagService: FeatureFlagService) {
-  return (req: Request, _res: Response, next: NextFunction) => {
-    // @ts-expect-error — adding custom property
-    req.isFeatureEnabled = async (
-      featureName: string
-    ): Promise<boolean> => {
-      // @ts-expect-error — reading user from auth middleware
-      const userId = req.user?.id;
-      return flagService.isEnabled(featureName, { userId });
-    };
+// Initialize on startup
+featureFlags.initialize({
+  environmentKey: process.env.FLAGSMITH_ENVIRONMENT_KEY!,
+  apiUrl: process.env.FLAGSMITH_API_URL,
+  enableLocalEvaluation: true,
+  environmentRefreshIntervalSeconds: 60,
+}).catch(err => {
+  console.error('Failed to initialize feature flags:', err);
+  // Non-fatal: service continues with defaults
+});
 
+// Feature flag middleware
+export function featureFlagMiddleware(flagName: string, fallback?: (req: any, res: any) => void) {
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const userId = req.user?.id;
+    const isEnabled = await featureFlags.isEnabled(flagName, userId);
+    
+    if (!isEnabled) {
+      if (fallback) {
+        return fallback(req, res);
+      }
+      return res.status(404).json({ error: 'feature_not_available' });
+    }
+    
     next();
   };
 }
+
+// Usage example:
+// app.post('/api/orders/express-checkout',
+//   authenticate(),
+//   featureFlagMiddleware('express-checkout'),
+//   expressCheckoutHandler
+// );
 ```
 
 ---
 
-## 6. LaunchDarkly Integration
+## 5. Environment-specific Config ด้วย dotenv-flow
 
 ```typescript
-// packages/shared/src/feature-flags/launchdarkly.client.ts
-
-import * as LaunchDarkly from '@launchdarkly/node-server-sdk';
-
-interface LDUser {
-  key: string;
-  email?: string;
-  name?: string;
-  country?: string;
-  custom?: Record<string, LaunchDarkly.LDFlagValue>;
-}
-
-export class LaunchDarklyService {
-  private client!: LaunchDarkly.LDClient;
-  private ready = false;
-
-  constructor(private readonly sdkKey: string) {}
-
-  async initialize(): Promise<void> {
-    this.client = LaunchDarkly.init(this.sdkKey, {
-      logger: LaunchDarkly.basicLogger({
-        level: 'warn',
-        destination: console.error,
-      }),
-      // Use streaming for real-time updates
-      stream: true,
-      // Offline mode for testing
-      offline: process.env.NODE_ENV === 'test',
-    });
-
-    await this.client.waitForInitialization({ timeout: 10 });
-    this.ready = true;
-    console.log('[LaunchDarkly] SDK initialized');
-
-    // Listen for flag changes
-    this.client.on('update', (settings) => {
-      console.log(`[LaunchDarkly] Flag updated:`, Object.keys(settings.updates));
-    });
-  }
-
-  async variation<T extends LaunchDarkly.LDFlagValue>(
-    flagKey: string,
-    user: LDUser,
-    defaultValue: T
-  ): Promise<T> {
-    if (!this.ready) {
-      console.warn('[LaunchDarkly] Not initialized, returning default');
-      return defaultValue;
-    }
-
-    return this.client.variation(flagKey, user, defaultValue) as T;
-  }
-
-  async boolVariation(
-    flagKey: string,
-    user: LDUser,
-    defaultValue = false
-  ): Promise<boolean> {
-    return this.client.boolVariation(flagKey, user, defaultValue);
-  }
-
-  async stringVariation(
-    flagKey: string,
-    user: LDUser,
-    defaultValue = ''
-  ): Promise<string> {
-    return this.client.stringVariation(flagKey, user, defaultValue);
-  }
-
-  async jsonVariation<T>(
-    flagKey: string,
-    user: LDUser,
-    defaultValue: T
-  ): Promise<T> {
-    return this.client.jsonVariation(flagKey, user, defaultValue) as T;
-  }
-
-  // Get all flags for a user (for debugging/inspection)
-  async allFlagsState(user: LDUser): Promise<Record<string, LaunchDarkly.LDFlagValue>> {
-    const state = this.client.allFlagsState(user);
-    return state.toValuesMap();
-  }
-
-  async close(): Promise<void> {
-    await this.client.close();
-  }
-}
-```
-
----
-
-## 7. Config Validation ด้วย JSON Schema / Zod
-
-```typescript
-// packages/shared/src/config/config.validator.ts
-
+// src/config/env.ts
+import 'dotenv-flow/config';
 import { z } from 'zod';
 
-// ─── Schema Definitions ────────────────────────────────────────────────────
+// dotenv-flow loads:
+// .env (base)
+// .env.local (local overrides, gitignored)
+// .env.{NODE_ENV} (e.g., .env.production, .env.test)
+// .env.{NODE_ENV}.local
 
-const DatabaseConfigSchema = z.object({
-  host: z.string().min(1),
-  port: z.number().int().min(1).max(65535).default(5432),
-  database: z.string().min(1),
-  user: z.string().min(1),
-  password: z.string().min(1),
-  ssl: z.boolean().default(false),
-  maxConnections: z.number().int().min(1).max(1000).default(20),
-  connectionTimeoutMs: z.number().int().min(100).default(5000),
-  idleTimeoutMs: z.number().int().min(1000).default(30000),
-});
-
-const RedisConfigSchema = z.object({
-  url: z.string().url().optional(),
-  host: z.string().default('localhost'),
-  port: z.number().int().default(6379),
-  password: z.string().optional(),
-  db: z.number().int().min(0).max(15).default(0),
-  maxRetriesPerRequest: z.number().int().default(3),
-  enableReadyCheck: z.boolean().default(true),
-});
-
-const RabbitMQConfigSchema = z.object({
-  url: z.string().default('amqp://guest:guest@localhost:5672'),
-  heartbeat: z.number().int().default(60),
-  prefetchCount: z.number().int().min(1).default(10),
-  reconnectDelay: z.number().int().default(5000),
-  maxReconnectAttempts: z.number().int().default(-1),
-});
-
-const HttpServerConfigSchema = z.object({
-  port: z.number().int().min(1).max(65535),
-  host: z.string().default('0.0.0.0'),
-  requestTimeoutMs: z.number().int().default(30000),
-  keepAliveTimeoutMs: z.number().int().default(65000),
-  maxBodySizeBytes: z.number().int().default(10 * 1024 * 1024), // 10MB
-  corsOrigins: z.array(z.string()).default(['*']),
-  trustProxy: z.boolean().default(true),
-});
-
-const JwtConfigSchema = z.object({
-  secret: z.string().min(32, 'JWT secret must be at least 32 characters'),
-  expiresIn: z.string().default('1h'),
-  issuer: z.string().default('microservices'),
-  audience: z.string().optional(),
-});
-
-export const AppConfigSchema = z.object({
-  environment: z.enum(['development', 'staging', 'production', 'test']),
-  serviceName: z.string().min(1),
-  version: z.string().default('1.0.0'),
-  logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+const EnvironmentSchema = z.object({
+  // Server
+  NODE_ENV: z.enum(['development', 'test', 'staging', 'production']),
+  PORT: z.coerce.number().int().min(1024).max(65535).default(3000),
+  SERVICE_NAME: z.string().min(1),
+  SERVICE_VERSION: z.string().regex(/^\d+\.\d+\.\d+/).default('0.0.0'),
   
-  server: HttpServerConfigSchema,
-  database: DatabaseConfigSchema,
-  redis: RedisConfigSchema.optional(),
-  rabbitmq: RabbitMQConfigSchema.optional(),
-  jwt: JwtConfigSchema,
+  // Database
+  DATABASE_URL: z.string().url().refine(
+    url => url.startsWith('postgresql://') || url.startsWith('postgres://'),
+    'Must be a PostgreSQL URL'
+  ),
+  DB_POOL_MIN: z.coerce.number().int().min(1).default(2),
+  DB_POOL_MAX: z.coerce.number().int().min(1).default(10),
+  DB_STATEMENT_TIMEOUT: z.coerce.number().int().positive().default(30000),
+  DB_IDLE_TIMEOUT: z.coerce.number().int().positive().default(10000),
   
-  tracing: z.object({
-    enabled: z.boolean().default(true),
-    endpoint: z.string().url().optional(),
-    sampleRate: z.number().min(0).max(1).default(0.1),
-  }).default({}),
+  // Redis
+  REDIS_URL: z.string().url(),
+  REDIS_POOL_SIZE: z.coerce.number().int().min(1).default(10),
   
-  metrics: z.object({
-    enabled: z.boolean().default(true),
-    path: z.string().default('/metrics'),
-  }).default({}),
+  // Auth
+  JWT_SECRET: z.string().min(32, 'JWT secret must be at least 32 characters'),
+  JWT_EXPIRES_IN: z.string().default('1h'),
+  OAUTH_ISSUER: z.string().url(),
+  OAUTH_AUDIENCE: z.string().url(),
+  
+  // External services
+  PRODUCT_SERVICE_URL: z.string().url(),
+  PAYMENT_SERVICE_URL: z.string().url(),
+  NOTIFICATION_SERVICE_URL: z.string().url().optional(),
+  
+  // Message broker
+  RABBITMQ_URL: z.string().url(),
+  RABBITMQ_EXCHANGE: z.string().default('orders'),
+  
+  // Observability
+  OTEL_COLLECTOR_URL: z.string().url().optional(),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LOG_FORMAT: z.enum(['json', 'pretty']).default('json'),
+  
+  // Feature flags
+  FLAGSMITH_ENVIRONMENT_KEY: z.string().min(1).optional(),
+  FLAGSMITH_API_URL: z.string().url().optional(),
+  
+  // AWS (for Secrets Manager)
+  AWS_REGION: z.string().default('us-east-1'),
+  
+  // API keys
+  PAGERDUTY_ROUTING_KEY: z.string().optional(),
+  API_KEY_HMAC_SECRET: z.string().min(32),
+  
+  // Metrics
+  METRICS_AUTH_TOKEN: z.string().optional(),
+}).superRefine((data, ctx) => {
+  // Production-specific validation
+  if (data.NODE_ENV === 'production') {
+    if (!data.PAGERDUTY_ROUTING_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'PAGERDUTY_ROUTING_KEY is required in production',
+        path: ['PAGERDUTY_ROUTING_KEY'],
+      });
+    }
+    
+    if (!data.OTEL_COLLECTOR_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'OTEL_COLLECTOR_URL is required in production',
+        path: ['OTEL_COLLECTOR_URL'],
+      });
+    }
+    
+    if (!data.FLAGSMITH_ENVIRONMENT_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'FLAGSMITH_ENVIRONMENT_KEY is required in production',
+        path: ['FLAGSMITH_ENVIRONMENT_KEY'],
+      });
+    }
+  }
 });
 
-export type AppConfig = z.infer<typeof AppConfigSchema>;
+type Env = z.infer<typeof EnvironmentSchema>;
 
-// ─── Config Loader ─────────────────────────────────────────────────────────
+let _env: Env | null = null;
 
-export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
-  const raw = {
-    environment: process.env.NODE_ENV ?? 'development',
-    serviceName: process.env.SERVICE_NAME ?? 'unknown-service',
-    version: process.env.APP_VERSION ?? '1.0.0',
-    logLevel: process.env.LOG_LEVEL ?? 'info',
+export function getEnv(): Env {
+  if (_env) return _env;
+  
+  const result = EnvironmentSchema.safeParse(process.env);
+  
+  if (!result.success) {
+    const errors = result.error.errors.map(e =>
+      `  ${e.path.join('.')}: ${e.message}`
+    ).join('\n');
     
-    server: {
-      port: parseInt(process.env.PORT ?? '3000'),
-      host: process.env.HOST ?? '0.0.0.0',
-      requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS ?? '30000'),
-      corsOrigins: (process.env.CORS_ORIGINS ?? '*').split(','),
-      trustProxy: process.env.TRUST_PROXY !== 'false',
-    },
-    
-    database: {
-      host: process.env.DB_HOST ?? 'localhost',
-      port: parseInt(process.env.DB_PORT ?? '5432'),
-      database: process.env.DB_NAME ?? '',
-      user: process.env.DB_USER ?? 'postgres',
-      password: process.env.DB_PASSWORD ?? '',
-      ssl: process.env.DB_SSL === 'true',
-      maxConnections: parseInt(process.env.DB_MAX_CONNECTIONS ?? '20'),
-    },
-    
-    redis: process.env.REDIS_URL
-      ? { url: process.env.REDIS_URL }
-      : process.env.REDIS_HOST
-      ? {
-          host: process.env.REDIS_HOST,
-          port: parseInt(process.env.REDIS_PORT ?? '6379'),
-          password: process.env.REDIS_PASSWORD,
-        }
-      : undefined,
-    
-    rabbitmq: process.env.RABBITMQ_URL
-      ? { url: process.env.RABBITMQ_URL }
-      : undefined,
-    
-    jwt: {
-      secret: process.env.JWT_SECRET ?? '',
-      expiresIn: process.env.JWT_EXPIRES_IN ?? '1h',
-      issuer: process.env.JWT_ISSUER ?? 'microservices',
-    },
-    
-    tracing: {
-      enabled: process.env.TRACING_ENABLED !== 'false',
-      endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-      sampleRate: parseFloat(process.env.TRACING_SAMPLE_RATE ?? '0.1'),
-    },
-    
-    ...overrides,
-  };
+    throw new Error(`Invalid environment configuration:\n${errors}`);
+  }
+  
+  _env = result.data;
+  return _env;
+}
 
+// Validate immediately on import in production
+if (process.env.NODE_ENV === 'production') {
   try {
-    return AppConfigSchema.parse(raw);
+    getEnv();
+    console.log('Environment configuration validated successfully');
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      const issues = error.issues.map(
-        (i) => `  - ${i.path.join('.')}: ${i.message}`
-      ).join('\n');
-      throw new Error(`Configuration validation failed:\n${issues}`);
-    }
-    throw error;
-  }
-}
-
-// ─── Validation Middleware ─────────────────────────────────────────────────
-
-export function validateEnvVars(requiredVars: string[]): void {
-  const missing = requiredVars.filter(
-    (key) => !process.env[key] || process.env[key]!.trim() === ''
-  );
-
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables:\n${missing.map(v => `  - ${v}`).join('\n')}`
-    );
-  }
-}
-```
-
----
-
-## 8. Environment-specific Config Management
-
-```typescript
-// packages/shared/src/config/env.config.ts
-// จัดการ config ที่แตกต่างกันในแต่ละ environment
-
-type Environment = 'development' | 'staging' | 'production' | 'test';
-
-interface EnvironmentConfig {
-  logLevel: 'debug' | 'info' | 'warn' | 'error';
-  dbPoolSize: number;
-  cacheEnabled: boolean;
-  cacheTtlSeconds: number;
-  rateLimitPerMinute: number;
-  jwtExpiresIn: string;
-  corsOrigins: string[];
-  tracingSampleRate: number;
-  circuitBreakerThreshold: number;
-}
-
-const environmentConfigs: Record<Environment, EnvironmentConfig> = {
-  development: {
-    logLevel: 'debug',
-    dbPoolSize: 5,
-    cacheEnabled: false,
-    cacheTtlSeconds: 60,
-    rateLimitPerMinute: 10000,
-    jwtExpiresIn: '7d',
-    corsOrigins: ['http://localhost:3000', 'http://localhost:3001'],
-    tracingSampleRate: 1.0, // Sample everything in dev
-    circuitBreakerThreshold: 10,
-  },
-  staging: {
-    logLevel: 'info',
-    dbPoolSize: 10,
-    cacheEnabled: true,
-    cacheTtlSeconds: 300,
-    rateLimitPerMinute: 1000,
-    jwtExpiresIn: '1d',
-    corsOrigins: ['https://staging.myapp.com'],
-    tracingSampleRate: 0.5,
-    circuitBreakerThreshold: 5,
-  },
-  production: {
-    logLevel: 'warn',
-    dbPoolSize: 25,
-    cacheEnabled: true,
-    cacheTtlSeconds: 600,
-    rateLimitPerMinute: 100,
-    jwtExpiresIn: '1h',
-    corsOrigins: ['https://myapp.com', 'https://www.myapp.com'],
-    tracingSampleRate: 0.1, // Sample 10% in production
-    circuitBreakerThreshold: 5,
-  },
-  test: {
-    logLevel: 'error',
-    dbPoolSize: 2,
-    cacheEnabled: false,
-    cacheTtlSeconds: 0,
-    rateLimitPerMinute: 100000,
-    jwtExpiresIn: '7d',
-    corsOrigins: ['*'],
-    tracingSampleRate: 0,
-    circuitBreakerThreshold: 100,
-  },
-};
-
-export function getEnvironmentConfig(
-  env: Environment = (process.env.NODE_ENV as Environment) ?? 'development'
-): EnvironmentConfig {
-  const config = environmentConfigs[env];
-  if (!config) {
-    throw new Error(`Unknown environment: ${env}`);
-  }
-  return config;
-}
-
-// Override ด้วย environment variables
-export function mergeWithEnvOverrides(
-  base: EnvironmentConfig
-): EnvironmentConfig {
-  return {
-    ...base,
-    logLevel:
-      (process.env.LOG_LEVEL as EnvironmentConfig['logLevel']) ??
-      base.logLevel,
-    dbPoolSize: parseInt(
-      process.env.DB_POOL_SIZE ?? String(base.dbPoolSize)
-    ),
-    cacheEnabled:
-      process.env.CACHE_ENABLED !== undefined
-        ? process.env.CACHE_ENABLED === 'true'
-        : base.cacheEnabled,
-    cacheTtlSeconds: parseInt(
-      process.env.CACHE_TTL_SECONDS ?? String(base.cacheTtlSeconds)
-    ),
-    rateLimitPerMinute: parseInt(
-      process.env.RATE_LIMIT_PER_MINUTE ?? String(base.rateLimitPerMinute)
-    ),
-    tracingSampleRate: parseFloat(
-      process.env.TRACING_SAMPLE_RATE ?? String(base.tracingSampleRate)
-    ),
-  };
-}
-```
-
----
-
-## 9. Config Reload Endpoint
-
-```typescript
-// packages/shared/src/config/config.endpoint.ts
-
-import { Router, Request, Response } from 'express';
-import { AppConfigManager } from './config.watcher';
-
-export function createConfigRouter(configManager: AppConfigManager) {
-  const router = Router();
-
-  // GET /config/features — ดู feature flags ปัจจุบัน
-  router.get('/features', (_req: Request, res: Response) => {
-    const flags = configManager.getFeatureFlags();
-    res.json(flags);
-  });
-
-  // GET /config/rate-limit
-  router.get('/rate-limit', (_req: Request, res: Response) => {
-    const config = configManager.getRateLimitConfig();
-    res.json(config);
-  });
-
-  // GET /config/feature/:name — check single feature
-  router.get('/feature/:name', (req: Request, res: Response) => {
-    const { name } = req.params;
-    const enabled = configManager.isFeatureEnabled(name);
-    res.json({ feature: name, enabled });
-  });
-
-  return router;
-}
-```
-
----
-
-## 10. Docker Compose ครบสมบูรณ์
-
-```yaml
-# docker-compose.config.yml
-version: '3.8'
-
-services:
-  order-service:
-    image: myrepo/order-service:${VERSION:-latest}
-    environment:
-      NODE_ENV: production
-      PORT: 3001
-      SERVICE_NAME: order-service
-      
-      # Database
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: orders
-      DB_USER: orders_user
-      DB_PASSWORD_FILE: /run/secrets/db_password
-      DB_MAX_CONNECTIONS: 25
-      DB_SSL: "true"
-      
-      # Redis
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # JWT
-      JWT_EXPIRES_IN: 1h
-      
-      # Feature Flags
-      FLAGSMITH_ENVIRONMENT_KEY_FILE: /run/secrets/flagsmith_key
-      
-      # Tracing
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      TRACING_SAMPLE_RATE: "0.1"
-      
-      CONFIG_DIR: /app/config
-      
-    configs:
-      - source: order-service-config
-        target: /app/config/rate-limit.json
-      - source: features-config
-        target: /app/config/features.yaml
-    
-    secrets:
-      - db_password
-      - jwt_secret
-      - flagsmith_key
-    
-    volumes:
-      - order_logs:/app/logs
-    
-    deploy:
-      replicas: 2
-      update_config:
-        order: rolling-update
-        failure_action: rollback
-      resources:
-        limits:
-          memory: 256M
-          cpus: '0.5'
-
-configs:
-  order-service-config:
-    file: ./config/rate-limit.json
-  features-config:
-    file: ./config/features.yaml
-
-secrets:
-  db_password:
-    external: true
-  jwt_secret:
-    external: true
-  flagsmith_key:
-    external: true
-
-volumes:
-  order_logs:
-```
-
----
-
-## 11. Helm Chart Values สำหรับ Config Management
-
-```yaml
-# helm/order-service/values.yaml
-replicaCount: 2
-
-image:
-  repository: myrepo/order-service
-  tag: "1.2.0"
-  pullPolicy: IfNotPresent
-
-config:
-  logLevel: info
-  maxConnections: 25
-  requestTimeoutMs: 30000
-  rateLimitPerMinute: 1000
-
-  rateLimit:
-    windowMs: 60000
-    maxRequests: 1000
-    skipFailedRequests: false
-    keyBy: userId
-
-  features:
-    new_checkout_flow: false
-    loyalty_points: true
-    express_delivery: true
-    cod_payment: false
-
-externalSecrets:
-  enabled: true
-  secretStore: aws-secrets-manager
-  refreshInterval: 5m
-  secrets:
-    - name: DATABASE_URL
-      remoteKey: microservices/production/order-service
-      property: database_url
-    - name: JWT_SECRET
-      remoteKey: microservices/production/shared
-      property: jwt_secret
-
-featureFlags:
-  provider: flagsmith  # or launchdarkly
-  environmentKeySecret:
-    name: feature-flags-secret
-    key: FLAGSMITH_ENVIRONMENT_KEY
-
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 70
-
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-```
-
-```yaml
-# helm/order-service/templates/configmap.yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "order-service.fullname" . }}-config
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "order-service.labels" . | nindent 4 }}
-data:
-  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
-  MAX_CONNECTIONS: {{ .Values.config.maxConnections | quote }}
-  REQUEST_TIMEOUT_MS: {{ .Values.config.requestTimeoutMs | quote }}
-  rate-limit.json: |
-    {{ .Values.config.rateLimit | toJson }}
-  features.yaml: |
-    features:
-    {{- range $key, $val := .Values.config.features }}
-      {{ $key }}: {{ $val }}
-    {{- end }}
-```
-
----
-
-## 12. Config Drift Detection
-
-```typescript
-// scripts/config-drift-detector.ts
-// ตรวจสอบว่า config ที่ deploy จริงตรงกับที่คาดหวังหรือไม่
-
-import axios from 'axios';
-import yaml from 'js-yaml';
-import fs from 'fs';
-
-interface ServiceConfigSnapshot {
-  service: string;
-  endpoint: string;
-  expectedConfig: Record<string, unknown>;
-}
-
-const services: ServiceConfigSnapshot[] = [
-  {
-    service: 'order-service',
-    endpoint: 'http://order-service:3001/config/features',
-    expectedConfig: {
-      features: {
-        new_checkout_flow: false,
-        loyalty_points: true,
-        express_delivery: true,
-      },
-    },
-  },
-];
-
-async function detectConfigDrift(): Promise<void> {
-  console.log('Checking for configuration drift...\n');
-
-  let driftFound = false;
-
-  for (const snapshot of services) {
-    try {
-      const response = await axios.get(snapshot.endpoint, { timeout: 5000 });
-      const actual = response.data;
-
-      const diffs = findDiffs(snapshot.expectedConfig, actual, '');
-
-      if (diffs.length > 0) {
-        driftFound = true;
-        console.error(`DRIFT DETECTED in ${snapshot.service}:`);
-        diffs.forEach((d) => console.error(`  ${d}`));
-      } else {
-        console.log(`OK: ${snapshot.service} — no drift`);
-      }
-    } catch (error) {
-      console.error(`ERROR checking ${snapshot.service}:`, (error as Error).message);
-      driftFound = true;
-    }
-  }
-
-  if (driftFound) {
+    console.error('FATAL: Invalid environment configuration');
+    console.error(error);
     process.exit(1);
   }
 }
 
-function findDiffs(
-  expected: Record<string, unknown>,
-  actual: Record<string, unknown>,
-  prefix: string
-): string[] {
-  const diffs: string[] = [];
+export type { Env };
+```
 
-  for (const [key, expectedVal] of Object.entries(expected)) {
-    const path = prefix ? `${prefix}.${key}` : key;
-    const actualVal = actual[key];
+---
 
-    if (actualVal === undefined) {
-      diffs.push(`Missing key: ${path} (expected: ${JSON.stringify(expectedVal)})`);
-    } else if (
-      typeof expectedVal === 'object' &&
-      expectedVal !== null &&
-      typeof actualVal === 'object' &&
-      actualVal !== null
-    ) {
-      diffs.push(
-        ...findDiffs(
-          expectedVal as Record<string, unknown>,
-          actualVal as Record<string, unknown>,
-          path
-        )
-      );
-    } else if (expectedVal !== actualVal) {
-      diffs.push(
-        `Value mismatch at ${path}: expected=${JSON.stringify(expectedVal)}, actual=${JSON.stringify(actualVal)}`
-      );
-    }
-  }
+## 6. Config Validation ด้วย AJV
 
-  return diffs;
+```typescript
+// src/config/ajv-validator.ts
+import Ajv, { JSONSchemaType } from 'ajv';
+import addFormats from 'ajv-formats';
+import addKeywords from 'ajv-keywords';
+
+const ajv = new Ajv({
+  allErrors: true,
+  coerceTypes: true,
+  useDefaults: true,
+  strict: true,
+});
+
+addFormats(ajv);
+addKeywords(ajv, ['transform']);
+
+interface DatabaseConfig {
+  host: string;
+  port: number;
+  name: string;
+  poolMin: number;
+  poolMax: number;
+  statementTimeout: number;
+  ssl: {
+    enabled: boolean;
+    caPath?: string;
+  };
 }
 
-detectConfigDrift().catch(console.error);
+const databaseConfigSchema: JSONSchemaType<DatabaseConfig> = {
+  type: 'object',
+  properties: {
+    host: { type: 'string', minLength: 1 },
+    port: { type: 'integer', minimum: 1024, maximum: 65535, default: 5432 },
+    name: { type: 'string', minLength: 1 },
+    poolMin: { type: 'integer', minimum: 1, maximum: 10, default: 2 },
+    poolMax: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+    statementTimeout: { type: 'integer', minimum: 1000, default: 30000 },
+    ssl: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        caPath: { type: 'string', nullable: true },
+      },
+      required: ['enabled'],
+      additionalProperties: false,
+    },
+  },
+  required: ['host', 'name', 'ssl'],
+  additionalProperties: false,
+};
+
+const validateDatabaseConfig = ajv.compile(databaseConfigSchema);
+
+export function parseDatabaseConfig(raw: unknown): DatabaseConfig {
+  const data = JSON.parse(JSON.stringify(raw)); // Deep clone for coercion
+  
+  if (!validateDatabaseConfig(data)) {
+    const errors = ajv.errorsText(validateDatabaseConfig.errors, { separator: '\n' });
+    throw new Error(`Invalid database config:\n${errors}`);
+  }
+  
+  // Additional cross-field validation
+  if (data.poolMin > data.poolMax) {
+    throw new Error('poolMin must be <= poolMax');
+  }
+  
+  return data;
+}
+
+// Runtime config update validation
+export class ConfigValidator {
+  private readonly validators = new Map<string, ReturnType<typeof ajv.compile>>();
+  
+  register<T>(name: string, schema: object): void {
+    this.validators.set(name, ajv.compile(schema));
+  }
+  
+  validate<T>(name: string, data: unknown): T {
+    const validator = this.validators.get(name);
+    if (!validator) {
+      throw new Error(`No validator registered for: ${name}`);
+    }
+    
+    const cloned = JSON.parse(JSON.stringify(data));
+    
+    if (!validator(cloned)) {
+      const errors = ajv.errorsText(validator.errors, {
+        separator: '\n',
+        dataVar: name,
+      });
+      throw new Error(`Validation failed for ${name}:\n${errors}`);
+    }
+    
+    return cloned as T;
+  }
+}
+```
+
+---
+
+## 7. Config Hierarchy và Override Pattern
+
+```typescript
+// src/config/config-hierarchy.ts
+import { getEnv } from './env';
+import { secretsManager } from './secrets-manager';
+import { configManager } from './hot-reload';
+import { featureFlags } from './feature-flags';
+
+// Unified config access point
+export class AppConfiguration {
+  private static instance: AppConfiguration;
+  private readonly env = getEnv();
+  
+  static getInstance(): AppConfiguration {
+    if (!this.instance) {
+      this.instance = new AppConfiguration();
+    }
+    return this.instance;
+  }
+  
+  // Database config with secrets
+  async getDatabaseConfig() {
+    const secret = await secretsManager.getSecret<{
+      username: string;
+      password: string;
+    }>(`production/${this.env.SERVICE_NAME}/database`);
+    
+    return {
+      connectionString: `postgresql://${secret.username}:${secret.password}@${this.env.DATABASE_URL}`,
+      pool: {
+        min: this.env.DB_POOL_MIN,
+        max: this.env.DB_POOL_MAX,
+        idleTimeoutMillis: this.env.DB_IDLE_TIMEOUT,
+        statementTimeout: this.env.DB_STATEMENT_TIMEOUT,
+      },
+      ssl: this.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
+    };
+  }
+  
+  // Runtime feature flag
+  async isFeatureEnabled(flag: string, userId?: string): Promise<boolean> {
+    // Priority: runtime flag > env var override > flagsmith
+    const envOverride = process.env[`FEATURE_${flag.toUpperCase().replace(/-/g, '_')}`];
+    if (envOverride !== undefined) {
+      return envOverride === 'true';
+    }
+    
+    return featureFlags.isEnabled(flag, userId);
+  }
+  
+  // Dynamic config from file with hot-reload
+  getRateLimitConfig() {
+    return configManager.get('rateLimiting');
+  }
+  
+  getCorsConfig() {
+    return configManager.get('cors');
+  }
+  
+  // Static config from environment
+  getServiceConfig() {
+    return {
+      name: this.env.SERVICE_NAME,
+      version: this.env.SERVICE_VERSION,
+      port: this.env.PORT,
+      environment: this.env.NODE_ENV,
+    };
+  }
+}
+
+export const appConfig = AppConfiguration.getInstance();
 ```
 
 ---
 
 ## สรุป
 
-ในบทนี้เราได้เรียนรู้:
+ในบทนี้เราได้เรียนรู้ Configuration Management อย่างครบถ้วน:
 
-1. **Kubernetes ConfigMaps/Secrets** — วิธีจัดการ Config และ Secret ใน Kubernetes ด้วย RBAC ที่ถูกต้อง
+1. **Kubernetes ConfigMaps/Secrets** — Best practices สำหรับ non-sensitive config ใน ConfigMap, Sealed Secrets สำหรับ encrypted secrets ใน git
 
-2. **External Secrets Operator** — ดึง Secret จาก AWS Secrets Manager เข้า Kubernetes โดยอัตโนมัติพร้อม Auto-refresh
+2. **External Secrets Operator** — Integration กับ AWS Secrets Manager ผ่าน IRSA, refreshInterval, และ template transformation
 
-3. **Config Hot-Reloading** — Watch file changes ใน ConfigMap Volume และ reload config โดยไม่ต้อง restart service
+3. **Hot-reload Config** — chokidar/fs.watch สำหรับ config file changes โดยไม่ต้อง restart, validation ก่อน apply
 
-4. **Feature Flags** — ใช้ Flagsmith และ LaunchDarkly สำหรับ A/B Testing และ Gradual rollout
+4. **Feature Flags** — Flagsmith self-hosted deployment บน Kubernetes, TypeScript SDK พร้อม local evaluation, segment-based targeting
 
-5. **Config Validation ด้วย Zod** — Validate config ตั้งแต่ startup เพื่อ fail fast ก่อน deploy
+5. **dotenv-flow** — Environment-specific config hierarchy (.env → .env.local → .env.production) พร้อม Zod validation
 
-6. **Environment-specific Config** — จัดการ config ที่แตกต่างกันในแต่ละ environment อย่างเป็นระบบ
+6. **Config Validation** — AJV สำหรับ JSON Schema validation, cross-field validation, runtime config updates
 
-**Best Practice:** เก็บ Secret ใน AWS Secrets Manager หรือ Vault ไม่ใช่ใน ConfigMap หรือ environment variables โดยตรง และใช้ External Secrets Operator เพื่อ sync เข้า Kubernetes
+7. **Config Hierarchy** — Unified access point ที่รวม secrets, dynamic config, และ feature flags ด้วย clear priority rules
+
+Key takeaways:
+- แยก sensitive config (secrets) กับ non-sensitive config (configmap) ให้ชัดเจน
+- Validate ทุก config ตั้งแต่ startup เพื่อ fail fast แทนที่จะ fail ใน runtime
+- Hot-reload ช่วยให้ tune parameters ใน production ได้โดยไม่ต้อง redeploy
+- Feature flags เป็น tool ที่ทรงพลังสำหรับ progressive rollouts และ A/B testing
+- ใช้ External Secrets Operator แทนการเก็บ secrets ใน Kubernetes โดยตรง
