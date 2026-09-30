@@ -1,1038 +1,1083 @@
-# Part 87: gRPC ขั้นสูง
+# Part 87: gRPC in Microservices
 
 ## บทนำ
 
-gRPC เป็น high-performance RPC framework ที่สร้างโดย Google ใช้ Protocol Buffers เป็น interface definition language และ HTTP/2 เป็น transport layer บทนี้ครอบคลุม gRPC แบบขั้นสูงตั้งแต่ streaming patterns, interceptors, load balancing จนถึง gRPC-web สำหรับ browser
+gRPC (gRPC Remote Procedure Call) เป็น high-performance RPC framework จาก Google ที่ใช้ Protocol Buffers เป็น interface definition language และ HTTP/2 เป็น transport layer ใน Microservices gRPC เหมาะสำหรับ internal service-to-service communication ที่ต้องการ performance สูงและ type safety
 
 ---
 
-## Protocol Buffers (Proto3) Best Practices
+## 1. gRPC vs REST Comparison
 
-### Service Definition
+### 1.1 Feature Comparison
+
+```typescript
+/**
+ * gRPC vs REST Comparison:
+ * 
+ * Feature          | gRPC                    | REST
+ * ------------------|-------------------------|------------------
+ * Protocol         | HTTP/2                  | HTTP/1.1 or HTTP/2
+ * Message Format   | Protocol Buffers (binary)| JSON (text)
+ * Schema           | .proto files            | OpenAPI (optional)
+ * Streaming        | Bidirectional           | Limited (SSE, WebSocket)
+ * Code Generation  | Built-in                | Optional (OpenAPI generator)
+ * Browser Support  | Via gRPC-Web proxy      | Native
+ * Latency          | ~20-30% better          | Baseline
+ * Payload Size     | 5-10x smaller           | Baseline
+ * Type Safety      | Strong (compile-time)   | Depends on tooling
+ * Error Handling   | Status codes            | HTTP status codes
+ * Load Balancing   | L7 (connection-level)   | L7 (request-level)
+ */
+
+// ตัวอย่าง: REST ทำแบบนี้
+fetch('/api/users/123')
+  .then(r => r.json())
+  .then(user => console.log(user));
+
+// ตัวอย่าง: gRPC ทำแบบนี้ (strongly typed)
+const user = await userClient.getUser({ id: '123' });
+console.log(user.name, user.email);
+```
+
+---
+
+## 2. Protocol Buffers Schema Design
+
+### 2.1 Proto File Design Best Practices
 
 ```protobuf
-// proto/order/v1/order.proto
-
+// proto/user.proto
 syntax = "proto3";
 
-package order.v1;
+package user.v1;
+
+option go_package = "github.com/example/user/v1";
+option java_package = "com.example.user.v1";
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
-import "validate/validate.proto";  // protoc-gen-validate
 
-option go_package = "github.com/company/proto/order/v1;orderv1";
-option java_package = "com.company.proto.order.v1";
-option java_multiple_files = true;
-
-// OrderService handles all order operations
-service OrderService {
-  // Unary RPC - Create new order
-  rpc CreateOrder(CreateOrderRequest) returns (Order) {}
+// User message definition
+message User {
+  string id = 1;                                    // Field numbers ไม่เปลี่ยน
+  string name = 2;
+  string email = 3;
+  UserRole role = 4;
+  bool is_active = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
   
-  // Unary RPC - Get order by ID
-  rpc GetOrder(GetOrderRequest) returns (Order) {}
+  // Nested message
+  Address address = 8;
   
-  // Unary RPC - Update order fields
-  rpc UpdateOrder(UpdateOrderRequest) returns (Order) {}
+  // Optional field (proto3 ต้องใช้ optional keyword)
+  optional string phone_number = 9;
   
-  // Server streaming - Watch order status changes
-  rpc WatchOrder(WatchOrderRequest) returns (stream OrderEvent) {}
-  
-  // Client streaming - Batch create orders
-  rpc BatchCreateOrders(stream CreateOrderRequest) returns (BatchCreateOrdersResponse) {}
-  
-  // Bidirectional streaming - Real-time order processing
-  rpc ProcessOrders(stream CreateOrderRequest) returns (stream Order) {}
-  
-  // List orders with pagination
-  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {}
-}
-
-// ────────────────────────────── Messages ──────────────────────────────
-
-message Order {
-  string id = 1;
-  string user_id = 2;
-  OrderStatus status = 3;
-  repeated OrderItem items = 4;
-  Money total_amount = 5;
-  Address shipping_address = 6;
-  google.protobuf.Timestamp created_at = 7;
-  google.protobuf.Timestamp updated_at = 8;
-  
-  // Metadata
-  map<string, string> metadata = 9;
-}
-
-message OrderItem {
-  string product_id = 1;
-  string product_name = 2;
-  int32 quantity = 3 [(validate.rules).int32.gt = 0];
-  Money unit_price = 4;
-  Money subtotal = 5;
-}
-
-message Money {
-  string currency_code = 1 [(validate.rules).string = {
-    pattern: "^[A-Z]{3}$"  // ISO 4217
-  }];
-  int64 units = 2;      // ส่วนเต็ม (baht)
-  int32 nanos = 3;      // ส่วนทศนิยม (-999999999 ถึง +999999999)
+  // Reserved fields (อย่าลบ field เก่า ให้ reserve แทน)
+  reserved 10, 11;
+  reserved "old_field_name";
 }
 
 message Address {
-  string street = 1 [(validate.rules).string.min_len = 1];
-  string city = 2 [(validate.rules).string.min_len = 1];
-  string province = 3;
-  string postal_code = 4 [(validate.rules).string = {
-    pattern: "^[0-9]{5}$"  // Thai postal code
-  }];
-  string country_code = 5 [(validate.rules).string = {
-    len: 2
-  }];
+  string street = 1;
+  string city = 2;
+  string country = 3;
+  string postal_code = 4;
 }
 
-enum OrderStatus {
-  ORDER_STATUS_UNSPECIFIED = 0;  // proto3 ต้องมี default 0
-  ORDER_STATUS_PENDING = 1;
-  ORDER_STATUS_CONFIRMED = 2;
-  ORDER_STATUS_PROCESSING = 3;
-  ORDER_STATUS_SHIPPED = 4;
-  ORDER_STATUS_DELIVERED = 5;
-  ORDER_STATUS_CANCELLED = 6;
-  ORDER_STATUS_REFUNDED = 7;
+enum UserRole {
+  USER_ROLE_UNSPECIFIED = 0;  // ต้องมี 0 value เสมอ
+  USER_ROLE_USER = 1;
+  USER_ROLE_ADMIN = 2;
+  USER_ROLE_MODERATOR = 3;
 }
 
-// ────────────────────────────── Requests ──────────────────────────────
-
-message CreateOrderRequest {
-  string user_id = 1 [(validate.rules).string.uuid = true];
-  repeated OrderItemInput items = 2 [(validate.rules).repeated.min_items = 1];
-  Address shipping_address = 3 [(validate.rules).message.required = true];
-  string idempotency_key = 4 [(validate.rules).string.min_len = 1];
-}
-
-message OrderItemInput {
-  string product_id = 1 [(validate.rules).string.uuid = true];
-  int32 quantity = 2 [(validate.rules).int32 = {gt: 0, lte: 100}];
-}
-
-message GetOrderRequest {
-  string order_id = 1 [(validate.rules).string.uuid = true];
-  google.protobuf.FieldMask field_mask = 2;  // Partial response
-}
-
-message UpdateOrderRequest {
-  string order_id = 1 [(validate.rules).string.uuid = true];
-  Order order = 2;
-  google.protobuf.FieldMask update_mask = 3;  // Only update specified fields
-}
-
-message WatchOrderRequest {
-  string order_id = 1 [(validate.rules).string.uuid = true];
-  repeated OrderStatus watch_statuses = 2;  // Filter specific status changes
-}
-
-message OrderEvent {
-  string order_id = 1;
-  OrderStatus old_status = 2;
-  OrderStatus new_status = 3;
-  google.protobuf.Timestamp event_time = 4;
-  string message = 5;
-}
-
-message ListOrdersRequest {
+// Request/Response messages
+message GetUserRequest {
   string user_id = 1;
-  OrderStatus status_filter = 2;
-  int32 page_size = 3 [(validate.rules).int32 = {gt: 0, lte: 100}];
-  string page_token = 4;
 }
 
-message ListOrdersResponse {
-  repeated Order orders = 1;
-  string next_page_token = 2;
-  int32 total_count = 3;
+message CreateUserRequest {
+  string name = 1;
+  string email = 2;
+  UserRole role = 3;
+  optional Address address = 4;
 }
 
-message BatchCreateOrdersResponse {
-  repeated Order orders = 1;
-  repeated BatchCreateError errors = 2;
+message UpdateUserRequest {
+  string user_id = 1;
+  string name = 2;
+  optional string phone_number = 3;
+  optional Address address = 4;
+  
+  // Field mask: ระบุว่า field ไหนที่จะ update
+  google.protobuf.FieldMask update_mask = 5;
+}
+
+message ListUsersRequest {
+  int32 page_size = 1;         // สูงสุดไม่เกิน 100
+  string page_token = 2;       // cursor for pagination
+  string filter = 3;           // "role=ADMIN AND is_active=true"
+  string order_by = 4;         // "created_at DESC"
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  string next_page_token = 2;  // ว่างหมายความว่าไม่มีหน้าถัดไป
+  int32 total_size = 3;        // จำนวนทั้งหมด (ถ้ารู้)
+}
+
+// UserService definition
+service UserService {
+  // Unary RPC
+  rpc GetUser(GetUserRequest) returns (User);
+  
+  // Unary with Empty response
+  rpc DeleteUser(GetUserRequest) returns (google.protobuf.Empty);
+  
+  // Unary
+  rpc CreateUser(CreateUserRequest) returns (User);
+  rpc UpdateUser(UpdateUserRequest) returns (User);
+  
+  // Server streaming
+  rpc ListUsers(ListUsersRequest) returns (stream User);
+  
+  // Client streaming
+  rpc BatchCreateUsers(stream CreateUserRequest) returns (BatchCreateUsersResponse);
+  
+  // Bidirectional streaming
+  rpc SyncUsers(stream SyncUserRequest) returns (stream SyncUserResponse);
+}
+
+message BatchCreateUsersResponse {
+  repeated User created_users = 1;
+  repeated string failed_emails = 2;
   int32 success_count = 3;
-  int32 error_count = 4;
+  int32 failure_count = 4;
 }
 
-message BatchCreateError {
-  int32 index = 1;
-  string error_code = 2;
-  string message = 3;
+message SyncUserRequest {
+  oneof operation {
+    CreateUserRequest create = 1;
+    UpdateUserRequest update = 2;
+    GetUserRequest delete = 3;
+  }
+}
+
+message SyncUserResponse {
+  string operation_id = 1;
+  bool success = 2;
+  optional string error_message = 3;
+  optional User user = 4;
+}
+```
+
+### 2.2 Proto Compilation
+
+```json
+// package.json scripts
+{
+  "scripts": {
+    "proto:compile": "grpc_tools_node_protoc --js_out=import_style=commonjs,binary:./src/generated --grpc_out=grpc_js:./src/generated --proto_path=./proto ./proto/**/*.proto",
+    "proto:compile:ts": "grpc_tools_node_protoc_plugin --plugin=protoc-gen-ts=./node_modules/.bin/protoc-gen-ts --ts_out=grpc_js:./src/generated --grpc_out=grpc_js:./src/generated --proto_path=./proto ./proto/**/*.proto"
+  }
+}
+```
+
+```yaml
+# buf.yaml - Modern proto tooling
+version: v1
+deps:
+  - buf.build/googleapis/googleapis
+breaking:
+  use:
+    - FILE
+lint:
+  use:
+    - STANDARD
+  except:
+    - PACKAGE_VERSION_SUFFIX
+```
+
+---
+
+## 3. gRPC Server Implementation
+
+```typescript
+// src/grpc/user-server.ts
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import path from 'path';
+
+const PROTO_PATH = path.join(__dirname, '../../proto/user.proto');
+
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+  includeDirs: ['./proto'],
+});
+
+const userProto = grpc.loadPackageDefinition(packageDefinition) as any;
+
+// Better: use generated types with ts-proto
+import {
+  UserServiceServer,
+  UserServiceService,
+  GetUserRequest,
+  CreateUserRequest,
+  ListUsersRequest,
+  User,
+  UserRole,
+} from './generated/user';
+import { ServerUnaryCall, sendUnaryData, ServerWritableStream, ServerReadableStream, ServerDuplexStream } from '@grpc/grpc-js';
+import { Empty } from 'google-protobuf/google/protobuf/empty_pb';
+
+export class UserGrpcServer implements UserServiceServer {
+  [name: string]: any;
+  
+  constructor(private userService: UserService) {}
+
+  // Unary RPC
+  async getUser(
+    call: ServerUnaryCall<GetUserRequest, User>,
+    callback: sendUnaryData<User>
+  ): Promise<void> {
+    const { user_id } = call.request;
+    
+    try {
+      const user = await this.userService.findById(user_id);
+      
+      if (!user) {
+        callback({
+          code: grpc.status.NOT_FOUND,
+          message: `User ${user_id} not found`,
+        });
+        return;
+      }
+      
+      callback(null, {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: UserRole[user.role as keyof typeof UserRole],
+        is_active: user.isActive,
+        created_at: {
+          seconds: Math.floor(user.createdAt.getTime() / 1000),
+          nanos: (user.createdAt.getTime() % 1000) * 1e6,
+        },
+        updated_at: {
+          seconds: Math.floor(user.updatedAt.getTime() / 1000),
+          nanos: (user.updatedAt.getTime() % 1000) * 1e6,
+        },
+      });
+    } catch (error) {
+      callback({
+        code: grpc.status.INTERNAL,
+        message: `Internal error: ${(error as Error).message}`,
+      });
+    }
+  }
+
+  // Server Streaming RPC
+  async listUsers(
+    call: ServerWritableStream<ListUsersRequest, User>
+  ): Promise<void> {
+    const { page_size, filter } = call.request;
+    
+    try {
+      const cursor = this.userService.streamUsers({
+        limit: page_size || 50,
+        filter,
+      });
+      
+      for await (const user of cursor) {
+        // ตรวจสอบว่า client ยกเลิกแล้วหรือไม่
+        if (call.cancelled) break;
+        
+        call.write({
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: UserRole[user.role as keyof typeof UserRole],
+          is_active: user.isActive,
+        });
+      }
+      
+      call.end();
+    } catch (error) {
+      call.destroy(error as Error);
+    }
+  }
+
+  // Client Streaming RPC
+  async batchCreateUsers(
+    call: ServerReadableStream<CreateUserRequest, any>,
+    callback: sendUnaryData<any>
+  ): Promise<void> {
+    const createdUsers: User[] = [];
+    const failedEmails: string[] = [];
+    
+    try {
+      for await (const request of call) {
+        try {
+          const user = await this.userService.create({
+            name: request.name,
+            email: request.email,
+          });
+          createdUsers.push(user as any);
+        } catch (error) {
+          failedEmails.push(request.email);
+        }
+      }
+      
+      callback(null, {
+        created_users: createdUsers,
+        failed_emails: failedEmails,
+        success_count: createdUsers.length,
+        failure_count: failedEmails.length,
+      });
+    } catch (error) {
+      callback({
+        code: grpc.status.INTERNAL,
+        message: (error as Error).message,
+      });
+    }
+  }
+
+  // Bidirectional Streaming RPC
+  async syncUsers(
+    call: ServerDuplexStream<any, any>
+  ): Promise<void> {
+    call.on('data', async (request: any) => {
+      const operationId = crypto.randomUUID();
+      
+      try {
+        let user: any;
+        
+        if (request.create) {
+          user = await this.userService.create(request.create);
+          call.write({ operation_id: operationId, success: true, user });
+        } else if (request.update) {
+          user = await this.userService.update(request.update.user_id, request.update);
+          call.write({ operation_id: operationId, success: true, user });
+        } else if (request.delete) {
+          await this.userService.delete(request.delete.user_id);
+          call.write({ operation_id: operationId, success: true });
+        }
+      } catch (error) {
+        call.write({
+          operation_id: operationId,
+          success: false,
+          error_message: (error as Error).message,
+        });
+      }
+    });
+    
+    call.on('end', () => {
+      call.end();
+    });
+    
+    call.on('error', (error) => {
+      console.error('Sync stream error:', error);
+    });
+  }
+}
+
+// Server startup
+export function startGrpcServer(service: UserGrpcServer): grpc.Server {
+  const server = new grpc.Server({
+    'grpc.max_receive_message_length': 10 * 1024 * 1024, // 10MB
+    'grpc.max_send_message_length': 10 * 1024 * 1024,
+    'grpc.keepalive_time_ms': 30000,
+    'grpc.keepalive_timeout_ms': 5000,
+  });
+  
+  server.addService(UserServiceService, service);
+  
+  const port = process.env.GRPC_PORT || '50051';
+  const credentials = process.env.TLS_CERT_PATH
+    ? grpc.ServerCredentials.createSsl(
+        Buffer.from(require('fs').readFileSync(process.env.TLS_CA_CERT!)),
+        [{
+          cert_chain: Buffer.from(require('fs').readFileSync(process.env.TLS_CERT_PATH!)),
+          private_key: Buffer.from(require('fs').readFileSync(process.env.TLS_KEY_PATH!)),
+        }],
+        true
+      )
+    : grpc.ServerCredentials.createInsecure();
+  
+  server.bindAsync(`0.0.0.0:${port}`, credentials, (error, port) => {
+    if (error) {
+      console.error('Failed to bind gRPC server:', error);
+      process.exit(1);
+    }
+    console.log(`gRPC server listening on port ${port}`);
+    server.start();
+  });
+  
+  return server;
 }
 ```
 
 ---
 
-## NestJS gRPC Implementation
-
-### Server Setup
+## 4. gRPC Client Implementation
 
 ```typescript
-// services/order/src/main.ts
+// src/grpc/user-client.ts
+import * as grpc from '@grpc/grpc-js';
+import { UserServiceClient } from './generated/user';
 
-import { NestFactory } from '@nestjs/core';
-import { MicroserviceOptions, Transport } from '@nestjs/microservices';
-import { join } from 'path';
-import { AppModule } from './app.module';
-
-async function bootstrap() {
-  // HTTP server สำหรับ REST API
-  const app = await NestFactory.create(AppModule);
-
-  // gRPC microservice
-  app.connectMicroservice<MicroserviceOptions>({
-    transport: Transport.GRPC,
-    options: {
-      package: 'order.v1',
-      protoPath: join(__dirname, '../proto/order/v1/order.proto'),
-      url: '0.0.0.0:50051',
-      loader: {
-        keepCase: true,
-        longs: String,
-        enums: String,
-        defaults: true,
-        oneofs: true,
-        includeDirs: [join(__dirname, '../proto')],
-      },
-      channelOptions: {
-        'grpc.max_receive_message_length': 1024 * 1024 * 10, // 10MB
-        'grpc.max_send_message_length': 1024 * 1024 * 10,
-        'grpc.keepalive_time_ms': 30000,
-        'grpc.keepalive_timeout_ms': 5000,
-        'grpc.keepalive_permit_without_calls': 1,
-      },
-    },
-  });
-
-  await app.startAllMicroservices();
-  await app.listen(3000);
+export class UserGrpcClient {
+  private client: UserServiceClient;
   
-  console.log('gRPC server listening on :50051');
-  console.log('HTTP server listening on :3000');
-}
+  constructor(address: string) {
+    this.client = new UserServiceClient(
+      address,
+      process.env.TLS_ENABLED === 'true'
+        ? grpc.credentials.createSsl()
+        : grpc.credentials.createInsecure(),
+      {
+        'grpc.keepalive_time_ms': 30000,
+        'grpc.keepalive_permit_without_calls': 1,
+        'grpc.service_config': JSON.stringify({
+          loadBalancingConfig: [{ round_robin: {} }],
+          methodConfig: [{
+            name: [{ service: 'user.v1.UserService' }],
+            retryPolicy: {
+              maxAttempts: 3,
+              initialBackoff: '0.1s',
+              maxBackoff: '1s',
+              backoffMultiplier: 2,
+              retryableStatusCodes: ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'],
+            },
+            timeout: '5s',
+          }],
+        }),
+      }
+    );
+  }
 
-bootstrap();
+  async getUser(userId: string): Promise<User> {
+    return new Promise((resolve, reject) => {
+      const metadata = new grpc.Metadata();
+      metadata.add('x-correlation-id', getCorrelationId());
+      metadata.add('authorization', `Bearer ${getAuthToken()}`);
+      
+      this.client.getUser(
+        { user_id: userId },
+        metadata,
+        (error, response) => {
+          if (error) {
+            if (error.code === grpc.status.NOT_FOUND) {
+              reject(new NotFoundError(`User ${userId} not found`));
+            } else {
+              reject(new Error(`gRPC error: ${error.message}`));
+            }
+            return;
+          }
+          resolve(response!);
+        }
+      );
+    });
+  }
+
+  // Server streaming - returns async iterator
+  async *listUsers(filter?: string): AsyncGenerator<User> {
+    const metadata = new grpc.Metadata();
+    metadata.add('authorization', `Bearer ${getAuthToken()}`);
+    
+    const call = this.client.listUsers(
+      { filter, page_size: 100 },
+      metadata
+    );
+    
+    try {
+      for await (const user of call) {
+        yield user;
+      }
+    } finally {
+      call.cancel();
+    }
+  }
+
+  // Client streaming
+  async batchCreate(users: Array<{ name: string; email: string }>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const call = this.client.batchCreateUsers((error, response) => {
+        if (error) reject(error);
+        else resolve(response);
+      });
+      
+      // Write all messages
+      for (const user of users) {
+        call.write({ name: user.name, email: user.email });
+      }
+      
+      call.end();
+    });
+  }
+
+  async close(): Promise<void> {
+    this.client.close();
+  }
+}
 ```
 
+---
+
+## 5. gRPC Interceptors
+
+### 5.1 Server Interceptors (Authentication, Logging, Tracing)
+
 ```typescript
-// services/order/src/order.controller.ts
+// src/grpc/interceptors/auth.interceptor.ts
+import * as grpc from '@grpc/grpc-js';
 
-import { Controller, Logger } from '@nestjs/common';
-import { GrpcMethod, GrpcStreamMethod } from '@nestjs/microservices';
-import { Subject, Observable } from 'rxjs';
-import {
-  Order,
-  CreateOrderRequest,
-  GetOrderRequest,
-  WatchOrderRequest,
-  OrderEvent,
-  ListOrdersRequest,
-  ListOrdersResponse,
-} from './generated/order/v1/order';
-
-@Controller()
-export class OrderGrpcController {
-  private readonly logger = new Logger(OrderGrpcController.name);
-
-  constructor(private readonly orderService: OrderService) {}
-
-  // ─── Unary RPC ───────────────────────────────────────────────────────────
-
-  @GrpcMethod('OrderService', 'CreateOrder')
-  async createOrder(data: CreateOrderRequest): Promise<Order> {
-    this.logger.debug(`Creating order for user: ${data.userId}`);
-    return this.orderService.create(data);
-  }
-
-  @GrpcMethod('OrderService', 'GetOrder')
-  async getOrder(data: GetOrderRequest): Promise<Order> {
-    return this.orderService.findById(data.orderId, data.fieldMask);
-  }
-
-  // ─── Server Streaming RPC ───────────────────────────────────────────────
-
-  @GrpcStreamMethod('OrderService', 'WatchOrder')
-  watchOrder(data: WatchOrderRequest): Observable<OrderEvent> {
-    const subject = new Subject<OrderEvent>();
-
-    // Subscribe ไปยัง event stream
-    const subscription = this.orderService.watchOrderEvents(
-      data.orderId,
-      data.watchStatuses,
-      (event) => subject.next(event),
-      (error) => subject.error(error),
-      () => subject.complete(),
-    );
-
-    // Cleanup เมื่อ client disconnect
-    return new Observable((observer) => {
-      const sub = subject.subscribe(observer);
-      
-      return () => {
-        sub.unsubscribe();
-        subscription.unsubscribe();
-        this.logger.debug(`Client stopped watching order: ${data.orderId}`);
-      };
-    });
-  }
-
-  // ─── Client Streaming RPC ──────────────────────────────────────────────
-
-  @GrpcStreamMethod('OrderService', 'BatchCreateOrders')
-  async batchCreateOrders(
-    messages: Observable<CreateOrderRequest>,
-  ): Promise<BatchCreateOrdersResponse> {
-    const orders: Order[] = [];
-    const errors: BatchCreateError[] = [];
-    let index = 0;
-
-    return new Promise((resolve, reject) => {
-      messages.subscribe({
-        next: async (request) => {
-          try {
-            const order = await this.orderService.create(request);
-            orders.push(order);
-          } catch (error) {
-            errors.push({
-              index,
-              errorCode: error.code || 'UNKNOWN',
-              message: error.message,
-            });
-          }
-          index++;
-        },
-        error: reject,
-        complete: () => {
-          resolve({
-            orders,
-            errors,
-            successCount: orders.length,
-            errorCount: errors.length,
+export function createAuthInterceptor(jwtService: JWTService) {
+  return function authInterceptor(
+    options: grpc.InterceptorOptions,
+    nextCall: grpc.NextCall
+  ): grpc.InterceptingCall {
+    return new grpc.InterceptingCall(nextCall(options), {
+      start: function (metadata, listener, next) {
+        const token = metadata.get('authorization')[0]?.toString().split(' ')[1];
+        
+        if (!token) {
+          const call = nextCall(options);
+          call.start(metadata, {
+            onReceiveMessage: (message, next) => next(message),
+            onReceiveStatus: (status, next) => {
+              next({
+                code: grpc.status.UNAUTHENTICATED,
+                details: 'Authentication required',
+                metadata: new grpc.Metadata(),
+              });
+            },
           });
-        },
-      });
-    });
-  }
-
-  // ─── Bidirectional Streaming RPC ──────────────────────────────────────
-
-  @GrpcStreamMethod('OrderService', 'ProcessOrders')
-  processOrders(
-    messages: Observable<CreateOrderRequest>,
-  ): Observable<Order> {
-    const subject = new Subject<Order>();
-
-    messages.subscribe({
-      next: async (request) => {
+          return;
+        }
+        
         try {
-          const order = await this.orderService.create(request);
-          subject.next(order);
+          const decoded = jwtService.verify(token);
+          metadata.add('x-user-id', decoded.userId);
+          metadata.add('x-user-role', decoded.role);
+          next(metadata, listener);
         } catch (error) {
-          // gRPC error handling - ส่ง error ใน metadata
-          subject.error({
-            code: Status.INTERNAL,
-            message: error.message,
+          next(metadata, {
+            onReceiveMessage: (message, next) => next(message),
+            onReceiveStatus: (status, next) => {
+              next({
+                code: grpc.status.UNAUTHENTICATED,
+                details: 'Invalid token',
+                metadata: new grpc.Metadata(),
+              });
+            },
           });
         }
       },
-      error: (error) => subject.error(error),
-      complete: () => subject.complete(),
     });
-
-    return subject.asObservable();
-  }
-}
-```
-
----
-
-## gRPC Error Handling
-
-```typescript
-// shared/src/grpc/grpc-exception.filter.ts
-
-import { Catch, RpcExceptionFilter, ArgumentsHost } from '@nestjs/common';
-import { Observable, throwError } from 'rxjs';
-import { RpcException } from '@nestjs/microservices';
-import { Status } from '@grpc/grpc-js/build/src/constants';
-
-interface GrpcError {
-  code: Status;
-  message: string;
-  details?: string;
-  metadata?: Record<string, string>;
-}
-
-@Catch()
-export class GrpcExceptionFilter implements RpcExceptionFilter {
-  catch(exception: unknown, host: ArgumentsHost): Observable<never> {
-    const grpcError = this.mapToGrpcError(exception);
-    return throwError(() => grpcError);
-  }
-
-  private mapToGrpcError(exception: unknown): GrpcError {
-    if (exception instanceof RpcException) {
-      return exception.getError() as GrpcError;
-    }
-
-    if (exception instanceof Error) {
-      // Map domain exceptions to gRPC status codes
-      const errorMap: Record<string, Status> = {
-        NotFoundException: Status.NOT_FOUND,
-        UnauthorizedException: Status.UNAUTHENTICATED,
-        ForbiddenException: Status.PERMISSION_DENIED,
-        BadRequestException: Status.INVALID_ARGUMENT,
-        ConflictException: Status.ALREADY_EXISTS,
-        TooManyRequestsException: Status.RESOURCE_EXHAUSTED,
-        ServiceUnavailableException: Status.UNAVAILABLE,
-      };
-
-      const constructorName = exception.constructor.name;
-      const statusCode = errorMap[constructorName] || Status.INTERNAL;
-
-      return {
-        code: statusCode,
-        message: exception.message,
-        details: JSON.stringify({
-          type: constructorName,
-          timestamp: new Date().toISOString(),
-        }),
-      };
-    }
-
-    return {
-      code: Status.INTERNAL,
-      message: 'Internal server error',
-    };
-  }
-}
-```
-
----
-
-## Interceptors
-
-### Logging Interceptor
-
-```typescript
-// shared/src/grpc/interceptors/logging.interceptor.ts
-
-import { Injectable } from '@nestjs/common';
-import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
-import { GrpcInterceptor, GrpcCall } from '@grpc/grpc-js';
-
-export const createLoggingInterceptor = (): GrpcInterceptor => {
-  return {
-    interceptUnary<RequestType, ResponseType>(
-      methodDescriptor: any,
-      call: GrpcCall<RequestType, ResponseType>,
-    ) {
-      const method = methodDescriptor.path;
-      const startTime = Date.now();
-      
-      console.log(`gRPC call started: ${method}`);
-      
-      call.on('error', (error) => {
-        console.error(`gRPC call error: ${method}`, {
-          duration: Date.now() - startTime,
-          error: error.message,
-          code: error.code,
-        });
-      });
-
-      call.on('end', () => {
-        console.log(`gRPC call completed: ${method}`, {
-          duration: Date.now() - startTime,
-        });
-      });
-
-      return call;
-    },
   };
-};
-```
-
-### Authentication Interceptor
-
-```typescript
-// shared/src/grpc/interceptors/auth.interceptor.ts
-
-import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
-import { Metadata } from '@grpc/grpc-js';
-import { JwtService } from '@nestjs/jwt';
-
-@Injectable()
-export class GrpcAuthGuard implements CanActivate {
-  constructor(private readonly jwtService: JwtService) {}
-
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    const type = context.getType<string>();
-    
-    if (type !== 'rpc') {
-      return true;
-    }
-
-    const metadata = context.switchToRpc().getContext<Metadata>();
-    const authHeader = metadata.get('authorization')[0] as string;
-
-    if (!authHeader) {
-      throw new RpcException({
-        code: Status.UNAUTHENTICATED,
-        message: 'No authorization token provided',
-      });
-    }
-
-    const token = authHeader.replace('Bearer ', '');
-    
-    try {
-      const payload = await this.jwtService.verifyAsync(token);
-      
-      // Attach user to metadata สำหรับ downstream use
-      metadata.set('user-id', payload.sub);
-      metadata.set('user-email', payload.email);
-      
-      return true;
-    } catch (error) {
-      throw new RpcException({
-        code: Status.UNAUTHENTICATED,
-        message: 'Invalid or expired token',
-      });
-    }
-  }
 }
-```
 
-### Retry Interceptor (Client-side)
-
-```typescript
-// shared/src/grpc/interceptors/retry.interceptor.ts
-
-import {
-  CallOptions,
-  ClientInterceptor,
-  InterceptingCall,
-  Listener,
-  Metadata,
-  Requester,
-  StatusObject,
-} from '@grpc/grpc-js';
-import { Status } from '@grpc/grpc-js/build/src/constants';
-
-export function createRetryInterceptor(
-  maxRetries = 3,
-  retryableStatusCodes = [
-    Status.UNAVAILABLE,
-    Status.INTERNAL,
-    Status.RESOURCE_EXHAUSTED,
-  ]
-): ClientInterceptor {
-  return (options: CallOptions, nextCall: any) => {
-    let retryCount = 0;
-    let metadata: Metadata;
-    let requestMessage: any;
-
-    const requester: Requester = {
-      start: (meta: Metadata, listener: Listener, next: any) => {
-        metadata = meta;
-        next(meta, {
-          onReceiveStatus: (status: StatusObject, nextListener: any) => {
-            if (
-              retryCount < maxRetries &&
-              retryableStatusCodes.includes(status.code)
-            ) {
-              retryCount++;
-              const delay = Math.pow(2, retryCount) * 100; // exponential backoff
-              
-              setTimeout(() => {
-                const newCall = nextCall(options);
-                newCall.start(metadata, listener);
-                if (requestMessage) {
-                  newCall.sendMessage(requestMessage);
-                }
-                newCall.halfClose();
-              }, delay);
-              
-              return; // Don't call nextListener yet
-            }
-            
-            nextListener.onReceiveStatus(status);
+// Logging Interceptor
+export function createLoggingInterceptor() {
+  return function loggingInterceptor(
+    options: grpc.InterceptorOptions,
+    nextCall: grpc.NextCall
+  ): grpc.InterceptingCall {
+    const startTime = Date.now();
+    const method = options.method_definition.path;
+    
+    return new grpc.InterceptingCall(nextCall(options), {
+      start: function (metadata, listener, next) {
+        const correlationId = metadata.get('x-correlation-id')[0]?.toString() || 
+                             crypto.randomUUID();
+        
+        console.info({
+          message: 'gRPC request started',
+          method,
+          correlationId,
+        });
+        
+        next(metadata, {
+          onReceiveMessage: (message, next) => next(message),
+          onReceiveStatus: (status, next) => {
+            console.info({
+              message: 'gRPC request completed',
+              method,
+              status: status.code,
+              duration: Date.now() - startTime,
+              correlationId,
+            });
+            next(status);
           },
         });
       },
-      sendMessage: (message: any, next: any) => {
-        requestMessage = message;
-        next(message);
-      },
-      halfClose: (next: any) => next(),
-    };
-
-    return new InterceptingCall(nextCall(options), requester);
+    });
   };
 }
+
+// Apply interceptors to server
+server.addService(UserServiceService, userServiceImpl, {
+  interceptors: [
+    createLoggingInterceptor(),
+    createAuthInterceptor(jwtService),
+  ],
+});
 ```
 
 ---
 
-## Health Checking Protocol
+## 6. gRPC-Web for Browser Clients
 
 ```typescript
-// services/order/src/health/grpc-health.controller.ts
-// Implements gRPC Health Checking Protocol (grpc.health.v1)
+// web/src/grpc-web-client.ts
+import { GrpcWebFetchTransport } from "@protobuf-ts/grpcweb-transport";
+import { UserServiceClient } from "./generated/user.client";
 
-import { Controller } from '@nestjs/common';
-import { GrpcMethod } from '@nestjs/microservices';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
-import { InjectRedis } from '@liaoliaots/nestjs-redis';
-import Redis from 'ioredis';
+const transport = new GrpcWebFetchTransport({
+  baseUrl: process.env.REACT_APP_GRPC_WEB_URL || 'http://localhost:8080',
+  fetchInit: {
+    credentials: 'include',
+  },
+});
 
-enum ServingStatus {
-  UNKNOWN = 0,
-  SERVING = 1,
-  NOT_SERVING = 2,
-  SERVICE_UNKNOWN = 3,
+const userClient = new UserServiceClient(transport);
+
+// React Hook
+export function useUser(userId: string) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  
+  useEffect(() => {
+    const call = userClient.getUser({
+      userId,
+    });
+    
+    call.response.then(response => {
+      setUser(response.response);
+      setLoading(false);
+    }).catch(err => {
+      setError(err);
+      setLoading(false);
+    });
+    
+    return () => call.cancel();
+  }, [userId]);
+  
+  return { user, loading, error };
 }
 
-@Controller()
-export class HealthController {
-  constructor(
-    @InjectDataSource()
-    private readonly dataSource: DataSource,
-    @InjectRedis()
-    private readonly redis: Redis,
-  ) {}
-
-  @GrpcMethod('Health', 'Check')
-  async check(data: { service: string }) {
-    const checks = {
-      database: await this.checkDatabase(),
-      redis: await this.checkRedis(),
-    };
-
-    const isHealthy = Object.values(checks).every(Boolean);
-
-    return {
-      status: isHealthy ? ServingStatus.SERVING : ServingStatus.NOT_SERVING,
-    };
-  }
-
-  @GrpcMethod('Health', 'Watch')
-  watch(data: { service: string }) {
-    // Stream health status changes
-    // Implementation ขึ้นอยู่กับ use case
-  }
-
-  private async checkDatabase(): Promise<boolean> {
-    try {
-      await this.dataSource.query('SELECT 1');
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async checkRedis(): Promise<boolean> {
-    try {
-      await this.redis.ping();
-      return true;
-    } catch {
-      return false;
-    }
-  }
+// Server streaming hook
+export function useUserStream(filter?: string) {
+  const [users, setUsers] = useState<User[]>([]);
+  
+  useEffect(() => {
+    const call = userClient.listUsers({ filter });
+    
+    (async () => {
+      try {
+        for await (const user of call.responses) {
+          setUsers(prev => [...prev, user]);
+        }
+      } catch (error) {
+        if ((error as any).code !== 'CANCELLED') {
+          console.error(error);
+        }
+      }
+    })();
+    
+    return () => call.cancel();
+  }, [filter]);
+  
+  return users;
 }
 ```
 
 ```yaml
-# kubernetes/probes/order-service.yaml
-# ใช้ grpc_health_probe สำหรับ Kubernetes health checks
+# Envoy proxy config สำหรับ gRPC-Web
+# envoy.yaml
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: AUTO
+                stat_prefix: ingress_http
+                route_config:
+                  virtual_hosts:
+                    - name: local_service
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/user.v1.UserService" }
+                          route:
+                            cluster: user_grpc_service
+                      cors:
+                        allow_origin_string_match:
+                          - prefix: "*"
+                        allow_methods: GET, PUT, DELETE, POST, OPTIONS
+                        allow_headers: keep-alive,user-agent,cache-control,content-type,content-transfer-encoding,x-accept-content-transfer-encoding,x-accept-response-streaming,x-user-agent,x-grpc-web,grpc-timeout,authorization
+                        max_age: "1728000"
+                        expose_headers: grpc-status,grpc-message
+                http_filters:
+                  - name: envoy.filters.http.grpc_web
+                  - name: envoy.filters.http.cors
+                  - name: envoy.filters.http.router
 
-spec:
-  containers:
-  - name: order-service
-    image: company/order-service:latest
-    
-    livenessProbe:
-      exec:
-        command:
-        - /bin/grpc_health_probe
-        - -addr=:50051
-        - -service=order.v1.OrderService
-        - -rpc-timeout=5s
-      initialDelaySeconds: 30
-      periodSeconds: 10
-      failureThreshold: 3
-    
-    readinessProbe:
-      exec:
-        command:
-        - /bin/grpc_health_probe
-        - -addr=:50051
-        - -service=order.v1.OrderService
-      initialDelaySeconds: 5
-      periodSeconds: 5
+  clusters:
+    - name: user_grpc_service
+      connect_timeout: 0.25s
+      type: LOGICAL_DNS
+      lb_policy: ROUND_ROBIN
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: user_grpc_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: user-service
+                      port_value: 50051
 ```
 
 ---
 
-## gRPC Load Balancing
+## 7. gRPC Error Handling
 
 ```typescript
-// services/api-gateway/src/grpc/load-balancing.service.ts
-// Client-side load balancing ด้วย round-robin
-
-import { Injectable, OnModuleInit } from '@nestjs/common';
+// src/grpc/error-handler.ts
 import * as grpc from '@grpc/grpc-js';
-import { credentials, loadPackageDefinition } from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
 
-@Injectable()
-export class OrderServiceClient implements OnModuleInit {
-  private client: any;
+// Mapping application errors to gRPC status codes
+export class GrpcErrorHandler {
+  static toGrpcError(error: Error): grpc.ServiceError {
+    if (error instanceof NotFoundError) {
+      return {
+        code: grpc.status.NOT_FOUND,
+        details: error.message,
+        metadata: new grpc.Metadata(),
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    if (error instanceof ValidationError) {
+      return {
+        code: grpc.status.INVALID_ARGUMENT,
+        details: error.message,
+        metadata: new grpc.Metadata(),
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    if (error instanceof AuthenticationError) {
+      return {
+        code: grpc.status.UNAUTHENTICATED,
+        details: error.message,
+        metadata: new grpc.Metadata(),
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    if (error instanceof AuthorizationError) {
+      return {
+        code: grpc.status.PERMISSION_DENIED,
+        details: error.message,
+        metadata: new grpc.Metadata(),
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    if (error instanceof ConflictError) {
+      return {
+        code: grpc.status.ALREADY_EXISTS,
+        details: error.message,
+        metadata: new grpc.Metadata(),
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    if (error instanceof RateLimitError) {
+      const metadata = new grpc.Metadata();
+      metadata.add('retry-after', '60');
+      return {
+        code: grpc.status.RESOURCE_EXHAUSTED,
+        details: error.message,
+        metadata,
+        name: 'ServiceError',
+        message: error.message,
+      };
+    }
+    
+    // Default: internal error
+    return {
+      code: grpc.status.INTERNAL,
+      details: 'An internal error occurred',
+      metadata: new grpc.Metadata(),
+      name: 'ServiceError',
+      message: error.message,
+    };
+  }
+}
 
-  async onModuleInit(): Promise<void> {
-    const packageDef = await protoLoader.load(
-      'proto/order/v1/order.proto',
-      {
-        keepCase: true,
-        longs: String,
-        enums: String,
-      }
-    );
-
-    const proto = loadPackageDefinition(packageDef) as any;
-
-    // DNS load balancing - Kubernetes discovers all pods
-    this.client = new proto.order.v1.OrderService(
-      'dns:///order-service.production.svc.cluster.local:50051',
-      credentials.createInsecure(),
-      {
-        // Client-side round-robin load balancing
-        'grpc.service_config': JSON.stringify({
-          loadBalancingPolicy: 'round_robin',
-          methodConfig: [
-            {
-              name: [{ service: 'order.v1.OrderService' }],
-              retryPolicy: {
-                maxAttempts: 3,
-                initialBackoff: '0.1s',
-                maxBackoff: '1s',
-                backoffMultiplier: 2,
-                retryableStatusCodes: ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'],
-              },
-              timeout: '5s',
-            },
-          ],
-        }),
-        'grpc.keepalive_time_ms': 30000,
-        'grpc.keepalive_timeout_ms': 5000,
-      }
-    );
+// Client-side error handling
+export function handleGrpcError(error: grpc.ServiceError): never {
+  const message = error.details || error.message;
+  
+  switch (error.code) {
+    case grpc.status.NOT_FOUND:
+      throw new NotFoundError(message);
+    case grpc.status.INVALID_ARGUMENT:
+      throw new ValidationError(message);
+    case grpc.status.UNAUTHENTICATED:
+      throw new AuthenticationError(message);
+    case grpc.status.PERMISSION_DENIED:
+      throw new AuthorizationError(message);
+    case grpc.status.ALREADY_EXISTS:
+      throw new ConflictError(message);
+    case grpc.status.RESOURCE_EXHAUSTED:
+      throw new RateLimitError(message);
+    case grpc.status.UNAVAILABLE:
+      throw new ServiceUnavailableError(message);
+    default:
+      throw new Error(`gRPC error ${error.code}: ${message}`);
   }
 }
 ```
 
 ---
 
-## gRPC-web สำหรับ Browser
+## 8. gRPC Health Checking Protocol
+
+```protobuf
+// proto/grpc/health/v1/health.proto (standard)
+syntax = "proto3";
+
+package grpc.health.v1;
+
+message HealthCheckRequest {
+  string service = 1;  // ว่างหมายถึงตรวจสอบ server โดยรวม
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+}
+
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+```
 
 ```typescript
-// frontend/src/grpc/order-client.ts
-// gRPC-web client สำหรับ React/Vue frontend
+// src/grpc/health.service.ts
+import * as grpc from '@grpc/grpc-js';
+import { 
+  HealthImplementation,
+  ServingStatusMap 
+} from 'grpc-health-check';
 
-import {
-  OrderServiceClient,
-  CreateOrderRequest,
-  OrderItem,
-  Address,
-} from './generated/order/v1/order_grpc_web_pb';
-import { OrderServicePromiseClient } from './generated/order/v1/order_grpc_web_pb';
-import { AuthInterceptor } from './interceptors/auth.interceptor';
+export class HealthService {
+  private health: HealthImplementation;
+  private services: Map<string, ServingStatusMap[keyof ServingStatusMap]> = new Map();
 
-// สร้าง gRPC-web client
-const authInterceptor = new AuthInterceptor(getAuthToken);
+  constructor() {
+    this.health = new HealthImplementation({});
+  }
 
-export const orderClient = new OrderServicePromiseClient(
-  process.env.REACT_APP_GRPC_GATEWAY_URL || 'http://localhost:8080',
-  null,
+  setStatus(service: string, status: 'SERVING' | 'NOT_SERVING'): void {
+    this.services.set(service, status === 'SERVING' 
+      ? HealthImplementation.status.SERVING 
+      : HealthImplementation.status.NOT_SERVING);
+    
+    this.health.setStatus(service, this.services.get(service)!);
+  }
+
+  addToServer(server: grpc.Server): void {
+    // Add health service to gRPC server
+    this.health.addToServer(server);
+    
+    // Set initial status
+    this.setStatus('', 'SERVING');
+    this.setStatus('user.v1.UserService', 'SERVING');
+  }
+
+  async checkDependencies(): Promise<void> {
+    try {
+      await this.dbService.ping();
+      await this.redisService.ping();
+      this.setStatus('user.v1.UserService', 'SERVING');
+    } catch (error) {
+      console.error('Health check failed:', error);
+      this.setStatus('user.v1.UserService', 'NOT_SERVING');
+    }
+  }
+}
+
+// Kubernetes liveness/readiness probe
+// kubectl -n prod exec pod -- grpc_health_probe -addr=:50051
+```
+
+---
+
+## 9. gRPC Reflection for Debugging
+
+```typescript
+// src/grpc/reflection.ts
+import { addReflection } from 'grpc-server-reflection';
+import * as grpc from '@grpc/grpc-js';
+
+export function addReflectionToServer(
+  server: grpc.Server,
+  protoFiles: string[]
+): void {
+  if (process.env.GRPC_REFLECTION_ENABLED !== 'true') {
+    return;
+  }
+  
+  addReflection(server, protoFiles);
+  
+  console.info('gRPC reflection enabled for debugging');
+}
+
+// Usage สำหรับ debug ด้วย grpcurl:
+// grpcurl -plaintext localhost:50051 list
+// grpcurl -plaintext localhost:50051 list user.v1.UserService
+// grpcurl -plaintext -d '{"user_id":"123"}' localhost:50051 user.v1.UserService/GetUser
+```
+
+---
+
+## 10. gRPC Load Balancing Strategies
+
+```typescript
+// src/grpc/load-balancer.ts
+
+// Service mesh approach (Kubernetes + Istio/Linkerd)
+// DNS resolution: user-service.default.svc.cluster.local:50051
+
+// Client-side load balancing
+const client = new UserServiceClient(
+  'dns:///user-service:50051',  // DNS round-robin
+  grpc.credentials.createInsecure(),
   {
-    unaryInterceptors: [authInterceptor],
-    streamInterceptors: [authInterceptor],
+    'grpc.service_config': JSON.stringify({
+      loadBalancingConfig: [
+        { round_robin: {} },
+        // หรือ
+        // { grpclb: {} }
+        // { pick_first: {} }
+      ],
+    }),
+    // Keepalive สำหรับ detect dead connections
+    'grpc.keepalive_time_ms': 30000,
+    'grpc.keepalive_timeout_ms': 5000,
+    'grpc.keepalive_permit_without_calls': 1,
   }
 );
 
-// Unary call
-export async function createOrder(params: {
-  userId: string;
-  items: Array<{ productId: string; quantity: number }>;
-  shippingAddress: {
-    street: string;
-    city: string;
-    postalCode: string;
-  };
-}): Promise<Order> {
-  const request = new CreateOrderRequest();
-  request.setUserId(params.userId);
-  request.setIdempotencyKey(crypto.randomUUID());
-
-  for (const item of params.items) {
-    const orderItem = new OrderItem();
-    orderItem.setProductId(item.productId);
-    orderItem.setQuantity(item.quantity);
-    request.addItems(orderItem);
-  }
-
-  const address = new Address();
-  address.setStreet(params.shippingAddress.street);
-  address.setCity(params.shippingAddress.city);
-  address.setPostalCode(params.shippingAddress.postalCode);
-  address.setCountryCode('TH');
-  request.setShippingAddress(address);
-
-  const order = await orderClient.createOrder(request, {});
-  return order.toObject();
-}
-
-// Server streaming - Watch order status
-export function watchOrder(
-  orderId: string,
-  onEvent: (event: OrderEvent) => void,
-  onError: (error: Error) => void,
-  onComplete: () => void,
-): () => void {
-  const request = new WatchOrderRequest();
-  request.setOrderId(orderId);
-
-  const stream = orderClient.watchOrder(request, {});
-
-  stream.on('data', (event) => {
-    onEvent(event.toObject());
-  });
-
-  stream.on('error', onError);
-  stream.on('end', onComplete);
-
-  // Return cancel function
-  return () => stream.cancel();
-}
+// gRPC over Kubernetes Service
+// user-service headless service allows client to discover all pods
+// kubectl create service clusterip user-service-headless --clusterip=None
 ```
 
 ```yaml
-# kubernetes/envoy/grpc-web-proxy.yaml
-# Envoy Proxy สำหรับ gRPC-web transcoding
-
+# kubernetes/user-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-headless
+  namespace: production
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    app: user-service
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: envoy-grpc-gateway
+  name: user-service
   namespace: production
 spec:
-  replicas: 2
+  replicas: 3
+  selector:
+    matchLabels:
+      app: user-service
   template:
+    metadata:
+      labels:
+        app: user-service
     spec:
       containers:
-      - name: envoy
-        image: envoyproxy/envoy:v1.28.0
-        ports:
-        - containerPort: 8080  # HTTP/gRPC-web port
-        - containerPort: 9901  # Admin port
-        volumeMounts:
-        - name: envoy-config
-          mountPath: /etc/envoy
-      volumes:
-      - name: envoy-config
-        configMap:
-          name: envoy-config
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: envoy-config
-data:
-  envoy.yaml: |
-    static_resources:
-      listeners:
-      - name: listener_0
-        address:
-          socket_address:
-            protocol: TCP
-            address: 0.0.0.0
-            port_value: 8080
-        filter_chains:
-        - filters:
-          - name: envoy.filters.network.http_connection_manager
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-              stat_prefix: ingress_http
-              codec_type: AUTO
-              route_config:
-                name: local_route
-                virtual_hosts:
-                - name: backend
-                  domains: ["*"]
-                  routes:
-                  - match:
-                      prefix: "/order.v1.OrderService"
-                    route:
-                      cluster: order_service_grpc
-              http_filters:
-              - name: envoy.filters.http.grpc_web  # gRPC-web support
-                typed_config:
-                  "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb
-              - name: envoy.filters.http.cors
-                typed_config:
-                  "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
-              - name: envoy.filters.http.router
-                typed_config:
-                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-      
-      clusters:
-      - name: order_service_grpc
-        connect_timeout: 5s
-        type: STRICT_DNS
-        http2_protocol_options: {}  # Force HTTP/2 for gRPC
-        load_assignment:
-          cluster_name: order_service_grpc
-          endpoints:
-          - lb_endpoints:
-            - endpoint:
-                address:
-                  socket_address:
-                    address: order-service.production.svc.cluster.local
-                    port_value: 50051
+        - name: user-service
+          image: user-service:latest
+          ports:
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            exec:
+              command: ["/bin/grpc_health_probe", "-addr=:50051"]
+            initialDelaySeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/grpc_health_probe", "-addr=:50051"]
+            initialDelaySeconds: 10
 ```
 
 ---
 
-## gRPC Reflection สำหรับ Development
+## สรุปท้ายบท
 
-```typescript
-// services/order/src/main.ts - เพิ่ม reflection ใน development
+| หัวข้อ | gRPC | REST |
+|--------|------|------|
+| Serialization | Protobuf (binary, ~5-10x smaller) | JSON (text) |
+| Latency | ~20-30% faster | Baseline |
+| Type Safety | Compile-time | Runtime (with tools) |
+| Streaming | Native bidirectional | Limited |
+| Browser Support | Via proxy (gRPC-Web) | Native |
+| Learning Curve | สูงกว่า | ต่ำกว่า |
+| Tooling | ดี (grpcurl, Postman) | ดีมาก |
+| Caching | ยาก | ง่าย (HTTP cache headers) |
 
-import { ReflectionService } from '@grpc/reflection';
+### เมื่อไหร่ควรใช้ gRPC
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  
-  if (process.env.NODE_ENV !== 'production') {
-    // Enable gRPC reflection (ทำให้ grpcurl/grpc-ui ทำงานได้)
-    app.connectMicroservice<MicroserviceOptions>({
-      transport: Transport.GRPC,
-      options: {
-        package: ['order.v1', 'grpc.reflection.v1alpha'],
-        protoPath: [
-          join(__dirname, '../proto/order/v1/order.proto'),
-          join(__dirname, '../proto/grpc/reflection.proto'),
-        ],
-        url: '0.0.0.0:50051',
-      },
-    });
-  }
-}
-```
+1. **Internal service-to-service** communication ที่ต้องการ performance สูง
+2. **Real-time streaming** data (server push, bidirectional)
+3. **Polyglot microservices** ที่ใช้หลายภาษา (code generation จาก proto)
+4. **Strongly-typed API** ที่ต้องการ compile-time safety
+5. **Mobile/IoT** clients ที่ bandwidth มีจำกัด
 
-```bash
-# Testing gRPC endpoints ด้วย grpcurl
+### เมื่อไหร่ควรใช้ REST
 
-# List services
-grpcurl -plaintext localhost:50051 list
-
-# List methods ใน service
-grpcurl -plaintext localhost:50051 list order.v1.OrderService
-
-# Describe message type
-grpcurl -plaintext localhost:50051 describe order.v1.CreateOrderRequest
-
-# Call unary RPC
-grpcurl -plaintext \
-  -H "Authorization: Bearer <token>" \
-  -d '{
-    "user_id": "user-123",
-    "items": [{"product_id": "prod-456", "quantity": 2}],
-    "shipping_address": {
-      "street": "123 Sukhumvit Rd",
-      "city": "Bangkok",
-      "postal_code": "10110",
-      "country_code": "TH"
-    },
-    "idempotency_key": "order-req-uuid-here"
-  }' \
-  localhost:50051 \
-  order.v1.OrderService/CreateOrder
-
-# Stream RPC
-grpcurl -plaintext \
-  -H "Authorization: Bearer <token>" \
-  -d '{"order_id": "order-789"}' \
-  localhost:50051 \
-  order.v1.OrderService/WatchOrder
-```
-
----
-
-## Proto Schema Evolution (Backward Compatibility)
-
-```protobuf
-// proto/order/v1/order.proto - Best practices สำหรับ backward compatibility
-
-message Order {
-  // Field numbers ห้ามเปลี่ยน หรือ reuse
-  string id = 1;
-  string user_id = 2;
-  OrderStatus status = 3;
-  
-  // ถ้าต้องการลบ field ให้ใช้ reserved แทนการลบ
-  reserved 4;  // was: string old_field = 4;
-  reserved "old_field";
-  
-  // เพิ่ม fields ใหม่ได้โดยใช้ field number ใหม่ (สูงกว่าเดิม)
-  repeated OrderItem items = 5;
-  Money total_amount = 6;
-  
-  // New fields in v2 - clients เก่าจะ ignore
-  string tracking_number = 10;
-  DeliveryInfo delivery_info = 11;
-}
-
-// ถ้าเปลี่ยน Enum ให้เพิ่มค่าใหม่ ไม่ลบค่าเดิม
-enum OrderStatus {
-  ORDER_STATUS_UNSPECIFIED = 0;
-  ORDER_STATUS_PENDING = 1;
-  ORDER_STATUS_CONFIRMED = 2;
-  // ห้ามลบ values เดิม
-  // ORDER_STATUS_DEPRECATED = 3;  // ← ถ้าต้องการ deprecate
-  ORDER_STATUS_PROCESSING = 4;  // เพิ่มใหม่ได้
-}
-```
-
----
-
-## สรุป
-
-gRPC เป็นเครื่องมือที่ทรงพลังสำหรับ internal microservices communication:
-
-| Feature | Best Practice |
-|---------|---------------|
-| Proto definition | ใช้ validation rules, reserved fields |
-| Streaming | Unary default, streaming เมื่อจำเป็น |
-| Error handling | Map domain errors to gRPC status codes |
-| Interceptors | Auth, logging, retry ใน interceptor layer |
-| Health check | Implement gRPC health checking protocol |
-| Load balancing | Client-side LB + K8s DNS |
-| gRPC-web | Envoy proxy สำหรับ browser clients |
-| Reflection | เปิดเฉพาะ non-production |
-| Schema evolution | ไม่เปลี่ยน field numbers, ใช้ reserved |
-
-ข้อควรระวัง:
-1. **gRPC ไม่เหมาะกับ public API** เนื่องจาก browser support ยังจำกัด
-2. **Backward compatibility** — ต้องระวังเรื่อง proto schema changes มาก
-3. **Debugging** ยากกว่า REST เนื่องจาก binary format — ใช้ grpcurl/grpcui
-4. **ไม่มี built-in caching** ต้องทำเองถ้าต้องการ
+1. **Public APIs** ที่ต้องการ browser compatibility
+2. **Simple CRUD operations** ที่ไม่ต้องการ streaming
+3. **Team ที่ familiar กับ REST** มากกว่า
+4. **Caching** เป็น requirement หลัก

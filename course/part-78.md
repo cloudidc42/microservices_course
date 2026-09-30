@@ -1,4 +1,4 @@
-# Part 78: Service Mesh Advanced
+# Part 78: Microservices Scalability Patterns
 
 ## บทนำ
 
