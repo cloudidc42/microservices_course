@@ -1,934 +1,1344 @@
-# Part 96: Microservices Roadmap 2024-2025
+# Part 96: Microservices Technology Roadmap
 
-## บทนำ
+## แผนที่เทคโนโลยี Microservices (2024-2025 และอนาคต)
 
-โลกของ Microservices กำลังเปลี่ยนแปลงอย่างรวดเร็ว บทนี้จะสำรวจ Emerging Trends, เทคโนโลยีใหม่ที่กำลังมา, และทิศทางที่นักพัฒนาต้องเตรียมตัว ตั้งแต่ eBPF, WebAssembly, Dapr, Next-gen Service Mesh, Serverless Microservices, AI-augmented Operations ไปจนถึง Green Computing
+ในบทนี้เราจะสำรวจทิศทางการพัฒนาของ Microservices ecosystem รวมถึงเทคโนโลยีใหม่ที่กำลังเข้ามามีบทบาท
 
 ---
 
-## 1. eBPF: The Future of Observability & Networking
+## 1. สถานะปัจจุบันของ Microservices Ecosystem (2024-2025)
 
-### 1.1 eBPF คืออะไร?
+### ภาพรวม
 
-```
-eBPF (Extended Berkeley Packet Filter) คือ Technology ที่ให้เรา
-Run Code ใน Linux Kernel โดยไม่ต้องแก้ Kernel Source Code
+Microservices ได้กลายเป็นแนวทางหลักสำหรับระบบขนาดใหญ่แล้ว โดยมีการนำมาใช้อย่างแพร่หลาย:
 
-Traditional Approach:        eBPF Approach:
-┌────────────────────┐       ┌────────────────────────────────┐
-│   User Space       │       │   User Space                   │
-│  ┌──────────────┐  │       │  ┌──────────────┐              │
-│  │ Application  │  │       │  │ eBPF Programs│              │
-│  └──────────────┘  │       │  └──────────┬───┘              │
-│  ┌──────────────┐  │       │             │ Load & Verify     │
-│  │ Kernel Module│  │       └─────────────┼──────────────────┘
-│  │ (risky!)     │  │       ┌─────────────▼──────────────────┐
-│  └──────────────┘  │       │   Kernel Space                 │
-│         ↕          │       │  ┌──────────────────────────┐  │
-│  Kernel Space      │       │  │ eBPF JIT-compiled code   │  │
-└────────────────────┘       │  │ (safe sandbox)            │  │
-                              │  └──────────────────────────┘  │
-                              └────────────────────────────────┘
+| ด้าน | สถานะ 2024-2025 |
+|------|----------------|
+| Container Orchestration | Kubernetes เป็น Standard de facto |
+| Service Mesh | Istio และ Linkerd เติบโตสูง |
+| GitOps | ArgoCD/Flux กลายเป็น Default |
+| Observability | OpenTelemetry เป็น Standard |
+| API Gateway | Kong, Traefik, Envoy แข่งขันกัน |
+| Serverless | Lambda/Cloud Functions รวมกับ Microservices |
 
-ความสามารถ:
-- Zero-overhead observability
-- Network policy enforcement ใน kernel
-- Performance profiling
-- Security monitoring (รู้ทันที มีใครพยายาม escape container)
-```
+---
 
-### 1.2 eBPF Use Cases ใน Microservices
+## 2. eBPF - เทคโนโลยีที่เปลี่ยนเกม
+
+eBPF (extended Berkeley Packet Filter) ช่วยให้รัน Code ใน Linux Kernel ได้โดยตรง ทำให้ Observability และ Security เปลี่ยนไปมาก
 
 ```
-1. Network Observability (Cilium Hubble):
-   - ดู L3/L4/L7 traffic ระหว่าง Services โดยไม่ต้องแก้ Application code
-   - Network policy enforcement
-   - Load balancing ใน kernel (เร็วกว่า iptables 100x)
-
-2. Distributed Tracing ไม่ต้อง Instrument:
-   - Pixie (ของ New Relic): Auto-instruments requests
-   - Pyroscope: Continuous profiling
-
-3. Security:
-   - Tetragon (Cilium): Runtime security
-   - Falco: Container runtime security
-   - ตรวจจับ Privilege escalation ได้ทันที
-
-ตัวอย่าง: Cilium บน Kubernetes
+                    eBPF Architecture
+    ┌─────────────────────────────────────────────┐
+    │              User Space                      │
+    │  BPF Program  ──►  BPF Verifier              │
+    │                         │                    │
+    │                    JIT Compiler              │
+    │                         │                    │
+    ├─────────────────────────┼────────────────────┤
+    │           Kernel Space  │                    │
+    │                         ▼                    │
+    │              BPF Maps ◄──► BPF Programs      │
+    │                    │                         │
+    │         ┌───────────┼───────────┐            │
+    │         ▼           ▼           ▼            │
+    │      Network     Tracing     Security        │
+    │     (XDP/TC)    (kprobe)     (LSM)           │
+    └─────────────────────────────────────────────┘
 ```
 
-### 1.3 Cilium Setup
+### eBPF ใน Microservices
 
-```yaml
-# k8s/cilium-values.yaml
-# ติดตั้ง Cilium แทน kube-proxy
-cilium:
-  kubeProxyReplacement: "strict"
-  hubble:
-    enabled: true
-    relay:
-      enabled: true
-    ui:
-      enabled: true
-  loadBalancer:
-    algorithm: "maglev"  # Better than round-robin
-  bpf:
-    masquerade: true
-  
-  # Network Policy เพิ่ม L7 (HTTP)
-  # ตัวอย่าง: Order Service ได้รับแค่ GET/POST เท่านั้น
+```typescript
+// cilium-network-policy.yaml
+// ใช้ Cilium (eBPF-based) แทน iptables สำหรับ Network Policy
 ```
 
 ```yaml
-# Network Policy ระดับ L7 ด้วย Cilium
-apiVersion: "cilium.io/v2"
+# cilium-network-policy.yaml
+apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: order-service-policy
+  name: allow-order-to-payment
+  namespace: production
 spec:
   endpointSelector:
     matchLabels:
-      app: order-service
+      app: payment-service
   ingress:
-  - fromEndpoints:
-    - matchLabels:
-        app: api-gateway
-    toPorts:
-    - ports:
-      - port: "8080"
-        protocol: TCP
-      rules:
-        http:
-        - method: "GET"
-          path: "/api/v1/orders/.*"
-        - method: "POST"
-          path: "/api/v1/orders"
-        # Block DELETE explicitly
+    - fromEndpoints:
+        - matchLabels:
+            app: order-service
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+          rules:
+            http:
+              - method: POST
+                path: /api/v1/payments
+              - method: GET
+                path: /api/v1/payments/.*
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+---
+# eBPF-based Observability ด้วย Tetragon
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: payment-syscall-monitor
+spec:
+  kprobes:
+    - call: sys_connect
+      syscall: true
+      args:
+        - index: 0
+          type: int
+      selectors:
+        - matchBinaries:
+            - operator: In
+              values:
+                - /usr/local/bin/node
+```
+
+### eBPF ใน Observability
+
+```yaml
+# hubble-flow-tracing.yaml
+# Hubble คือ Network Observability ที่ใช้ eBPF ผ่าน Cilium
+
+# ดู Network Flow ระหว่าง Services
+# hubble observe --namespace production --follow
+
+# ตัวอย่าง Output:
+# Jul  4 10:00:00.000 production/order-service:50234 
+#   -> production/payment-service:3000 http-request 
+#   FORWARDED (TCP Flags: ACK)
 ```
 
 ---
 
-## 2. WebAssembly (Wasm) ใน Microservices
+## 3. WebAssembly (WASM) ใน Microservices
 
-### 2.1 Wasm Edge Computing
+WASM กำลังเปลี่ยนวิธีที่เราทำ Microservices โดยเฉพาะใน Edge Computing
 
+```typescript
+// wasm-plugin/src/plugin.ts
+// Envoy Proxy WASM Plugin สำหรับ Request Transformation
+
+// Plugin นี้เขียนด้วย Rust แล้วคอมไพล์เป็น WASM
+// ตัวอย่างนี้แสดง Concept
+
+export class RequestTransformPlugin {
+  // ใช้ WASM เพิ่ม Header ให้ทุก Request
+  onRequestHeaders(numHeaders: number): FilterHeadersStatus {
+    this.addRequestHeader('X-Request-ID', generateUUID());
+    this.addRequestHeader('X-Service-Name', 'my-microservice');
+    
+    // ตรวจสอบ JWT Token
+    const authHeader = this.getRequestHeader('Authorization');
+    if (authHeader) {
+      const userId = this.extractUserIdFromJWT(authHeader);
+      if (userId) {
+        this.addRequestHeader('X-User-ID', userId);
+      }
+    }
+    
+    return FilterHeadersStatus.Continue;
+  }
+
+  private generateUUID(): string {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
+  private extractUserIdFromJWT(authHeader: string): string | null {
+    try {
+      const token = authHeader.replace('Bearer ', '');
+      const [, payload] = token.split('.');
+      const decoded = JSON.parse(atob(payload));
+      return decoded.sub || null;
+    } catch {
+      return null;
+    }
+  }
+}
 ```
-WebAssembly กำลังเปลี่ยนจาก "Browser only" เป็น "Everywhere"
 
-Traditional Container:         Wasm Module:
-┌─────────────────────┐        ┌──────────────────────────┐
-│  Container Image    │        │  Wasm Binary (.wasm)     │
-│  ┌───────────────┐  │        │  ┌──────────────────┐    │
-│  │ OS Libs (200MB│  │        │  │  Pure Business   │    │
-│  │ Runtime       │  │        │  │  Logic (100KB)   │    │
-│  │ App Binary    │  │        │  └──────────────────┘    │
-│  └───────────────┘  │        │  + WASI (System calls)   │
-│  Start time: 100ms+ │        │  Start time: < 1ms!      │
-└─────────────────────┘        └──────────────────────────┘
-
-Use Cases:
-1. Edge Functions (Cloudflare Workers, Fastly Compute)
-2. Plugin Systems (eBPF alternative)
-3. Serverless ที่เริ่ม Fast กว่า Container
-4. Cross-platform Business Logic (same code, any platform)
+```yaml
+# envoy-wasm-config.yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: request-transform-filter
+  namespace: production
+spec:
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.wasm
+          typedConfig:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+            config:
+              name: request_transform
+              vmConfig:
+                runtime: envoy.wasm.runtime.v8
+                code:
+                  local:
+                    filename: /etc/wasm/request-transform.wasm
 ```
 
-### 2.2 Wasm Serverless Function
+### Fermyon Spin - WASM Microservices Framework
 
 ```rust
-// edge-functions/src/rate_limiter.rs
-// Runs on Cloudflare Workers as Wasm
+// spin-app/src/lib.rs
+use spin_sdk::http::{IntoResponse, Request, Response};
+use spin_sdk::http_component;
 
-use worker::*;
-use std::collections::HashMap;
-
-#[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    let url = req.url()?;
-    let path = url.path();
+/// Simple Rust WASM Microservice
+#[http_component]
+fn handle_request(req: Request) -> anyhow::Result<impl IntoResponse> {
+    println!("Handling request to {:?}", req.header("spin-path-info"));
     
-    // Get client IP
-    let ip = req.headers().get("CF-Connecting-IP")?
-        .unwrap_or("unknown".to_string());
-    
-    // Rate limit check using Cloudflare KV
-    let kv = env.kv("RATE_LIMITS")?;
-    let key = format!("{}:{}", ip, &path[..path.find('/').unwrap_or(path.len())]);
-    
-    let count: u32 = kv.get(&key)
-        .text()
-        .await?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    
-    if count >= 100 {
-        return Response::error("Rate limit exceeded", 429);
-    }
-    
-    // Increment counter
-    kv.put(&key, (count + 1).to_string())?
-        .expiration_ttl(60) // Reset every minute
-        .execute()
-        .await?;
-    
-    // Forward to origin
-    let mut headers = Headers::new();
-    headers.set("X-RateLimit-Remaining", &(100 - count - 1).to_string())?;
-    
-    let mut init = RequestInit::new();
-    init.with_headers(headers);
-    
-    Fetch::Request(Request::new_with_init(
-        &format!("https://origin.example.com{}", path),
-        &init
-    )?)
-    .send()
-    .await
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(r#"{"message": "Hello from WASM Microservice!"}"#)
+        .build())
 }
+```
+
+```toml
+# spin.toml - Fermyon Spin Config
+spin_manifest_version = 2
+
+[application]
+name = "payment-wasm"
+version = "1.0.0"
+
+[[trigger.http]]
+route = "/api/..."
+component = "payment"
+
+[component.payment]
+source = "target/wasm32-wasi/release/payment_service.wasm"
+allowed_outbound_hosts = ["https://api.stripe.com"]
+key_value_stores = ["default"]
 ```
 
 ---
 
-## 3. Dapr (Distributed Application Runtime)
+## 4. Dapr - Distributed Application Runtime
 
-### 3.1 Dapr Overview
-
-```
-Dapr คือ Portable, Event-driven Runtime สำหรับ Microservices
-ที่แก้ปัญหา Distributed Systems โดยไม่ต้องเขียน Boilerplate Code
-
-What Dapr provides:
-┌────────────────────────────────────────────────────────────────┐
-│                        Dapr Building Blocks                     │
-├──────────────────┬─────────────────────────────────────────────┤
-│ Service Invoke   │ gRPC/HTTP service-to-service calls          │
-│                  │ + auto retry, mTLS, tracing                 │
-├──────────────────┼─────────────────────────────────────────────┤
-│ State Management │ Key-Value store (Redis, Cosmos, DynamoDB)    │
-│                  │ Transactional operations                     │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Pub/Sub          │ Message broker (Kafka, Redis, NATS)         │
-│                  │ At-least-once delivery                       │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Bindings         │ Input/Output to external systems            │
-│                  │ (S3, databases, email, etc.)                │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Actors           │ Virtual Actors pattern                       │
-│                  │ (stateful, single-threaded compute)         │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Secrets          │ Vault, Kubernetes secrets                   │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Config           │ Configuration management                     │
-├──────────────────┼─────────────────────────────────────────────┤
-│ Workflow         │ Long-running workflows (Saga replacement)   │
-└──────────────────┴─────────────────────────────────────────────┘
-```
-
-### 3.2 Dapr Implementation ตัวอย่าง
-
-```go
-// order-service/main.go with Dapr
-package main
-
-import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "net/http"
-    
-    dapr "github.com/dapr/go-sdk/client"
-    "github.com/dapr/go-sdk/service/common"
-    daprd "github.com/dapr/go-sdk/service/http"
-)
-
-func main() {
-    // Create Dapr service
-    s := daprd.NewService(":8080")
-    
-    // Subscribe to events
-    s.AddTopicEventHandler(&common.Subscription{
-        PubsubName: "order-pubsub",
-        Topic:      "payment.completed",
-    }, handlePaymentCompleted)
-    
-    // Add service invocation handler
-    s.AddServiceInvocationHandler("create-order", createOrderHandler)
-    
-    s.Start()
-}
-
-func createOrderHandler(ctx context.Context, in *common.InvocationEvent) (*common.Content, error) {
-    client, err := dapr.NewClient()
-    if err != nil {
-        return nil, err
-    }
-    defer client.Close()
-    
-    var req CreateOrderRequest
-    json.Unmarshal(in.Data, &req)
-    
-    order := processOrder(req)
-    
-    // Save state via Dapr (abstracts Redis/Cosmos/etc.)
-    orderData, _ := json.Marshal(order)
-    client.SaveState(ctx, "order-store", order.ID, orderData, nil)
-    
-    // Publish event via Dapr (abstracts Kafka/RabbitMQ/etc.)
-    eventData, _ := json.Marshal(OrderCreatedEvent{
-        OrderID:   order.ID,
-        CustomerID: req.CustomerID,
-        Amount:    order.Total,
-    })
-    client.PublishEvent(ctx, "order-pubsub", "order.created", eventData)
-    
-    // Call payment service via Dapr service invocation
-    paymentResp, err := client.InvokeMethodWithContent(ctx,
-        "payment-service",   // Dapr App ID
-        "charge",            // Method
-        "POST",
-        &dapr.DataContent{
-            ContentType: "application/json",
-            Data:        chargeData,
-        },
-    )
-    
-    respData, _ := json.Marshal(order)
-    return &common.Content{
-        ContentType: "application/json",
-        Data:        respData,
-    }, nil
-}
-
-func handlePaymentCompleted(ctx context.Context, e *common.TopicEvent) (retry bool, err error) {
-    var event PaymentCompletedEvent
-    json.Unmarshal(e.RawData, &event)
-    
-    client, _ := dapr.NewClient()
-    defer client.Close()
-    
-    // Update order status
-    orderData, _ := client.GetState(ctx, "order-store", event.OrderID, nil)
-    
-    var order Order
-    json.Unmarshal(orderData.Value, &order)
-    order.Status = "confirmed"
-    
-    newData, _ := json.Marshal(order)
-    client.SaveState(ctx, "order-store", order.ID, newData, nil)
-    
-    return false, nil
-}
-```
-
-### 3.3 Dapr Component Configuration
+Dapr ช่วยให้ Microservices ไม่ต้องรู้จัก Infrastructure ที่อยู่เบื้องหลัง
 
 ```yaml
-# dapr/components/pubsub.yaml
-# เปลี่ยน Backend ได้โดยไม่แก้ Code!
+# dapr-components/pubsub.yaml
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:
-  name: order-pubsub
+  name: pubsub
+  namespace: production
 spec:
-  type: pubsub.kafka  # เปลี่ยนเป็น pubsub.redis ได้ทันที
+  type: pubsub.kafka
   version: v1
   metadata:
-  - name: brokers
-    value: "kafka-broker:9092"
-  - name: consumerGroup
-    value: "order-service"
-  - name: authType
-    value: "none"
-
+    - name: brokers
+      value: kafka:9092
+    - name: consumerGroup
+      value: order-service
+    - name: authType
+      value: none
 ---
-# dapr/components/statestore.yaml
+# dapr-components/statestore.yaml
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:
-  name: order-store
+  name: statestore
+  namespace: production
 spec:
-  type: state.redis   # เปลี่ยนเป็น state.postgresql ได้ทันที
+  type: state.redis
   version: v1
   metadata:
-  - name: redisHost
-    value: "redis:6379"
-  - name: enableTLS
-    value: "false"
+    - name: redisHost
+      value: redis:6379
+    - name: actorStateStore
+      value: "true"
+```
+
+```typescript
+// order-service/src/order-dapr.service.ts
+import { Injectable } from '@nestjs/common';
+import { DaprClient, DaprServer, CommunicationProtocolEnum } from '@dapr/dapr';
+
+@Injectable()
+export class OrderDaprService {
+  private readonly daprClient: DaprClient;
+
+  constructor() {
+    this.daprClient = new DaprClient({
+      daprHost: 'localhost',
+      daprPort: '3500',
+      communicationProtocol: CommunicationProtocolEnum.HTTP,
+    });
+  }
+
+  // Publish Event ผ่าน Dapr Pub/Sub
+  async publishOrderCreated(order: any): Promise<void> {
+    await this.daprClient.pubsub.publish('pubsub', 'order-created', order);
+  }
+
+  // บันทึก State ผ่าน Dapr State Store
+  async saveOrderState(orderId: string, state: any): Promise<void> {
+    await this.daprClient.state.save('statestore', [{
+      key: `order:${orderId}`,
+      value: state,
+    }]);
+  }
+
+  // เรียก Service อื่นผ่าน Dapr Service Invocation
+  async callPaymentService(paymentRequest: any): Promise<any> {
+    return this.daprClient.invoker.invoke(
+      'payment-service',
+      'process-payment',
+      'POST',
+      paymentRequest,
+    );
+  }
+
+  // ใช้ Dapr Secret Store
+  async getStripeApiKey(): Promise<string> {
+    const secret = await this.daprClient.secret.get(
+      'vault-secret-store',
+      'stripe-api-key',
+    );
+    return secret['stripe-api-key'];
+  }
+
+  // Dapr Actor สำหรับ Order State Machine
+  async createOrderActor(orderId: string): Promise<any> {
+    return this.daprClient.actor.proxy.create<OrderActor>(
+      OrderActorImpl,
+      orderId,
+    );
+  }
+}
+```
+
+```typescript
+// actors/order-actor.ts
+import { AbstractActor } from '@dapr/dapr';
+
+export interface OrderActor {
+  processOrder(request: any): Promise<void>;
+  getStatus(): Promise<string>;
+  cancelOrder(reason: string): Promise<void>;
+}
+
+export class OrderActorImpl extends AbstractActor implements OrderActor {
+  async processOrder(request: any): Promise<void> {
+    const state = await this.getActorStateManager().getState<any>('order');
+    
+    if (state?.status === 'PROCESSING') {
+      throw new Error('Order already being processed');
+    }
+
+    await this.getActorStateManager().setState('order', {
+      ...request,
+      status: 'PROCESSING',
+      updatedAt: new Date(),
+    });
+
+    // จัดเก็บ Timer สำหรับ Timeout
+    await this.registerActorTimer(
+      'order-timeout',
+      'handleTimeout',
+      new Date(Date.now() + 30 * 60 * 1000), // 30 นาที
+      undefined,
+    );
+  }
+
+  async getStatus(): Promise<string> {
+    const state = await this.getActorStateManager().getState<any>('order');
+    return state?.status || 'UNKNOWN';
+  }
+
+  async cancelOrder(reason: string): Promise<void> {
+    const state = await this.getActorStateManager().getState<any>('order');
+    
+    await this.getActorStateManager().setState('order', {
+      ...state,
+      status: 'CANCELLED',
+      cancellationReason: reason,
+      cancelledAt: new Date(),
+    });
+  }
+
+  async handleTimeout(): Promise<void> {
+    const status = await this.getStatus();
+    if (status === 'PROCESSING') {
+      await this.cancelOrder('Timeout');
+    }
+  }
+}
 ```
 
 ---
 
-## 4. Next-Generation Service Mesh
+## 5. Service Mesh Evolution
 
-### 4.1 Ambient Mesh (Istio ไม่ต้อง Sidecar)
-
-```
-ปัญหาของ Traditional Sidecar Mesh:
-- ทุก Pod ต้องมี Envoy sidecar (+50MB memory each)
-- Pod startup latency เพิ่มขึ้น
-- Operational complexity สูง
-
-Istio Ambient Mesh (2023+):
-ไม่ต้องใช้ Sidecar แล้ว!
-
-Traditional (Sidecar):          Ambient Mesh:
-┌─────────────────────┐         ┌─────────────────────────────────┐
-│  Pod                │         │  Node                            │
-│  ┌─────┐ ┌───────┐  │         │  ┌──────────────────────────┐   │
-│  │ App │ │Envoy  │  │         │  │ ztunnel (per-node)       │   │
-│  │     │ │Sidecar│  │         │  │ L4 Security (mTLS, etc.) │   │
-│  └─────┘ └───────┘  │         │  └──────────────────────────┘   │
-└─────────────────────┘         │  ┌─────────┐ ┌─────────┐        │
-                                │  │  Pod A  │ │  Pod B  │        │
-                                │  │  (App)  │ │  (App)  │        │
-                                │  └─────────┘ └─────────┘        │
-                                │  (No sidecar needed!)            │
-                                └─────────────────────────────────┘
-                                
-Memory savings: -50MB per Pod
-Startup speed: Faster
-Traffic: L7 via Waypoint Proxy (per namespace, optional)
-```
-
-### 4.2 SPIFFE/SPIRE - Workload Identity
-
-```
-SPIFFE (Secure Production Identity Framework For Everyone):
-แทน API Keys ด้วย Cryptographic Identity
-
-Service A ──> SPIRE Agent ──> SVID (X.509 cert)
-                                    │
-                              ┌─────▼──────────────────┐
-                              │ Service B               │
-                              │ ตรวจสอบ cert ทันที      │
-                              │ ไม่ต้องใช้ API Key      │
-                              └─────────────────────────┘
-
-ทำงานร่วมกับ Istio/Cilium ได้ดี
-```
-
----
-
-## 5. Serverless Microservices
-
-### 5.1 Knative - Kubernetes-native Serverless
-
-```
-Knative Components:
-┌─────────────────────────────────────────────────────────────┐
-│                        Knative                               │
-├─────────────────────────────────────────────────────────────┤
-│ Serving:                                                      │
-│ - Scale to zero (ประหยัดค่าใช้จ่าย 80%+ สำหรับ low-traffic) │
-│ - Auto-scale based on requests per second                    │
-│ - Traffic splitting for A/B testing                          │
-│                                                               │
-│ Eventing:                                                     │
-│ - Event routing and filtering                                │
-│ - Source → Trigger → Service                                 │
-│ - Built-in CloudEvents standard                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 5.2 Knative Service Definition
+### Ambient Mesh - Istio ไม่ต้องใช้ Sidecar
 
 ```yaml
-# knative/image-processor.yaml
-# Scale to zero เมื่อไม่มีงาน
+# ambient-mesh-label.yaml
+# เปิดใช้ Ambient Mesh โดยไม่ต้องมี Sidecar Proxy
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    istio.io/dataplane-mode: ambient  # ใช้ ztunnel แทน Envoy Sidecar
+---
+# L4 Policy ผ่าน ztunnel (ไม่ต้องการ Sidecar)
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: payment-policy
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/production/sa/order-service
+```
+
+### Linkerd 2.x - Ultra-light Service Mesh
+
+```yaml
+# linkerd-service-profile.yaml
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: payment-service.production.svc.cluster.local
+  namespace: production
+spec:
+  routes:
+    - name: POST /api/v1/payments
+      condition:
+        method: POST
+        pathRegex: /api/v1/payments
+      responseClasses:
+        - condition:
+            status:
+              min: 500
+              max: 599
+          isFailure: true
+      timeout: 10s
+      retryBudget:
+        retryRatio: 0.2
+        minRetriesPerSecond: 10
+        ttl: 10s
+    - name: GET /api/v1/payments/{id}
+      condition:
+        method: GET
+        pathRegex: /api/v1/payments/[^/]*
+      isRetryable: true
+      timeout: 5s
+```
+
+---
+
+## 6. Serverless Microservices Convergence
+
+### AWS Lambda + Container Images
+
+```typescript
+// lambda-handler/src/handler.ts
+import { Handler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { NestFactory } from '@nestjs/core';
+import { ExpressAdapter } from '@nestjs/platform-express';
+import express from 'express';
+import serverlessExpress from '@vendia/serverless-express';
+import { AppModule } from './app.module';
+
+let serverlessExpressInstance: any;
+
+async function bootstrapServer() {
+  if (!serverlessExpressInstance) {
+    const expressApp = express();
+    const nestApp = await NestFactory.create(AppModule, new ExpressAdapter(expressApp));
+    await nestApp.init();
+    serverlessExpressInstance = serverlessExpress({ app: expressApp });
+  }
+  return serverlessExpressInstance;
+}
+
+export const handler: Handler = async (
+  event: APIGatewayProxyEvent,
+  context: any,
+  callback: any,
+) => {
+  const server = await bootstrapServer();
+  return server(event, context, callback);
+};
+```
+
+```yaml
+# serverless.yml (Serverless Framework)
+service: payment-microservice
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ap-southeast-1
+  environment:
+    DATABASE_URL: ${ssm:/production/payment/database-url}
+    REDIS_URL: ${ssm:/production/payment/redis-url}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+          Resource: arn:aws:ssm:ap-southeast-1:*:parameter/production/*
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+          Resource: !GetAtt PaymentQueue.Arn
+
+functions:
+  processPayment:
+    handler: dist/handler.handler
+    events:
+      - http:
+          path: /api/v1/payments
+          method: POST
+          authorizer:
+            name: jwtAuthorizer
+            type: TOKEN
+    timeout: 30
+    memorySize: 512
+    reservedConcurrency: 100
+    
+  reconciliation:
+    handler: dist/reconciliation.handler
+    events:
+      - schedule:
+          rate: cron(0 2 * * ? *)  # 02:00 UTC ทุกวัน
+    timeout: 900  # 15 นาที
+
+resources:
+  Resources:
+    PaymentQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: payment-queue.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 60
+```
+
+### Knative - Kubernetes-native Serverless
+
+```yaml
+# knative-service.yaml
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: image-processor
+  name: recommendation-service
   namespace: production
 spec:
   template:
     metadata:
       annotations:
-        # Scale from 0 to 100 based on concurrency
-        autoscaling.knative.dev/class: "kpa.autoscaling.knative.dev"
-        autoscaling.knative.dev/metric: "concurrency"
-        autoscaling.knative.dev/target: "10"
-        autoscaling.knative.dev/minScale: "0"  # Scale to zero!
-        autoscaling.knative.dev/maxScale: "100"
-        autoscaling.knative.dev/scaleToZeroGracePeriod: "30s"
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "50"
+        autoscaling.knative.dev/target: "100"  # 100 concurrent requests per pod
+        autoscaling.knative.dev/scale-to-zero-pod-retention-period: "1m"
     spec:
-      containerConcurrency: 10
-      timeoutSeconds: 300
+      containerConcurrency: 100
+      timeoutSeconds: 30
       containers:
-      - image: image-processor:v1.0
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "500m"
-          limits:
-            memory: "1Gi"
-            cpu: "2000m"
-        env:
-        - name: S3_BUCKET
-          valueFrom:
-            secretKeyRef:
-              name: aws-secrets
-              key: bucket
-              
+        - image: your-registry/recommendation-service:1.0.0
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          env:
+            - name: ML_MODEL_PATH
+              value: /models/recommendation
+```
+
 ---
-# Event trigger: เมื่อ upload ไป S3 → trigger image processor
-apiVersion: eventing.knative.dev/v1
-kind: Trigger
+
+## 7. AI/ML Integration Trends
+
+### ML Feature Store
+
+```typescript
+// ml-feature-store/src/feature.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRedis } from '@liaoliaots/nestjs-redis';
+import Redis from 'ioredis';
+
+export interface FeatureRequest {
+  entityId: string;
+  entityType: 'user' | 'product' | 'order';
+  features: string[];
+  maxAge?: number; // วินาที
+}
+
+export interface FeatureSet {
+  entityId: string;
+  features: Record<string, number | string | boolean>;
+  computedAt: Date;
+}
+
+@Injectable()
+export class FeatureStoreService {
+  private readonly logger = new Logger(FeatureStoreService.name);
+  private readonly DEFAULT_TTL = 3600; // 1 ชั่วโมง
+
+  constructor(
+    @InjectRedis() private readonly redis: Redis,
+    private readonly featureComputer: FeatureComputerService,
+  ) {}
+
+  async getFeatures(request: FeatureRequest): Promise<FeatureSet> {
+    const cacheKey = `features:${request.entityType}:${request.entityId}`;
+    const maxAge = request.maxAge || this.DEFAULT_TTL;
+    
+    // ตรวจสอบ Cache
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      const age = (Date.now() - new Date(parsed.computedAt).getTime()) / 1000;
+      
+      if (age < maxAge) {
+        return parsed;
+      }
+    }
+
+    // คำนวณ Features ใหม่
+    const features = await this.featureComputer.compute(
+      request.entityId,
+      request.entityType,
+      request.features,
+    );
+
+    const featureSet: FeatureSet = {
+      entityId: request.entityId,
+      features,
+      computedAt: new Date(),
+    };
+
+    await this.redis.setex(cacheKey, this.DEFAULT_TTL, JSON.stringify(featureSet));
+
+    return featureSet;
+  }
+
+  async storeFeatures(
+    entityId: string,
+    entityType: string,
+    features: Record<string, any>,
+  ): Promise<void> {
+    const cacheKey = `features:${entityType}:${entityId}`;
+    
+    const featureSet: FeatureSet = {
+      entityId,
+      features,
+      computedAt: new Date(),
+    };
+
+    await this.redis.setex(cacheKey, this.DEFAULT_TTL, JSON.stringify(featureSet));
+  }
+}
+```
+
+### LLM Integration ใน Microservices
+
+```typescript
+// ai-service/src/llm.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import Anthropic from '@anthropic-ai/sdk';
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+@Injectable()
+export class LLMService {
+  private readonly logger = new Logger(LLMService.name);
+  private readonly client: Anthropic;
+
+  constructor() {
+    this.client = new Anthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+    });
+  }
+
+  // ใช้ AI สำหรับ Customer Support Chatbot
+  async handleCustomerQuery(
+    message: string,
+    conversationHistory: ChatMessage[],
+    contextData: {
+      userId: string;
+      recentOrders?: any[];
+      accountInfo?: any;
+    },
+  ): Promise<string> {
+    const systemPrompt = `
+You are a helpful customer service agent for a food delivery platform.
+You have access to the following customer data:
+- Customer ID: ${contextData.userId}
+- Recent Orders: ${JSON.stringify(contextData.recentOrders)}
+- Account Info: ${JSON.stringify(contextData.accountInfo)}
+
+Respond in the same language as the user. Be helpful, concise, and professional.
+`;
+
+    const messages = [
+      ...conversationHistory.map(msg => ({
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+      })),
+      { role: 'user' as const, content: message },
+    ];
+
+    const response = await this.client.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages,
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  // ใช้ AI สำหรับ Product Description Generation
+  async generateProductDescription(
+    product: {
+      name: string;
+      ingredients: string[];
+      category: string;
+    },
+    language: 'th' | 'en' = 'th',
+  ): Promise<string> {
+    const prompt = language === 'th'
+      ? `เขียนคำอธิบายสั้นๆ น่ารับประทานสำหรับเมนู "${product.name}" ที่มีส่วนประกอบ: ${product.ingredients.join(', ')} ความยาวไม่เกิน 100 คำ`
+      : `Write a short appetizing description for "${product.name}" with ingredients: ${product.ingredients.join(', ')}. Max 100 words.`;
+
+    const response = await this.client.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  // ใช้ AI สำหรับ Fraud Detection Explanation
+  async explainFraudDecision(
+    fraudFlags: string[],
+    riskScore: number,
+    transactionData: any,
+  ): Promise<string> {
+    const response = await this.client.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: `
+Explain this fraud detection decision briefly:
+- Risk Score: ${riskScore}/100
+- Flags: ${fraudFlags.join(', ')}
+- Transaction: ${JSON.stringify(transactionData)}
+
+Provide a brief, clear explanation for the customer.
+`,
+      }],
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+}
+```
+
+---
+
+## 8. Edge Computing Growth
+
+```typescript
+// edge-service/src/edge-worker.ts
+// Cloudflare Workers - Edge Microservice
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Edge Caching สำหรับ Product Catalog
+    if (url.pathname.startsWith('/api/v1/products')) {
+      return handleProductRequest(request, env);
+    }
+
+    // Edge Authentication
+    if (request.headers.get('Authorization')) {
+      const userId = await verifyToken(
+        request.headers.get('Authorization')!,
+        env.JWT_SECRET,
+      );
+      
+      if (!userId) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+    }
+
+    // Forward ไปยัง Origin
+    return fetch(request);
+  },
+};
+
+async function handleProductRequest(request: Request, env: Env): Promise<Response> {
+  const cacheKey = new Request(request.url, { method: 'GET' });
+  const cache = caches.default;
+
+  // ตรวจสอบ Edge Cache ก่อน
+  let response = await cache.match(cacheKey);
+  
+  if (!response) {
+    // ดึงจาก Origin
+    response = await fetch(request);
+    
+    if (response.ok) {
+      // Cache ที่ Edge เป็นเวลา 5 นาที
+      const responseToCache = new Response(response.body, response);
+      responseToCache.headers.set('Cache-Control', 'public, max-age=300');
+      await cache.put(cacheKey, responseToCache);
+    }
+  }
+
+  return response;
+}
+
+async function verifyToken(token: string, secret: string): Promise<string | null> {
+  try {
+    // JWT verification ที่ Edge
+    const [header, payload, signature] = token.replace('Bearer ', '').split('.');
+    
+    const encoder = new TextEncoder();
+    const data = encoder.encode(`${header}.${payload}`);
+    const key = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify'],
+    );
+
+    const isValid = await crypto.subtle.verify(
+      'HMAC',
+      key,
+      Uint8Array.from(atob(signature.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
+      data,
+    );
+
+    if (!isValid) return null;
+
+    const decoded = JSON.parse(atob(payload));
+    return decoded.sub;
+  } catch {
+    return null;
+  }
+}
+
+interface Env {
+  JWT_SECRET: string;
+  ORIGIN_URL: string;
+}
+```
+
+---
+
+## 9. GitOps Maturity
+
+### ArgoCD ApplicationSet
+
+```yaml
+# argocd-applicationset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
 metadata:
-  name: image-upload-trigger
+  name: microservices
+  namespace: argocd
 spec:
-  broker: default
-  filter:
-    attributes:
-      type: com.amazonaws.s3.objectcreated
-      source: my-bucket
-  subscriber:
-    ref:
-      apiVersion: serving.knative.dev/v1
-      kind: Service
-      name: image-processor
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/microservices-gitops
+        revision: main
+        directories:
+          - path: apps/*
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - env: staging
+                  cluster: staging-cluster
+                - env: production
+                  cluster: production-cluster
+          - git:
+              repoURL: https://github.com/your-org/microservices-gitops
+              revision: main
+              directories:
+                - path: apps/*
+  template:
+    metadata:
+      name: '{{env}}-{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/microservices-gitops
+        targetRevision: main
+        path: '{{path}}'
+        helm:
+          valueFiles:
+            - values-{{env}}.yaml
+      destination:
+        server: '{{cluster}}'
+        namespace: '{{env}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            maxDuration: 3m
+            factor: 2
+```
+
+### Flux CD Progressive Delivery
+
+```yaml
+# fluxcd-kustomization.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: payment-service
+  namespace: flux-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: GitRepository
+    name: microservices-repo
+  path: ./k8s/payment-service
+  prune: true
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: payment-service
+      namespace: production
+  postBuild:
+    substitute:
+      APP_VERSION: "${APP_VERSION}"
+      ENVIRONMENT: production
+---
+# Progressive Delivery ด้วย Flagger
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: payment-service
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+  progressDeadlineSeconds: 60
+  service:
+    port: 3000
+    targetPort: 3000
+    trafficPolicy:
+      tls:
+        mode: ISTIO_MUTUAL
+  analysis:
+    interval: 1m
+    threshold: 5      # จำนวนครั้งที่ Fail ก่อน Rollback
+    maxWeight: 50     # Traffic สูงสุดที่ส่งไป Canary
+    stepWeight: 10    # เพิ่มทีละ 10%
+    metrics:
+      - name: request-success-rate
+        min: 99       # ต้องสำเร็จ >= 99%
+        interval: 1m
+      - name: request-duration
+        max: 500      # ต้องไม่เกิน 500ms (p99)
+        interval: 30s
+    webhooks:
+      - name: acceptance-test
+        type: pre-rollout
+        url: http://flagger-loadtester.test/
+        timeout: 30s
+        metadata:
+          type: bash
+          cmd: "curl -sd 'test' http://payment-service.production/health | grep 200"
 ```
 
 ---
 
-## 6. AI-Augmented Operations (AIOps)
+## 10. Platform Engineering Future
 
-### 6.1 AI ใน Operations
+### Internal Developer Platform (IDP)
 
+```typescript
+// idp/src/platform.service.ts
+// Internal Developer Platform - Self-service สำหรับ Dev Teams
+
+import { Injectable, Logger } from '@nestjs/common';
+
+export interface ServiceTemplate {
+  id: string;
+  name: string;
+  language: 'typescript' | 'python' | 'go' | 'java';
+  framework: string;
+  databases: string[];
+  messaging: string[];
+  features: string[];
+}
+
+export interface ServiceCreationRequest {
+  serviceName: string;
+  teamName: string;
+  templateId: string;
+  environment: 'development' | 'staging' | 'production';
+  config: Record<string, string>;
+}
+
+@Injectable()
+export class PlatformService {
+  private readonly logger = new Logger(PlatformService.name);
+
+  private readonly templates: ServiceTemplate[] = [
+    {
+      id: 'nestjs-rest-api',
+      name: 'NestJS REST API',
+      language: 'typescript',
+      framework: 'nestjs',
+      databases: ['postgresql', 'redis'],
+      messaging: ['kafka'],
+      features: ['authentication', 'logging', 'metrics', 'tracing'],
+    },
+    {
+      id: 'python-ml-service',
+      name: 'Python ML Service',
+      language: 'python',
+      framework: 'fastapi',
+      databases: ['postgresql'],
+      messaging: ['rabbitmq'],
+      features: ['model-serving', 'batch-processing', 'metrics'],
+    },
+  ];
+
+  async createService(request: ServiceCreationRequest): Promise<{
+    repositoryUrl: string;
+    cicdUrl: string;
+    dashboardUrl: string;
+  }> {
+    const template = this.templates.find(t => t.id === request.templateId);
+    
+    if (!template) {
+      throw new Error(`Template ${request.templateId} not found`);
+    }
+
+    this.logger.log(`Creating service ${request.serviceName} from template ${request.templateId}`);
+
+    // 1. สร้าง Git Repository
+    const repositoryUrl = await this.createGitRepository(request.serviceName, template);
+    
+    // 2. สร้าง CI/CD Pipeline
+    const cicdUrl = await this.createCICDPipeline(request.serviceName, request.teamName);
+    
+    // 3. สร้าง Kubernetes Namespace และ Resources
+    await this.createKubernetesResources(request.serviceName, request.teamName, request.environment);
+    
+    // 4. สร้าง Secrets ใน Vault
+    await this.createVaultSecrets(request.serviceName, request.environment, request.config);
+    
+    // 5. สร้าง Monitoring Dashboard
+    const dashboardUrl = await this.createMonitoringDashboard(request.serviceName);
+    
+    // 6. ลงทะเบียนใน Service Catalog
+    await this.registerInServiceCatalog({
+      name: request.serviceName,
+      team: request.teamName,
+      template: request.templateId,
+      repositoryUrl,
+    });
+
+    return { repositoryUrl, cicdUrl, dashboardUrl };
+  }
+
+  private async createGitRepository(
+    serviceName: string,
+    template: ServiceTemplate,
+  ): Promise<string> {
+    // Clone template และ customize
+    // เรียก GitHub API สร้าง Repository
+    const repoUrl = `https://github.com/your-org/${serviceName}`;
+    this.logger.log(`Created repository: ${repoUrl}`);
+    return repoUrl;
+  }
+
+  private async createKubernetesResources(
+    serviceName: string,
+    teamName: string,
+    environment: string,
+  ): Promise<void> {
+    // สร้าง Namespace, ResourceQuota, NetworkPolicy, RBAC
+    const manifests = this.generateKubernetesManifests(serviceName, teamName, environment);
+    
+    // Apply ผ่าน kubectl หรือ Kubernetes API
+    this.logger.log(`Created Kubernetes resources for ${serviceName}`);
+  }
+
+  private generateKubernetesManifests(
+    serviceName: string,
+    teamName: string,
+    environment: string,
+  ): string {
+    return `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${environment}-${teamName}
+  labels:
+    team: ${teamName}
+    environment: ${environment}
+    managed-by: idp
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ${teamName}-quota
+  namespace: ${environment}-${teamName}
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ${environment}-${teamName}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+`;
+  }
+
+  private async createVaultSecrets(
+    serviceName: string,
+    environment: string,
+    config: Record<string, string>,
+  ): Promise<void> {
+    // บันทึก Secrets ใน HashiCorp Vault
+    this.logger.log(`Created Vault secrets for ${serviceName}`);
+  }
+
+  private async createCICDPipeline(
+    serviceName: string,
+    teamName: string,
+  ): Promise<string> {
+    const pipelineUrl = `https://ci.your-org.com/${teamName}/${serviceName}`;
+    this.logger.log(`Created CI/CD pipeline: ${pipelineUrl}`);
+    return pipelineUrl;
+  }
+
+  private async createMonitoringDashboard(serviceName: string): Promise<string> {
+    const dashboardUrl = `https://grafana.your-org.com/d/${serviceName}`;
+    this.logger.log(`Created monitoring dashboard: ${dashboardUrl}`);
+    return dashboardUrl;
+  }
+
+  private async registerInServiceCatalog(serviceInfo: any): Promise<void> {
+    // บันทึกใน Backstage Service Catalog
+    this.logger.log(`Registered ${serviceInfo.name} in service catalog`);
+  }
+}
 ```
-AI กำลังเปลี่ยน Operations:
 
-Traditional Ops:              AI-Augmented Ops:
-┌─────────────────────┐       ┌─────────────────────────────────┐
-│ Alert fires          │       │ AI detects anomaly before alert │
-│ On-call engineer     │       │ AI suggests root cause          │
-│ Manual investigation │       │ AI recommends fix               │
-│ Trial and error fix  │       │ Auto-remediation (supervised)   │
-│ Post-mortem          │       │ AI learns from incident         │
-└─────────────────────┘       └─────────────────────────────────┘
+---
 
-Tools:
-- Dynatrace Davis AI: Root cause analysis
-- Datadog Watchdog: Anomaly detection  
-- AWS DevOps Guru: ML-powered recommendations
-- GitHub Copilot for Ops: Generate runbooks
-```
+## 11. FinOps Practices
 
-### 6.2 Anomaly Detection Pipeline
+```typescript
+// finops/src/cost-monitor.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 
-```python
-# aiops/anomaly_detection/detector.py
-import numpy as np
-from sklearn.ensemble import IsolationForest
-from prometheus_client import CollectorRegistry, Gauge
-import pandas as pd
-from typing import List, Dict
-import asyncio
+export interface ServiceCost {
+  serviceName: string;
+  teamName: string;
+  compute: number;
+  storage: number;
+  network: number;
+  total: number;
+  currency: string;
+  period: string;
+}
 
-class MetricsAnomalyDetector:
-    """Detect anomalies in service metrics using ML"""
+export interface CostAnomaly {
+  serviceName: string;
+  currentCost: number;
+  expectedCost: number;
+  variance: number;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
+@Injectable()
+export class FinOpsService {
+  private readonly logger = new Logger(FinOpsService.name);
+
+  @Cron('0 8 * * 1') // ทุกวันจันทร์ 08:00
+  async generateWeeklyCostReport(): Promise<void> {
+    const costs = await this.getServiceCosts('weekly');
+    const anomalies = await this.detectCostAnomalies(costs);
     
-    def __init__(self, prometheus_url: str):
-        self.prometheus_url = prometheus_url
-        self.models: Dict[str, IsolationForest] = {}
-        self.baseline_windows: Dict[str, list] = {}
-    
-    async def train_baseline(self, service_name: str, days: int = 14):
-        """Train on 2 weeks of historical data"""
-        # Query Prometheus for historical data
-        query = f"""
-        {{
-            http_request_duration_seconds_p99{{service="{service_name}"}},
-            http_requests_total{{service="{service_name}"}},
-            go_goroutines{{service="{service_name}"}},
-            process_resident_memory_bytes{{service="{service_name}"}}
-        }}
-        """
-        
-        # In real implementation: use Prometheus API
-        metrics_df = await self.query_prometheus_range(service_name, days)
-        
-        # Feature engineering
-        features = pd.DataFrame({
-            'p99_latency': metrics_df['p99_latency'],
-            'request_rate': metrics_df['request_rate'],
-            'goroutines': metrics_df['goroutines'],
-            'memory': metrics_df['memory'],
-            'hour_of_day': metrics_df.index.hour,
-            'day_of_week': metrics_df.index.dayofweek,
-            # Rolling features
-            'p99_latency_rolling_mean': metrics_df['p99_latency'].rolling(12).mean(),
-            'p99_latency_rolling_std': metrics_df['p99_latency'].rolling(12).std(),
-        }).dropna()
-        
-        # Train Isolation Forest
-        model = IsolationForest(
-            n_estimators=200,
-            contamination=0.05,  # Expect 5% anomalies
-            random_state=42,
-            n_jobs=-1
-        )
-        model.fit(features)
-        
-        self.models[service_name] = model
-        print(f"Model trained for {service_name} with {len(features)} samples")
-    
-    async def detect_anomaly(self, service_name: str, current_metrics: dict) -> AnomalyResult:
-        if service_name not in self.models:
-            return AnomalyResult(is_anomaly=False, reason="No model trained")
-        
-        model = self.models[service_name]
-        
-        features = np.array([[
-            current_metrics.get('p99_latency', 0),
-            current_metrics.get('request_rate', 0),
-            current_metrics.get('goroutines', 0),
-            current_metrics.get('memory', 0),
-            pd.Timestamp.now().hour,
-            pd.Timestamp.now().dayofweek,
-            0, 0,  # Rolling features (approximated)
-        ]])
-        
-        score = model.score_samples(features)[0]
-        is_anomaly = model.predict(features)[0] == -1
-        
-        reason = ""
-        if is_anomaly:
-            # Identify which metric contributed most
-            reason = self.explain_anomaly(service_name, current_metrics)
-        
-        return AnomalyResult(
-            is_anomaly=is_anomaly,
-            anomaly_score=score,
-            reason=reason,
-            severity=self.calculate_severity(score),
-        )
-    
-    def explain_anomaly(self, service_name: str, metrics: dict) -> str:
-        """Simple rule-based explanation"""
-        reasons = []
-        
-        baseline = self.get_baseline_stats(service_name)
-        
-        if metrics.get('p99_latency', 0) > baseline['p99_latency_mean'] + (3 * baseline['p99_latency_std']):
-            reasons.append(f"P99 latency is {metrics['p99_latency']:.0f}ms (normal: {baseline['p99_latency_mean']:.0f}ms)")
-        
-        if metrics.get('error_rate', 0) > 0.05:
-            reasons.append(f"Error rate is {metrics['error_rate']*100:.1f}% (threshold: 5%)")
-        
-        if metrics.get('goroutines', 0) > baseline['goroutines_p99']:
-            reasons.append(f"Goroutine count is unusually high: {metrics['goroutines']}")
-        
-        return "; ".join(reasons) if reasons else "Multivariate anomaly detected"
+    // ส่ง Report ไปยัง Teams
+    for (const cost of costs) {
+      await this.sendCostReport(cost);
+    }
 
+    if (anomalies.length > 0) {
+      await this.sendCostAnomalyAlert(anomalies);
+    }
+  }
 
-class AutoRemediationService:
-    """Automatic remediation for known issues"""
+  async getServiceCosts(period: 'daily' | 'weekly' | 'monthly'): Promise<ServiceCost[]> {
+    // ดึงข้อมูลจาก AWS Cost Explorer / GCP Billing
+    // หรือ Kubecost API
+    return [];
+  }
+
+  async detectCostAnomalies(costs: ServiceCost[]): Promise<CostAnomaly[]> {
+    const anomalies: CostAnomaly[] = [];
     
-    REMEDIATION_PLAYBOOKS = {
-        "HIGH_MEMORY": [
-            "Trigger GC",
-            "Scale up pods",
-            "Alert on-call if not resolved in 5 min",
-        ],
-        "HIGH_ERROR_RATE": [
-            "Check downstream services",
-            "Enable circuit breaker",
-            "Alert on-call",
-        ],
-        "POD_CRASHLOOP": [
-            "Restart pod",
-            "Check logs",
-            "Scale down if DB connection issue",
-        ],
+    for (const cost of costs) {
+      const historicalAvg = await this.getHistoricalAverage(cost.serviceName);
+      const variance = ((cost.total - historicalAvg) / historicalAvg) * 100;
+      
+      if (Math.abs(variance) > 20) {
+        anomalies.push({
+          serviceName: cost.serviceName,
+          currentCost: cost.total,
+          expectedCost: historicalAvg,
+          variance,
+          severity: Math.abs(variance) > 50 ? 'HIGH' : Math.abs(variance) > 30 ? 'MEDIUM' : 'LOW',
+        });
+      }
     }
     
-    async def remediate(self, alert: Alert):
-        playbook = self.REMEDIATION_PLAYBOOKS.get(alert.type, [])
-        
-        for step in playbook:
-            success = await self.execute_step(step, alert)
-            if not success:
-                # Escalate to human
-                await self.notify_oncall(alert, step)
-                return
+    return anomalies;
+  }
+
+  private async getHistoricalAverage(serviceName: string): Promise<number> {
+    // ดึง Average ย้อนหลัง 4 สัปดาห์
+    return 100; // Mock
+  }
+
+  private async sendCostReport(cost: ServiceCost): Promise<void> {
+    this.logger.log(`Sending cost report for ${cost.serviceName}: $${cost.total}`);
+  }
+
+  private async sendCostAnomalyAlert(anomalies: CostAnomaly[]): Promise<void> {
+    this.logger.warn(`Cost anomalies detected: ${anomalies.length}`);
+  }
+}
 ```
 
 ---
 
-## 7. Green Computing
-
-### 7.1 Sustainability ใน Microservices
+## 12. Learning Path Recommendations
 
 ```
-Carbon-Aware Computing:
+Microservices Engineer Learning Path 2024-2025
+═══════════════════════════════════════════════
 
-Traditional:                    Green Computing:
-Run 24/7 at full power          Scale to zero when idle
-Deploy in cheapest region       Deploy in cleanest energy region
-Ignore energy usage             Track carbon footprint
-No efficiency metrics           Optimize for carbon, not just $
+Level 1: Foundation (1-3 เดือน)
+├── Docker & Containers
+├── Kubernetes Basics
+├── REST API Design
+├── Basic Messaging (Kafka/RabbitMQ)
+└── CI/CD with GitHub Actions
 
-Tools:
-- Cloud Carbon Footprint (opensource)
-- AWS Customer Carbon Footprint Tool
-- Google Cloud Carbon Footprint
-- Kepler (Kubernetes Energy Efficiency)
-```
+Level 2: Intermediate (3-6 เดือน)
+├── Service Mesh (Istio/Linkerd)
+├── Observability (Prometheus + Grafana + Jaeger)
+├── API Gateway (Kong/Traefik)
+├── Security (mTLS, JWT, OIDC)
+└── Database Patterns (CQRS, Event Sourcing)
 
-### 7.2 Kepler - Kubernetes Energy Monitor
+Level 3: Advanced (6-12 เดือน)
+├── Platform Engineering & IDP
+├── GitOps (ArgoCD/Flux)
+├── Progressive Delivery (Canary/Blue-Green)
+├── Chaos Engineering
+└── Performance Optimization
 
-```yaml
-# kepler/kepler.yaml
-# ติดตาม Energy consumption ระดับ Pod
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: kepler
-  namespace: monitoring
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: kepler
-  template:
-    spec:
-      containers:
-      - name: kepler
-        image: quay.io/sustainable_computing_io/kepler:latest
-        env:
-        - name: ENABLE_EBPF_CGROUPID
-          value: "true"
-        - name: ENABLE_GPU
-          value: "false"
-        - name: ENABLE_CRI_RUNTIME_CTR_STAT  
-          value: "true"
-        ports:
-        - name: http
-          containerPort: 9102
-          hostPort: 9102
-```
-
-```python
-# green-ops/carbon_scheduler.py
-# Schedule batch jobs ในช่วงที่ Carbon Intensity ต่ำ
-import requests
-from datetime import datetime, timedelta
-import pytz
-
-BANGKOK_TZ = pytz.timezone('Asia/Bangkok')
-
-class CarbonAwareScheduler:
-    """Schedule workloads based on carbon intensity"""
-    
-    def __init__(self, carbon_api_key: str):
-        self.api_key = carbon_api_key
-        self.base_url = "https://api.electricitymap.org/v3"
-    
-    def get_carbon_intensity(self, zone: str = "TH") -> dict:
-        """Get current carbon intensity (gCO2/kWh)"""
-        response = requests.get(
-            f"{self.base_url}/carbon-intensity/latest?zone={zone}",
-            headers={"auth-token": self.api_key}
-        )
-        return response.json()
-    
-    def get_best_time_to_run(self, zone: str = "TH", hours_ahead: int = 24) -> datetime:
-        """Find the greenest time to run a batch job"""
-        response = requests.get(
-            f"{self.base_url}/carbon-intensity/forecast?zone={zone}",
-            headers={"auth-token": self.api_key}
-        )
-        forecast = response.json()
-        
-        # Find minimum carbon intensity in next N hours
-        forecasts = forecast.get('forecast', [])[:hours_ahead]
-        
-        min_carbon = float('inf')
-        best_time = datetime.now(BANGKOK_TZ)
-        
-        for point in forecasts:
-            if point['carbonIntensity'] < min_carbon:
-                min_carbon = point['carbonIntensity']
-                best_time = datetime.fromisoformat(point['datetime'])
-        
-        return best_time
-    
-    def should_defer_job(self, zone: str = "TH", threshold: int = 200) -> tuple[bool, str]:
-        """
-        Should we defer this job until carbon is lower?
-        Returns (should_defer, reason)
-        """
-        current = self.get_carbon_intensity(zone)
-        current_intensity = current.get('carbonIntensity', 0)
-        
-        if current_intensity > threshold:
-            best_time = self.get_best_time_to_run(zone)
-            minutes_to_wait = (best_time - datetime.now(BANGKOK_TZ)).total_seconds() / 60
-            return True, f"Current: {current_intensity}gCO2/kWh, best time in {minutes_to_wait:.0f} minutes"
-        
-        return False, f"Current carbon intensity OK: {current_intensity}gCO2/kWh"
+Level 4: Expert (12+ เดือน)
+├── eBPF & Cilium
+├── WebAssembly (WASM)
+├── Dapr Framework
+├── ML/AI Integration
+└── FinOps & Cost Optimization
 ```
 
 ---
 
-## 8. Platform Engineering & Internal Developer Platform
+## สรุปบทที่ 96
 
-### 8.1 IDPx (Internal Developer Platform)
-
-```
-Platform Engineering Trend 2024-2025:
-
-เปลี่ยนจาก: "DevOps team ต้องทำ Infrastructure ทุกอย่าง"
-เป็น: "Platform team สร้าง Self-service capabilities"
-
-Internal Developer Platform:
-┌────────────────────────────────────────────────────────────────┐
-│                  Developer Portal (Backstage)                   │
-│                                                                  │
-│  ┌───────────────┐  ┌───────────────┐  ┌──────────────────┐   │
-│  │ Service       │  │ API Catalog   │  │  Tech Radar      │   │
-│  │ Templates     │  │               │  │                  │   │
-│  └───────────────┘  └───────────────┘  └──────────────────┘   │
-│                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │              Golden Path (Scaffolding)                     │ │
-│  │  "Create new microservice" →                               │ │
-│  │   GitHub Repo + CI/CD + Monitoring + Runbook auto-created │ │
-│  └───────────────────────────────────────────────────────────┘ │
-└────────────────────────────────────────────────────────────────┘
-
-Tools:
-- Backstage (Spotify's Developer Portal)
-- Cortex (Service Catalog)
-- Humanitec (Platform Orchestrator)
-- Port (Internal Developer Portal)
-```
-
-### 8.2 Backstage Setup
-
-```yaml
-# backstage/catalog-info.yaml
-# ทุก Service ต้องมีไฟล์นี้ (Service Catalog)
-apiVersion: backstage.io/v1alpha1
-kind: Component
-metadata:
-  name: order-service
-  description: "Manages order lifecycle for Thai e-commerce platform"
-  annotations:
-    github.com/project-slug: "company/order-service"
-    backstage.io/techdocs-ref: dir:.
-    pagerduty.com/service-id: "P123456"
-    datadoghq.com/service-name: "order-service"
-    prometheus.io/alert: "order-service-*"
-  tags:
-    - go
-    - microservice
-    - critical
-  links:
-  - url: "https://grafana.internal/order-service"
-    title: Grafana Dashboard
-  - url: "https://jaeger.internal/order-service"
-    title: Distributed Traces
-  - url: "https://wiki.internal/runbooks/order-service"
-    title: Runbook
-spec:
-  type: service
-  lifecycle: production
-  owner: team-orders
-  system: e-commerce-platform
-  dependsOn:
-  - component:payment-service
-  - component:inventory-service
-  - resource:orders-postgres
-  - resource:kafka
-  providesApis:
-  - order-service-api
-```
-
----
-
-## 9. Emerging Patterns Summary
-
-### 9.1 Technology Adoption Timeline
-
-```
-Technology Adoption 2024-2025:
-
-NOW (Adopt):
-✅ Kubernetes + Helm/ArgoCD
-✅ Observability (Prometheus, Jaeger, Loki)
-✅ Service Mesh (Istio/Linkerd)
-✅ GitOps (ArgoCD/Flux)
-✅ Platform Engineering (Backstage)
-
-TRIAL (Evaluate):
-🔬 Dapr (Distributed App Runtime)
-🔬 eBPF-based networking (Cilium)
-🔬 Knative (Serverless on K8s)
-🔬 AI-Assisted Operations
-🔬 Carbon-aware scheduling
-
-ASSESS (Watch):
-👀 WebAssembly microservices
-👀 Ambient Mesh (Istio without sidecar)
-👀 SPIFFE/SPIRE workload identity
-👀 Rust for high-performance services
-
-HOLD (Avoid for now):
-⏸ Blockchain for most use cases
-⏸ Overly complex service mesh setups
-⏸ Premature microservices decomposition
-```
-
-### 9.2 Skills Roadmap สำหรับ 2025
-
-```
-Backend/Platform Engineer Learning Path:
-
-Foundation (ต้องรู้):
-□ Container fundamentals (Docker)
-□ Kubernetes (CKA level)
-□ CI/CD (GitHub Actions, ArgoCD)
-□ Observability (Prometheus, Grafana, Jaeger)
-□ API Design (REST, gRPC, GraphQL)
-
-Intermediate (ควรรู้):
-□ Service Mesh (Istio basics)
-□ Kafka/Event-driven architecture
-□ Infrastructure as Code (Terraform)
-□ Security (RBAC, mTLS, SAST/DAST)
-□ Platform Engineering basics
-
-Advanced (เพิ่มคุณค่า):
-□ eBPF concepts (Cilium/Hubble)
-□ Wasm serverless functions
-□ AI/ML Operations (MLOps integration)
-□ Cost optimization (FinOps)
-□ Green computing practices
-
-Leadership:
-□ Architecture Decision Records (ADR)
-□ Technology radar management
-□ Platform team practices
-□ Developer Experience (DevEx)
-```
-
----
-
-## สรุป
-
-Microservices Roadmap 2024-2025 ชี้ให้เห็นทิศทางสำคัญ:
-
-1. **eBPF** - Zero-overhead observability และ Network security ใน Kernel
-2. **WebAssembly** - Edge computing และ Serverless runtime ที่เร็วกว่า Container
-3. **Dapr** - Abstraction layer สำหรับ Distributed System primitives
-4. **Ambient Mesh** - Service Mesh ไม่ต้องใช้ Sidecar (ลด overhead)
-5. **AI Operations** - Automated anomaly detection และ Self-healing systems
-6. **Green Computing** - Carbon-aware workload scheduling
-7. **Platform Engineering** - Self-service Developer Portal ช่วย Developer Productivity
-
-> "The best technology is invisible — it enables developers to focus on business value, not infrastructure plumbing"
-
----
-
-*ถัดไป: Part 97 - Open Source Microservices Tools*
+| เทคโนโลยี | ระดับ Maturity | Use Case |
+|-----------|---------------|---------|
+| **Kubernetes** | Production-ready | Container Orchestration |
+| **eBPF/Cilium** | Growing | Network + Observability |
+| **WASM** | Early Adopter | Edge Computing + Plugins |
+| **Dapr** | Growing | Cloud-agnostic Microservices |
+| **Ambient Mesh** | Beta | Service Mesh ไม่มี Sidecar |
+| **Knative** | Stable | Serverless on Kubernetes |
+| **GitOps** | Mature | Deployment Automation |
+| **Platform Engineering** | Growing | Developer Self-service |
+| **FinOps** | Growing | Cost Awareness |
+| **AI/ML Integration** | Rapidly Growing | Smart Services |
+| **Edge Computing** | Growing | Low-latency Global Apps |
