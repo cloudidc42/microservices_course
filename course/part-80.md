@@ -1,1541 +1,2831 @@
-# Part 80: DevSecOps สำหรับ Microservices
+# Part 80: Kubernetes Advanced Patterns
 
 ## บทนำ
 
-DevSecOps คือการนำ Security เข้ามาเป็นส่วนหนึ่งของ Development และ Operations ตั้งแต่ต้น (Shift Left) บทนี้จะครอบคลุม Security ใน CI/CD Pipeline, SAST/DAST Integration, Container Image Scanning, Infrastructure Security Scanning, Policy as Code ด้วย OPA/Conftest, Secret Scanning และ Compliance Automation
+Kubernetes Advanced Patterns ครอบคลุม Custom Resource Definitions (CRDs), Operators, Admission Webhooks, Multi-tenancy, GitOps และ Event-driven Automation บทนี้จะช่วยให้เข้าใจการขยาย Kubernetes API และการสร้าง platform features บน Kubernetes
 
 ---
 
-## 1. Security ใน CI/CD Pipeline
+## 80.1 Custom Resource Definition (CRD)
 
-### 1.1 GitHub Actions Security Pipeline
-
-```yaml
-# .github/workflows/security-pipeline.yml
-name: Security Pipeline
-
-on:
-  push:
-    branches: [main, develop, 'release/**']
-  pull_request:
-    branches: [main]
-  schedule:
-    - cron: '0 2 * * *'  # Daily scan at 2 AM
-
-permissions:
-  contents: read
-  security-events: write
-  pull-requests: write
-  checks: write
-
-jobs:
-  # 1. Static Application Security Testing (SAST)
-  sast:
-    name: SAST Analysis
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for better analysis
-
-      # CodeQL Analysis
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript, typescript, python
-          config-file: .github/codeql-config.yml
-          queries: security-and-quality
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:javascript"
-          upload: true
-
-      # Semgrep SAST
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: >-
-            p/security-audit
-            p/secrets
-            p/owasp-top-ten
-            p/nodejs
-            p/typescript
-          output_format: sarif
-          output_file: semgrep.sarif
-        env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-
-      - name: Upload Semgrep Results
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: semgrep.sarif
-
-      # ESLint Security Rules
-      - name: ESLint Security Scan
-        run: |
-          npm ci
-          npx eslint . \
-            --plugin=security \
-            --plugin=no-unsanitized \
-            --rule='security/detect-object-injection: error' \
-            --rule='security/detect-non-literal-regexp: warn' \
-            --rule='security/detect-unsafe-regex: error' \
-            --rule='no-unsanitized/method: error' \
-            --format=sarif \
-            --output-file=eslint-security.sarif || true
-
-  # 2. Dependency Vulnerability Scanning
-  dependency-scan:
-    name: Dependency Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run npm audit
-        run: |
-          npm ci
-          npm audit --audit-level=high --json > npm-audit.json || true
-          
-          # Fail if critical vulnerabilities found
-          CRITICAL=$(cat npm-audit.json | jq '.metadata.vulnerabilities.critical // 0')
-          if [ "$CRITICAL" -gt "0" ]; then
-            echo "::error::Found $CRITICAL critical vulnerabilities!"
-            cat npm-audit.json | jq '.vulnerabilities | to_entries[] | select(.value.severity == "critical") | .key'
-            exit 1
-          fi
-
-      # Snyk vulnerability scanning
-      - name: Run Snyk
-        uses: snyk/actions/node@master
-        with:
-          args: --severity-threshold=high --sarif-file-output=snyk.sarif
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Upload Snyk Results
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: snyk.sarif
-
-      # OWASP Dependency Check
-      - name: OWASP Dependency Check
-        uses: dependency-check/Dependency-Check_Action@main
-        with:
-          project: 'microservices-app'
-          path: '.'
-          format: 'SARIF'
-          args: >
-            --failOnCVSS 7
-            --enableRetired
-            --nodeAuditSkipDevDependencies
-
-  # 3. Container Image Scanning
-  container-scan:
-    name: Container Image Scan
-    runs-on: ubuntu-latest
-    needs: [sast]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build Docker Image
-        run: |
-          docker build \
-            --tag ${{ github.repository }}:${{ github.sha }} \
-            --label "git-commit=${{ github.sha }}" \
-            --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            .
-
-      # Trivy container scanning
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ github.repository }}:${{ github.sha }}'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-
-      - name: Upload Trivy Results
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-
-      # Grype scanning
-      - name: Run Grype Scanner
-        uses: anchore/scan-action@v3
-        with:
-          image: '${{ github.repository }}:${{ github.sha }}'
-          fail-build: true
-          severity-cutoff: high
-          output-format: sarif
-          
-      # Docker Scout
-      - name: Docker Scout CVEs
-        uses: docker/scout-action@v1
-        with:
-          command: cves
-          image: '${{ github.repository }}:${{ github.sha }}'
-          only-severities: critical,high
-          exit-code: true
-
-  # 4. Infrastructure as Code Security
-  iac-scan:
-    name: IaC Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Checkov for Terraform/Kubernetes
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory: ./infrastructure
-          framework: terraform,kubernetes,helm
-          output_format: sarif
-          output_file_path: checkov.sarif
-          soft_fail: false
-          skip_check: >-
-            CKV_K8S_28,
-            CKV_K8S_30
-
-      # tfsec for Terraform
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.0
-        with:
-          working_directory: ./infrastructure/terraform
-          format: sarif
-          additional_args: --minimum-severity HIGH
-
-      # Conftest for policy-as-code
-      - name: Run Conftest
-        run: |
-          curl -L https://github.com/open-policy-agent/conftest/releases/download/v0.46.0/conftest_0.46.0_Linux_x86_64.tar.gz | tar -xz
-          sudo mv conftest /usr/local/bin/
-          
-          conftest test \
-            --policy ./policies \
-            ./kubernetes/**/*.yaml \
-            --all-namespaces \
-            --combine \
-            --output=json > conftest-results.json 2>&1 || true
-
-  # 5. Secret Scanning
-  secret-scan:
-    name: Secret Scanning
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # TruffleHog secret scanning
-      - name: TruffleHog OSS
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
-
-      # Gitleaks
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-
-  # 6. DAST (Dynamic Application Security Testing)
-  dast:
-    name: DAST Scan
-    runs-on: ubuntu-latest
-    needs: [container-scan]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-    services:
-      app:
-        image: ${{ github.repository }}:${{ github.sha }}
-        ports:
-          - 8080:8080
-    steps:
-      - uses: actions/checkout@v4
-
-      # OWASP ZAP full scan
-      - name: OWASP ZAP Full Scan
-        uses: zaproxy/action-full-scan@v0.9.0
-        with:
-          target: 'http://localhost:8080'
-          rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a -j'
-          artifact_name: zap-report
-
-      # Nuclei scanner
-      - name: Run Nuclei
-        uses: projectdiscovery/nuclei-action@main
-        with:
-          target: http://localhost:8080
-          flags: "-severity critical,high -stats"
-
-  # 7. Security Gate
-  security-gate:
-    name: Security Gate
-    needs: [sast, dependency-scan, container-scan, iac-scan, secret-scan]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check Security Results
-        run: |
-          echo "All security scans passed. Proceeding with deployment."
-          
-      - name: Generate Security Report
-        run: |
-          cat << 'EOF' > security-report.md
-          # Security Scan Report
-          
-          **Date:** $(date -u)
-          **Commit:** ${{ github.sha }}
-          **Branch:** ${{ github.ref_name }}
-          
-          ## Scan Results
-          - SAST: ✓ Passed
-          - Dependency Scan: ✓ Passed
-          - Container Scan: ✓ Passed
-          - IaC Scan: ✓ Passed
-          - Secret Scan: ✓ Passed
-          EOF
-
-      - name: Comment PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('security-report.md', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: report
-            });
-```
-
----
-
-## 2. SAST Configuration
-
-### 2.1 CodeQL Configuration
+### CRD YAML สำหรับ MicroserviceDeployment
 
 ```yaml
-# .github/codeql-config.yml
-name: "Security CodeQL Config"
-
-queries:
-  - uses: security-and-quality
-  - uses: security-extended
-
-paths-ignore:
-  - node_modules
-  - dist
-  - build
-  - coverage
-  - '**/*.test.ts'
-  - '**/*.spec.ts'
-  - '**/*.d.ts'
-
-paths:
-  - src
-  - lib
-
-query-filters:
-  - exclude:
-      tags contain: experimental
+# microservice-deployment-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: microservicedeployments.platform.example.com
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.13.0
+spec:
+  group: platform.example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - image
+                - port
+              properties:
+                image:
+                  type: string
+                  description: "Container image to deploy"
+                  pattern: "^[a-z0-9/:._-]+$"
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  description: "Port the service listens on"
+                replicas:
+                  type: object
+                  properties:
+                    min:
+                      type: integer
+                      minimum: 1
+                      default: 2
+                    max:
+                      type: integer
+                      minimum: 1
+                      default: 10
+                    targetCPUUtilization:
+                      type: integer
+                      minimum: 1
+                      maximum: 100
+                      default: 70
+                resources:
+                  type: object
+                  properties:
+                    cpu:
+                      type: object
+                      properties:
+                        request:
+                          type: string
+                          default: "100m"
+                          pattern: "^[0-9]+(m|[.][0-9]+)?$"
+                        limit:
+                          type: string
+                          default: "1000m"
+                    memory:
+                      type: object
+                      properties:
+                        request:
+                          type: string
+                          default: "128Mi"
+                        limit:
+                          type: string
+                          default: "512Mi"
+                environment:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - name
+                    properties:
+                      name:
+                        type: string
+                      value:
+                        type: string
+                      valueFrom:
+                        type: object
+                        properties:
+                          secretKeyRef:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              key:
+                                type: string
+                          configMapKeyRef:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              key:
+                                type: string
+                ingress:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    host:
+                      type: string
+                    path:
+                      type: string
+                      default: "/"
+                    tlsEnabled:
+                      type: boolean
+                      default: true
+                healthCheck:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+                      default: "/health"
+                    port:
+                      type: integer
+                    initialDelaySeconds:
+                      type: integer
+                      default: 10
+                    periodSeconds:
+                      type: integer
+                      default: 10
+                monitoring:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    path:
+                      type: string
+                      default: "/metrics"
+                    interval:
+                      type: string
+                      default: "30s"
+                serviceAccount:
+                  type: string
+                  description: "Service account name"
+                configMaps:
+                  type: array
+                  items:
+                    type: string
+                secrets:
+                  type: array
+                  items:
+                    type: string
+                strategy:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum:
+                        - RollingUpdate
+                        - Recreate
+                        - BlueGreen
+                        - Canary
+                      default: "RollingUpdate"
+                    canaryWeight:
+                      type: integer
+                      minimum: 0
+                      maximum: 100
+                      default: 10
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Deploying
+                    - Running
+                    - Failed
+                    - Terminating
+                replicas:
+                  type: integer
+                readyReplicas:
+                  type: integer
+                availableReplicas:
+                  type: integer
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                deploymentRef:
+                  type: string
+                serviceRef:
+                  type: string
+                ingressRef:
+                  type: string
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Replicas
+          type: integer
+          jsonPath: .status.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      subresources:
+        status: {}
+        scale:
+          specReplicasPath: .spec.replicas.min
+          statusReplicasPath: .status.replicas
+  scope: Namespaced
+  names:
+    plural: microservicedeployments
+    singular: microservicedeployment
+    kind: MicroserviceDeployment
+    shortNames:
+      - msd
+    categories:
+      - platform
+      - all
 ```
 
-### 2.2 Custom ESLint Security Rules
+### TypeScript CRD Schema ด้วย zod
 
-```javascript
-// .eslintrc.security.js
-module.exports = {
-  plugins: ['security', 'no-unsanitized', 'no-secrets'],
-  extends: ['plugin:security/recommended'],
-  rules: {
-    // Prevent SQL injection
-    'security/detect-sql-literal-injection': 'error',
-    
-    // Prevent XSS
-    'no-unsanitized/method': ['error', {
-      escape: {
-        taggedTemplates: ['html', 'svg', 'css'],
-        methods: ['escapeHTML', 'sanitizeHTML'],
-      },
-    }],
-    
-    // Prevent command injection
-    'security/detect-child-process': 'warn',
-    'security/detect-non-literal-require': 'warn',
-    
-    // Prevent regex DoS (ReDoS)
-    'security/detect-unsafe-regex': 'error',
-    
-    // Prevent hardcoded secrets
-    'no-secrets/no-secrets': ['error', { tolerance: 4.0 }],
-    
-    // Prevent object injection
-    'security/detect-object-injection': 'error',
-    'security/detect-non-literal-fs-filename': 'warn',
-    
-    // Prevent SSRF
-    'no-restricted-syntax': [
-      'warn',
-      {
-        selector: "CallExpression[callee.name='fetch'][arguments.0.type='Identifier']",
-        message: 'User-controlled URLs in fetch() may lead to SSRF. Validate/allowlist the URL.',
-      },
-    ],
-  },
+```typescript
+// microservice-deployment-schema.ts
+import { z } from 'zod';
+
+// Resource definition schema
+const ResourceAmountSchema = z.string().regex(/^\d+(m|([.]\d+))?$/, {
+  message: 'Must be valid Kubernetes resource amount (e.g., "100m", "0.5")',
+});
+
+const MemoryAmountSchema = z.string().regex(/^\d+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$/, {
+  message: 'Must be valid memory amount (e.g., "128Mi", "1Gi")',
+});
+
+const ResourcesSchema = z.object({
+  cpu: z.object({
+    request: ResourceAmountSchema.default('100m'),
+    limit: ResourceAmountSchema.default('1000m'),
+  }).optional(),
+  memory: z.object({
+    request: MemoryAmountSchema.default('128Mi'),
+    limit: MemoryAmountSchema.default('512Mi'),
+  }).optional(),
+});
+
+const EnvVarSchema = z.union([
+  z.object({
+    name: z.string().min(1),
+    value: z.string(),
+  }),
+  z.object({
+    name: z.string().min(1),
+    valueFrom: z.union([
+      z.object({
+        secretKeyRef: z.object({
+          name: z.string(),
+          key: z.string(),
+        }),
+      }),
+      z.object({
+        configMapKeyRef: z.object({
+          name: z.string(),
+          key: z.string(),
+        }),
+      }),
+    ]),
+  }),
+]);
+
+const ReplicasSchema = z.object({
+  min: z.number().int().min(1).default(2),
+  max: z.number().int().min(1).default(10),
+  targetCPUUtilization: z.number().int().min(1).max(100).default(70),
+}).refine(data => data.max >= data.min, {
+  message: 'max replicas must be >= min replicas',
+});
+
+const IngressSchema = z.object({
+  enabled: z.boolean().default(false),
+  host: z.string().optional(),
+  path: z.string().default('/'),
+  tlsEnabled: z.boolean().default(true),
+});
+
+const HealthCheckSchema = z.object({
+  path: z.string().default('/health'),
+  port: z.number().int().optional(),
+  initialDelaySeconds: z.number().int().default(10),
+  periodSeconds: z.number().int().default(10),
+  failureThreshold: z.number().int().default(3),
+});
+
+const MonitoringSchema = z.object({
+  enabled: z.boolean().default(true),
+  path: z.string().default('/metrics'),
+  interval: z.string().default('30s'),
+});
+
+const StrategySchema = z.object({
+  type: z.enum(['RollingUpdate', 'Recreate', 'BlueGreen', 'Canary']).default('RollingUpdate'),
+  canaryWeight: z.number().int().min(0).max(100).default(10),
+});
+
+const MicroserviceDeploymentSpecSchema = z.object({
+  image: z.string().regex(/^[a-z0-9/:._-]+$/, {
+    message: 'Image must be a valid container image reference',
+  }),
+  port: z.number().int().min(1).max(65535),
+  replicas: ReplicasSchema.optional(),
+  resources: ResourcesSchema.optional(),
+  environment: z.array(EnvVarSchema).optional(),
+  ingress: IngressSchema.optional(),
+  healthCheck: HealthCheckSchema.optional(),
+  monitoring: MonitoringSchema.optional(),
+  serviceAccount: z.string().optional(),
+  configMaps: z.array(z.string()).optional(),
+  secrets: z.array(z.string()).optional(),
+  strategy: StrategySchema.optional(),
+});
+
+const MicroserviceDeploymentStatusSchema = z.object({
+  phase: z.enum(['Pending', 'Deploying', 'Running', 'Failed', 'Terminating']).optional(),
+  replicas: z.number().int().optional(),
+  readyReplicas: z.number().int().optional(),
+  availableReplicas: z.number().int().optional(),
+  conditions: z.array(z.object({
+    type: z.string(),
+    status: z.string(),
+    reason: z.string().optional(),
+    message: z.string().optional(),
+    lastTransitionTime: z.string().optional(),
+  })).optional(),
+  observedGeneration: z.number().int().optional(),
+  deploymentRef: z.string().optional(),
+  serviceRef: z.string().optional(),
+  ingressRef: z.string().optional(),
+});
+
+const MicroserviceDeploymentSchema = z.object({
+  apiVersion: z.literal('platform.example.com/v1'),
+  kind: z.literal('MicroserviceDeployment'),
+  metadata: z.object({
+    name: z.string().min(1).max(253),
+    namespace: z.string().optional(),
+    labels: z.record(z.string()).optional(),
+    annotations: z.record(z.string()).optional(),
+  }),
+  spec: MicroserviceDeploymentSpecSchema,
+  status: MicroserviceDeploymentStatusSchema.optional(),
+});
+
+type MicroserviceDeploymentSpec = z.infer<typeof MicroserviceDeploymentSpecSchema>;
+type MicroserviceDeployment = z.infer<typeof MicroserviceDeploymentSchema>;
+
+function validateMicroserviceDeployment(data: unknown): MicroserviceDeployment {
+  return MicroserviceDeploymentSchema.parse(data);
+}
+
+export {
+  MicroserviceDeploymentSchema,
+  MicroserviceDeploymentSpecSchema,
+  validateMicroserviceDeployment,
+  type MicroserviceDeployment,
+  type MicroserviceDeploymentSpec,
 };
 ```
 
 ---
 
-## 3. Container Image Scanning ใน Production
+## 80.2 Kubernetes Operator ด้วย TypeScript
 
-### 3.1 Triton Admission Controller
+### TypeScript Operator ใช้ @kubernetes/client-node
 
 ```typescript
-// admission-controller/src/image-scanner.ts
-import { KubeConfig, AdmissionregistrationV1Api } from '@kubernetes/client-node';
-import express from 'express';
-import https from 'https';
-import fs from 'fs';
-import axios from 'axios';
+// microservice-operator.ts
+import * as k8s from '@kubernetes/client-node';
+import { EventEmitter } from 'events';
 
-interface AdmissionReview {
+// Types
+interface MicroserviceDeployment {
+  apiVersion: string;
+  kind: string;
+  metadata: k8s.V1ObjectMeta;
+  spec: {
+    image: string;
+    port: number;
+    replicas?: {
+      min: number;
+      max: number;
+      targetCPUUtilization: number;
+    };
+    resources?: {
+      cpu?: { request: string; limit: string };
+      memory?: { request: string; limit: string };
+    };
+    environment?: Array<{ name: string; value?: string }>;
+    ingress?: {
+      enabled: boolean;
+      host?: string;
+      path: string;
+    };
+    healthCheck?: {
+      path: string;
+      initialDelaySeconds: number;
+      periodSeconds: number;
+    };
+  };
+  status?: {
+    phase?: string;
+    replicas?: number;
+    readyReplicas?: number;
+    conditions?: Array<{
+      type: string;
+      status: string;
+      reason?: string;
+      message?: string;
+      lastTransitionTime?: string;
+    }>;
+    observedGeneration?: number;
+  };
+}
+
+type ReconcileAction = 'create' | 'update' | 'delete' | 'noop';
+
+interface ReconcileResult {
+  action: ReconcileAction;
+  success: boolean;
+  error?: string;
+  requeue?: boolean;
+  requeueAfterMs?: number;
+}
+
+// Operator Class
+class MicroserviceOperator extends EventEmitter {
+  private kc: k8s.KubeConfig;
+  private coreApi: k8s.CoreV1Api;
+  private appsApi: k8s.AppsV1Api;
+  private customApi: k8s.CustomObjectsApi;
+  private autoscalingApi: k8s.AutoscalingV2Api;
+  private networkingApi: k8s.NetworkingV1Api;
+  private informer: k8s.Informer<MicroserviceDeployment> | null = null;
+  private reconcileQueue: Map<string, MicroserviceDeployment>;
+  private isProcessing = false;
+
+  private readonly GROUP = 'platform.example.com';
+  private readonly VERSION = 'v1';
+  private readonly PLURAL = 'microservicedeployments';
+  private readonly FINALIZER = 'platform.example.com/cleanup';
+  private readonly FIELD_MANAGER = 'microservice-operator';
+
+  constructor() {
+    super();
+    this.kc = new k8s.KubeConfig();
+    this.kc.loadFromDefault();
+    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
+    this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
+    this.customApi = this.kc.makeApiClient(k8s.CustomObjectsApi);
+    this.autoscalingApi = this.kc.makeApiClient(k8s.AutoscalingV2Api);
+    this.networkingApi = this.kc.makeApiClient(k8s.NetworkingV1Api);
+    this.reconcileQueue = new Map();
+  }
+
+  async start(): Promise<void> {
+    console.log('Starting MicroserviceDeployment Operator...');
+    
+    await this.setupInformer();
+    await this.processQueue();
+    
+    console.log('Operator started successfully');
+  }
+
+  private async setupInformer(): Promise<void> {
+    const listFn = () => this.customApi.listClusterCustomObject(
+      this.GROUP,
+      this.VERSION,
+      this.PLURAL
+    );
+
+    this.informer = k8s.makeInformer(
+      this.kc,
+      `/apis/${this.GROUP}/${this.VERSION}/${this.PLURAL}`,
+      listFn as any
+    );
+
+    this.informer.on('add', (obj: MicroserviceDeployment) => {
+      console.log(`[ADD] ${obj.metadata.namespace}/${obj.metadata.name}`);
+      this.enqueueReconcile(obj);
+    });
+
+    this.informer.on('update', (obj: MicroserviceDeployment) => {
+      console.log(`[UPDATE] ${obj.metadata.namespace}/${obj.metadata.name}`);
+      this.enqueueReconcile(obj);
+    });
+
+    this.informer.on('delete', (obj: MicroserviceDeployment) => {
+      console.log(`[DELETE] ${obj.metadata.namespace}/${obj.metadata.name}`);
+      // ลบออกจาก queue
+      const key = `${obj.metadata.namespace}/${obj.metadata.name}`;
+      this.reconcileQueue.delete(key);
+    });
+
+    this.informer.on('error', (err: Error) => {
+      console.error('Informer error:', err.message);
+      // Restart informer after 5 seconds
+      setTimeout(() => this.setupInformer(), 5000);
+    });
+
+    await this.informer.start();
+  }
+
+  private enqueueReconcile(obj: MicroserviceDeployment): void {
+    const key = `${obj.metadata.namespace}/${obj.metadata.name}`;
+    this.reconcileQueue.set(key, obj);
+    
+    if (!this.isProcessing) {
+      this.processQueue();
+    }
+  }
+
+  private async processQueue(): Promise<void> {
+    this.isProcessing = true;
+    
+    while (this.reconcileQueue.size > 0) {
+      const [key, obj] = this.reconcileQueue.entries().next().value;
+      this.reconcileQueue.delete(key);
+      
+      try {
+        const result = await this.reconcile(obj);
+        
+        if (result.requeue) {
+          const delay = result.requeueAfterMs ?? 5000;
+          setTimeout(() => this.enqueueReconcile(obj), delay);
+        }
+      } catch (err: any) {
+        console.error(`Reconcile error for ${key}:`, err.message);
+        // Requeue with backoff
+        setTimeout(() => this.enqueueReconcile(obj), 10000);
+      }
+    }
+    
+    this.isProcessing = false;
+  }
+
+  async reconcile(msd: MicroserviceDeployment): Promise<ReconcileResult> {
+    const { name, namespace, generation, finalizers } = msd.metadata;
+    const ns = namespace ?? 'default';
+
+    console.log(`Reconciling ${ns}/${name} (generation: ${generation})`);
+
+    // Handle deletion
+    if (msd.metadata.deletionTimestamp) {
+      return this.handleDeletion(msd, ns);
+    }
+
+    // Add finalizer if not present
+    if (!finalizers?.includes(this.FINALIZER)) {
+      await this.addFinalizer(msd, ns);
+    }
+
+    // Update status to Deploying
+    await this.updateStatus(msd, ns, {
+      phase: 'Deploying',
+      conditions: [{
+        type: 'Progressing',
+        status: 'True',
+        reason: 'ReconcileStarted',
+        message: 'Reconciliation started',
+        lastTransitionTime: new Date().toISOString(),
+      }],
+    });
+
+    try {
+      // Reconcile Deployment
+      await this.reconcileDeployment(msd, ns);
+      
+      // Reconcile Service
+      await this.reconcileService(msd, ns);
+      
+      // Reconcile HPA
+      await this.reconcileHPA(msd, ns);
+      
+      // Reconcile Ingress if enabled
+      if (msd.spec.ingress?.enabled) {
+        await this.reconcileIngress(msd, ns);
+      }
+
+      // Check deployment readiness
+      const deployment = await this.appsApi.readNamespacedDeployment(name, ns);
+      const readyReplicas = deployment.body.status?.readyReplicas ?? 0;
+      const totalReplicas = deployment.body.status?.replicas ?? 0;
+
+      await this.updateStatus(msd, ns, {
+        phase: readyReplicas === totalReplicas ? 'Running' : 'Deploying',
+        replicas: totalReplicas,
+        readyReplicas,
+        observedGeneration: generation,
+        conditions: [{
+          type: 'Available',
+          status: readyReplicas > 0 ? 'True' : 'False',
+          reason: readyReplicas > 0 ? 'MinimumReplicasAvailable' : 'MinimumReplicasUnavailable',
+          message: `${readyReplicas}/${totalReplicas} replicas ready`,
+          lastTransitionTime: new Date().toISOString(),
+        }],
+      });
+
+      // Requeue if not fully ready
+      if (readyReplicas < totalReplicas) {
+        return { action: 'update', success: true, requeue: true, requeueAfterMs: 10000 };
+      }
+
+      return { action: 'update', success: true, requeue: false };
+    } catch (err: any) {
+      await this.updateStatus(msd, ns, {
+        phase: 'Failed',
+        conditions: [{
+          type: 'Failed',
+          status: 'True',
+          reason: 'ReconcileError',
+          message: err.message,
+          lastTransitionTime: new Date().toISOString(),
+        }],
+      });
+
+      return {
+        action: 'update',
+        success: false,
+        error: err.message,
+        requeue: true,
+        requeueAfterMs: 30000,
+      };
+    }
+  }
+
+  private async reconcileDeployment(
+    msd: MicroserviceDeployment,
+    namespace: string
+  ): Promise<void> {
+    const { name } = msd.metadata;
+    const spec = msd.spec;
+    
+    const deploymentSpec: k8s.V1Deployment = {
+      metadata: {
+        name,
+        namespace,
+        labels: {
+          'app': name,
+          'managed-by': 'microservice-operator',
+          'platform.example.com/msd': name,
+        },
+        ownerReferences: [{
+          apiVersion: `${this.GROUP}/${this.VERSION}`,
+          kind: 'MicroserviceDeployment',
+          name,
+          uid: msd.metadata.uid!,
+          controller: true,
+          blockOwnerDeletion: true,
+        }],
+      },
+      spec: {
+        replicas: spec.replicas?.min ?? 2,
+        selector: {
+          matchLabels: { app: name },
+        },
+        template: {
+          metadata: {
+            labels: { app: name },
+            annotations: {
+              'prometheus.io/scrape': 'true',
+              'prometheus.io/path': '/metrics',
+              'prometheus.io/port': spec.port.toString(),
+            },
+          },
+          spec: {
+            containers: [{
+              name,
+              image: spec.image,
+              ports: [{ containerPort: spec.port }],
+              env: spec.environment as k8s.V1EnvVar[],
+              resources: {
+                requests: {
+                  cpu: spec.resources?.cpu?.request ?? '100m',
+                  memory: spec.resources?.memory?.request ?? '128Mi',
+                },
+                limits: {
+                  cpu: spec.resources?.cpu?.limit ?? '1000m',
+                  memory: spec.resources?.memory?.limit ?? '512Mi',
+                },
+              },
+              readinessProbe: {
+                httpGet: {
+                  path: spec.healthCheck?.path ?? '/health',
+                  port: spec.port as any,
+                },
+                initialDelaySeconds: spec.healthCheck?.initialDelaySeconds ?? 10,
+                periodSeconds: spec.healthCheck?.periodSeconds ?? 10,
+              },
+              livenessProbe: {
+                httpGet: {
+                  path: spec.healthCheck?.path ?? '/health',
+                  port: spec.port as any,
+                },
+                initialDelaySeconds: (spec.healthCheck?.initialDelaySeconds ?? 10) * 3,
+                periodSeconds: spec.healthCheck?.periodSeconds ?? 10,
+              },
+            }],
+          },
+        },
+        strategy: {
+          type: 'RollingUpdate',
+          rollingUpdate: {
+            maxSurge: 1,
+            maxUnavailable: 0,
+          },
+        },
+      },
+    };
+
+    try {
+      await this.appsApi.readNamespacedDeployment(name, namespace);
+      // Update existing
+      await this.appsApi.patchNamespacedDeployment(
+        name,
+        namespace,
+        deploymentSpec,
+        undefined,
+        undefined,
+        this.FIELD_MANAGER,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/apply-patch+yaml' } }
+      );
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        await this.appsApi.createNamespacedDeployment(namespace, deploymentSpec);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async reconcileService(
+    msd: MicroserviceDeployment,
+    namespace: string
+  ): Promise<void> {
+    const { name } = msd.metadata;
+    
+    const service: k8s.V1Service = {
+      metadata: {
+        name,
+        namespace,
+        labels: { app: name, 'managed-by': 'microservice-operator' },
+        ownerReferences: [{
+          apiVersion: `${this.GROUP}/${this.VERSION}`,
+          kind: 'MicroserviceDeployment',
+          name,
+          uid: msd.metadata.uid!,
+          controller: true,
+          blockOwnerDeletion: true,
+        }],
+      },
+      spec: {
+        selector: { app: name },
+        ports: [{
+          port: 80,
+          targetPort: msd.spec.port as any,
+          protocol: 'TCP',
+          name: 'http',
+        }],
+        type: 'ClusterIP',
+      },
+    };
+
+    try {
+      await this.coreApi.readNamespacedService(name, namespace);
+      await this.coreApi.patchNamespacedService(
+        name,
+        namespace,
+        service,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/merge-patch+json' } }
+      );
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        await this.coreApi.createNamespacedService(namespace, service);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async reconcileHPA(
+    msd: MicroserviceDeployment,
+    namespace: string
+  ): Promise<void> {
+    const { name } = msd.metadata;
+    const replicas = msd.spec.replicas;
+    
+    if (!replicas) return;
+
+    const hpa: k8s.V2HorizontalPodAutoscaler = {
+      metadata: {
+        name,
+        namespace,
+        ownerReferences: [{
+          apiVersion: `${this.GROUP}/${this.VERSION}`,
+          kind: 'MicroserviceDeployment',
+          name,
+          uid: msd.metadata.uid!,
+          controller: true,
+          blockOwnerDeletion: true,
+        }],
+      },
+      spec: {
+        scaleTargetRef: {
+          apiVersion: 'apps/v1',
+          kind: 'Deployment',
+          name,
+        },
+        minReplicas: replicas.min,
+        maxReplicas: replicas.max,
+        metrics: [{
+          type: 'Resource',
+          resource: {
+            name: 'cpu',
+            target: {
+              type: 'Utilization',
+              averageUtilization: replicas.targetCPUUtilization,
+            },
+          },
+        }],
+      },
+    };
+
+    try {
+      await this.autoscalingApi.readNamespacedHorizontalPodAutoscaler(name, namespace);
+      await this.autoscalingApi.patchNamespacedHorizontalPodAutoscaler(
+        name,
+        namespace,
+        hpa,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/merge-patch+json' } }
+      );
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        await this.autoscalingApi.createNamespacedHorizontalPodAutoscaler(namespace, hpa);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async reconcileIngress(
+    msd: MicroserviceDeployment,
+    namespace: string
+  ): Promise<void> {
+    const { name } = msd.metadata;
+    const ingressSpec = msd.spec.ingress!;
+    
+    if (!ingressSpec.host) {
+      throw new Error('Ingress requires a host');
+    }
+
+    const ingress: k8s.V1Ingress = {
+      metadata: {
+        name,
+        namespace,
+        annotations: {
+          'kubernetes.io/ingress.class': 'nginx',
+          'cert-manager.io/cluster-issuer': 'letsencrypt-prod',
+        },
+      },
+      spec: {
+        tls: ingressSpec.tlsEnabled ? [{
+          hosts: [ingressSpec.host],
+          secretName: `${name}-tls`,
+        }] : undefined,
+        rules: [{
+          host: ingressSpec.host,
+          http: {
+            paths: [{
+              path: ingressSpec.path,
+              pathType: 'Prefix',
+              backend: {
+                service: {
+                  name,
+                  port: { number: 80 },
+                },
+              },
+            }],
+          },
+        }],
+      },
+    };
+
+    try {
+      await this.networkingApi.readNamespacedIngress(name, namespace);
+      await this.networkingApi.patchNamespacedIngress(
+        name,
+        namespace,
+        ingress,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/merge-patch+json' } }
+      );
+    } catch (err: any) {
+      if (err.statusCode === 404) {
+        await this.networkingApi.createNamespacedIngress(namespace, ingress);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  private async handleDeletion(
+    msd: MicroserviceDeployment,
+    namespace: string
+  ): Promise<ReconcileResult> {
+    const { name, finalizers } = msd.metadata;
+    
+    if (!finalizers?.includes(this.FINALIZER)) {
+      return { action: 'delete', success: true };
+    }
+
+    console.log(`Handling deletion of ${namespace}/${name}`);
+    
+    // Cleanup logic here (e.g., external resources)
+    
+    // Remove finalizer
+    await this.removeFinalizer(msd, namespace);
+    
+    return { action: 'delete', success: true };
+  }
+
+  private async addFinalizer(msd: MicroserviceDeployment, namespace: string): Promise<void> {
+    const { name, finalizers = [] } = msd.metadata;
+    
+    await this.customApi.patchNamespacedCustomObject(
+      this.GROUP,
+      this.VERSION,
+      namespace,
+      this.PLURAL,
+      name,
+      { metadata: { finalizers: [...finalizers, this.FINALIZER] } },
+      undefined,
+      undefined,
+      undefined,
+      { headers: { 'Content-Type': 'application/merge-patch+json' } }
+    );
+  }
+
+  private async removeFinalizer(msd: MicroserviceDeployment, namespace: string): Promise<void> {
+    const { name, finalizers = [] } = msd.metadata;
+    const newFinalizers = finalizers.filter(f => f !== this.FINALIZER);
+    
+    await this.customApi.patchNamespacedCustomObject(
+      this.GROUP,
+      this.VERSION,
+      namespace,
+      this.PLURAL,
+      name,
+      { metadata: { finalizers: newFinalizers } },
+      undefined,
+      undefined,
+      undefined,
+      { headers: { 'Content-Type': 'application/merge-patch+json' } }
+    );
+  }
+
+  private async updateStatus(
+    msd: MicroserviceDeployment,
+    namespace: string,
+    status: Partial<MicroserviceDeployment['status']>
+  ): Promise<void> {
+    const { name } = msd.metadata;
+    
+    try {
+      await this.customApi.patchNamespacedCustomObjectStatus(
+        this.GROUP,
+        this.VERSION,
+        namespace,
+        this.PLURAL,
+        name,
+        { status },
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/merge-patch+json' } }
+      );
+    } catch (err: any) {
+      console.warn(`Failed to update status for ${namespace}/${name}:`, err.message);
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this.informer) {
+      await this.informer.stop();
+    }
+  }
+}
+
+// Main entry point
+async function main() {
+  const operator = new MicroserviceOperator();
+
+  process.on('SIGTERM', async () => {
+    console.log('Received SIGTERM, shutting down...');
+    await operator.stop();
+    process.exit(0);
+  });
+
+  process.on('SIGINT', async () => {
+    console.log('Received SIGINT, shutting down...');
+    await operator.stop();
+    process.exit(0);
+  });
+
+  await operator.start();
+}
+
+main().catch(console.error);
+```
+
+---
+
+## 80.3 Controller Pattern: TypeScript ReconcileController with Exponential Backoff
+
+```typescript
+// reconcile-controller.ts
+
+interface ReconcileRequest {
+  name: string;
+  namespace: string;
+  generation?: number;
+}
+
+interface ReconcileError extends Error {
+  retryable: boolean;
+  suggestedDelayMs?: number;
+}
+
+abstract class BaseController<T> {
+  private workQueue: Map<string, ReconcileRequest>;
+  private retryMap: Map<string, { count: number; nextRetryMs: number }>;
+  private isRunning = false;
+  protected maxRetries = 5;
+  protected baseDelayMs = 1000;
+  protected maxDelayMs = 300000; // 5 minutes
+
+  constructor() {
+    this.workQueue = new Map();
+    this.retryMap = new Map();
+  }
+
+  protected abstract reconcile(request: ReconcileRequest): Promise<ReconcileResult>;
+
+  enqueue(request: ReconcileRequest): void {
+    const key = `${request.namespace}/${request.name}`;
+    
+    // Deduplication: only keep latest request per object
+    this.workQueue.set(key, request);
+    
+    if (!this.isRunning) {
+      this.runLoop();
+    }
+  }
+
+  private async runLoop(): Promise<void> {
+    this.isRunning = true;
+    
+    while (this.workQueue.size > 0) {
+      const entries = Array.from(this.workQueue.entries());
+      const now = Date.now();
+      
+      // Process only requests that are ready (not in backoff)
+      const readyEntries = entries.filter(([key]) => {
+        const retry = this.retryMap.get(key);
+        return !retry || now >= retry.nextRetryMs;
+      });
+
+      if (readyEntries.length === 0) {
+        // All in backoff, wait a bit
+        await this.sleep(100);
+        continue;
+      }
+
+      // Process one at a time (can be parallelized for performance)
+      const [key, request] = readyEntries[0];
+      this.workQueue.delete(key);
+
+      await this.processRequest(key, request);
+    }
+    
+    this.isRunning = false;
+  }
+
+  private async processRequest(
+    key: string,
+    request: ReconcileRequest
+  ): Promise<void> {
+    try {
+      const result = await this.reconcile(request);
+      
+      if (result.success) {
+        // Clear retry state on success
+        this.retryMap.delete(key);
+        
+        if (result.requeue) {
+          setTimeout(
+            () => this.enqueue(request),
+            result.requeueAfterMs ?? 10000
+          );
+        }
+      } else if (result.requeue) {
+        this.handleRetry(key, request, result.requeueAfterMs);
+      }
+    } catch (err: any) {
+      const isRetryable = (err as ReconcileError).retryable !== false;
+      
+      if (isRetryable) {
+        this.handleRetry(key, request, (err as ReconcileError).suggestedDelayMs);
+      } else {
+        console.error(`[Controller] Non-retryable error for ${key}:`, err.message);
+        this.retryMap.delete(key);
+      }
+    }
+  }
+
+  private handleRetry(
+    key: string,
+    request: ReconcileRequest,
+    suggestedDelayMs?: number
+  ): void {
+    const existing = this.retryMap.get(key) ?? { count: 0, nextRetryMs: 0 };
+    
+    if (existing.count >= this.maxRetries) {
+      console.error(`[Controller] Max retries (${this.maxRetries}) exceeded for ${key}`);
+      this.retryMap.delete(key);
+      return;
+    }
+
+    // Exponential backoff: delay = base * 2^count + jitter
+    const exponentialDelay = Math.min(
+      this.baseDelayMs * Math.pow(2, existing.count),
+      this.maxDelayMs
+    );
+    
+    // Add ±20% jitter to prevent thundering herd
+    const jitter = exponentialDelay * 0.2 * (Math.random() - 0.5) * 2;
+    const delayMs = suggestedDelayMs ?? Math.round(exponentialDelay + jitter);
+
+    const newRetry = {
+      count: existing.count + 1,
+      nextRetryMs: Date.now() + delayMs,
+    };
+    
+    this.retryMap.set(key, newRetry);
+    this.workQueue.set(key, request);
+    
+    console.log(
+      `[Controller] Retry ${newRetry.count}/${this.maxRetries} for ${key} ` +
+      `in ${(delayMs / 1000).toFixed(1)}s`
+    );
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// Concrete Controller implementation
+class MicroserviceReconcileController extends BaseController<any> {
+  protected async reconcile(request: ReconcileRequest): Promise<ReconcileResult> {
+    console.log(`[MicroserviceController] Reconciling ${request.namespace}/${request.name}`);
+    
+    // ตัวอย่าง reconcile logic
+    // ในความเป็นจริงจะ interact กับ Kubernetes API
+    await this.doReconcile(request.name, request.namespace);
+    
+    return { action: 'update', success: true, requeue: false };
+  }
+
+  private async doReconcile(name: string, namespace: string): Promise<void> {
+    // Implement actual reconcile logic here
+    console.log(`  Processing ${namespace}/${name}`);
+  }
+}
+
+export { BaseController, MicroserviceReconcileController };
+```
+
+---
+
+## 80.4 Admission Webhook: TypeScript ValidatingWebhookServer
+
+```typescript
+// validating-webhook-server.ts
+import * as https from 'https';
+import * as fs from 'fs';
+import * as express from 'express';
+
+interface AdmissionRequest {
   apiVersion: string;
   kind: string;
   request: {
     uid: string;
+    kind: { group: string; version: string; kind: string };
+    resource: { group: string; version: string; resource: string };
+    name: string;
+    namespace: string;
+    operation: 'CREATE' | 'UPDATE' | 'DELETE' | 'CONNECT';
     object: any;
-    operation: string;
+    oldObject?: any;
+    dryRun: boolean;
+    userInfo: {
+      username: string;
+      uid?: string;
+      groups?: string[];
+    };
   };
-  response?: {
+}
+
+interface AdmissionResponse {
+  apiVersion: string;
+  kind: string;
+  response: {
     uid: string;
     allowed: boolean;
-    status?: { code: number; message: string };
+    status?: {
+      code: number;
+      message: string;
+    };
     warnings?: string[];
   };
 }
 
-interface ScanResult {
-  image: string;
-  vulnerabilities: {
-    critical: number;
-    high: number;
-    medium: number;
-    low: number;
-  };
-  passed: boolean;
-  details: string[];
-}
-
-const SCAN_POLICY = {
-  maxCritical: 0,
-  maxHigh: 0,
-  allowedImages: [
-    'registry.company.com/',
-    'gcr.io/distroless/',
-  ],
-  blockedBaseImages: [
-    ':latest',
-    ':master',
-    ':main',
-  ],
+type ValidationResult = {
+  allowed: true;
+  warnings?: string[];
+} | {
+  allowed: false;
+  code: number;
+  message: string;
 };
 
-export class ImageScanAdmissionController {
+class ValidatingWebhookServer {
   private app: express.Application;
-  private trivyUrl: string;
+  private validators: Map<string, (req: AdmissionRequest['request']) => Promise<ValidationResult>>;
 
-  constructor(trivyUrl: string) {
-    this.trivyUrl = trivyUrl;
+  constructor() {
+    this.app = express();
+    this.validators = new Map();
+    this.setupMiddleware();
+    this.setupRoutes();
+  }
+
+  private setupMiddleware(): void {
+    this.app.use(express.json());
+    this.app.use((req, res, next) => {
+      console.log(`${req.method} ${req.path} from ${req.ip}`);
+      next();
+    });
+  }
+
+  private setupRoutes(): void {
+    this.app.post('/validate/:resource', async (req, res) => {
+      const resource = req.params.resource;
+      const admissionReview = req.body as AdmissionRequest;
+
+      const validator = this.validators.get(resource);
+      
+      if (!validator) {
+        return res.json(this.buildResponse(admissionReview.request.uid, {
+          allowed: false,
+          code: 400,
+          message: `No validator registered for resource: ${resource}`,
+        }));
+      }
+
+      try {
+        const result = await validator(admissionReview.request);
+        return res.json(this.buildResponse(admissionReview.request.uid, result));
+      } catch (err: any) {
+        console.error(`Validation error for ${resource}:`, err.message);
+        return res.json(this.buildResponse(admissionReview.request.uid, {
+          allowed: false,
+          code: 500,
+          message: `Internal webhook error: ${err.message}`,
+        }));
+      }
+    });
+
+    this.app.get('/healthz', (req, res) => {
+      res.json({ status: 'ok', time: new Date().toISOString() });
+    });
+  }
+
+  registerValidator(
+    resource: string,
+    validator: (req: AdmissionRequest['request']) => Promise<ValidationResult>
+  ): void {
+    this.validators.set(resource, validator);
+    console.log(`Registered validator for resource: ${resource}`);
+  }
+
+  private buildResponse(uid: string, result: ValidationResult): AdmissionResponse {
+    const response: AdmissionResponse = {
+      apiVersion: 'admission.k8s.io/v1',
+      kind: 'AdmissionReview',
+      response: {
+        uid,
+        allowed: result.allowed,
+      },
+    };
+
+    if (!result.allowed) {
+      response.response.status = {
+        code: result.code,
+        message: result.message,
+      };
+    } else if (result.warnings) {
+      response.response.warnings = result.warnings;
+    }
+
+    return response;
+  }
+
+  start(port: number, certFile: string, keyFile: string): void {
+    const serverOptions: https.ServerOptions = {
+      cert: fs.readFileSync(certFile),
+      key: fs.readFileSync(keyFile),
+    };
+
+    const server = https.createServer(serverOptions, this.app);
+    
+    server.listen(port, () => {
+      console.log(`Validating webhook server listening on port ${port}`);
+    });
+  }
+}
+
+// MicroserviceDeployment Validator
+async function microserviceDeploymentValidator(
+  req: AdmissionRequest['request']
+): Promise<ValidationResult> {
+  const msd = req.object;
+  const warnings: string[] = [];
+
+  // Validate image is not using 'latest' tag
+  if (msd.spec?.image?.endsWith(':latest')) {
+    return {
+      allowed: false,
+      code: 400,
+      message: 'Image tag "latest" is not allowed in production. Please use a specific version tag.',
+    };
+  }
+
+  // Validate resource limits are set
+  if (!msd.spec?.resources?.cpu?.limit || !msd.spec?.resources?.memory?.limit) {
+    return {
+      allowed: false,
+      code: 400,
+      message: 'Resource limits (CPU and memory) are required for all deployments.',
+    };
+  }
+
+  // Validate max replicas doesn't exceed cluster policy
+  const maxAllowedReplicas = 50;
+  if (msd.spec?.replicas?.max > maxAllowedReplicas) {
+    return {
+      allowed: false,
+      code: 400,
+      message: `Maximum replicas (${msd.spec.replicas.max}) exceeds cluster limit (${maxAllowedReplicas}).`,
+    };
+  }
+
+  // Warning: no ingress but in production namespace
+  if (!msd.spec?.ingress?.enabled && req.namespace === 'production') {
+    warnings.push('Ingress is not enabled. Service will only be accessible within the cluster.');
+  }
+
+  // Warning: no monitoring
+  if (!msd.spec?.monitoring?.enabled) {
+    warnings.push('Monitoring is not enabled. Consider enabling Prometheus metrics scraping.');
+  }
+
+  return { allowed: true, warnings: warnings.length > 0 ? warnings : undefined };
+}
+
+// Server setup
+const webhookServer = new ValidatingWebhookServer();
+webhookServer.registerValidator('microservicedeployments', microserviceDeploymentValidator);
+webhookServer.start(
+  8443,
+  process.env.TLS_CERT_FILE ?? '/tls/tls.crt',
+  process.env.TLS_KEY_FILE ?? '/tls/tls.key'
+);
+```
+
+### ValidatingWebhookConfiguration YAML
+
+```yaml
+# validating-webhook-config.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: microservice-deployment-validator
+  annotations:
+    cert-manager.io/inject-ca-from: "platform-system/webhook-server-cert"
+webhooks:
+  - name: validate.microservicedeployments.platform.example.com
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: microservice-webhook-server
+        namespace: platform-system
+        path: /validate/microservicedeployments
+        port: 443
+    rules:
+      - apiGroups: ["platform.example.com"]
+        apiVersions: ["v1"]
+        resources: ["microservicedeployments"]
+        operations:
+          - CREATE
+          - UPDATE
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - kube-public
+            - platform-system
+    failurePolicy: Fail
+    sideEffects: None
+    timeoutSeconds: 10
+```
+
+---
+
+## 80.5 MutatingWebhookConfiguration: Auto-inject Sidecar
+
+```yaml
+# mutating-webhook-config.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+  annotations:
+    cert-manager.io/inject-ca-from: "platform-system/webhook-server-cert"
+webhooks:
+  - name: inject-sidecar.platform.example.com
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: sidecar-injector
+        namespace: platform-system
+        path: /mutate/pods
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        operations:
+          - CREATE
+        scope: Namespaced
+    namespaceSelector:
+      matchLabels:
+        sidecar-injection: enabled
+    objectSelector:
+      matchExpressions:
+        - key: sidecar-injector/inject
+          operator: NotIn
+          values: ["false"]
+    failurePolicy: Ignore  # Don't block pod creation if webhook fails
+    sideEffects: None
+    timeoutSeconds: 5
+    reinvocationPolicy: IfNeeded
+```
+
+### TypeScript Mutating Webhook สำหรับ Sidecar Injection
+
+```typescript
+// mutating-webhook-server.ts
+import * as express from 'express';
+import * as https from 'https';
+import * as fs from 'fs';
+
+interface MutatingAdmissionResponse {
+  apiVersion: string;
+  kind: string;
+  response: {
+    uid: string;
+    allowed: boolean;
+    patchType?: 'JSONPatch';
+    patch?: string;
+    status?: { message: string };
+  };
+}
+
+interface JSONPatch {
+  op: 'add' | 'remove' | 'replace' | 'copy' | 'move' | 'test';
+  path: string;
+  value?: any;
+  from?: string;
+}
+
+class MutatingSidecarInjector {
+  private app: express.Application;
+
+  private readonly SIDECAR_CONTAINER = {
+    name: 'monitoring-sidecar',
+    image: 'myregistry/monitoring-sidecar:v1.0.0',
+    ports: [{ containerPort: 9091, name: 'metrics' }],
+    resources: {
+      requests: { cpu: '50m', memory: '64Mi' },
+      limits: { cpu: '200m', memory: '128Mi' },
+    },
+    env: [
+      { name: 'SIDECAR_ENABLED', value: 'true' },
+      { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
+      { name: 'POD_NAMESPACE', valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
+    ],
+    readinessProbe: {
+      httpGet: { path: '/ready', port: 9091 },
+      initialDelaySeconds: 5,
+      periodSeconds: 10,
+    },
+  };
+
+  constructor() {
     this.app = express();
     this.app.use(express.json());
     this.setupRoutes();
   }
 
   private setupRoutes(): void {
-    this.app.post('/validate', async (req, res) => {
-      const review: AdmissionReview = req.body;
-      const response = await this.handleAdmission(review);
-      res.json(response);
+    this.app.post('/mutate/pods', async (req, res) => {
+      const admissionReview = req.body;
+      const pod = admissionReview.request?.object;
+      const uid = admissionReview.request?.uid;
+
+      // ตรวจสอบว่า sidecar ถูก inject แล้วหรือยัง
+      const alreadyInjected = pod?.metadata?.annotations?.['sidecar-injected'] === 'true';
+      const skipInjection = pod?.metadata?.annotations?.['sidecar-injector/inject'] === 'false';
+
+      if (alreadyInjected || skipInjection) {
+        return res.json(this.allowWithoutPatch(uid));
+      }
+
+      const patches = this.buildPatches(pod);
+      return res.json(this.buildMutatingResponse(uid, patches));
     });
 
-    this.app.get('/health', (_, res) => res.json({ status: 'ok' }));
+    this.app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
   }
 
-  private async handleAdmission(review: AdmissionReview): Promise<AdmissionReview> {
-    const { uid } = review.request;
-    const pod = review.request.object;
-    const warnings: string[] = [];
+  private buildPatches(pod: any): JSONPatch[] {
+    const patches: JSONPatch[] = [];
+    const containers = pod.spec?.containers ?? [];
 
-    if (review.request.operation !== 'CREATE' && review.request.operation !== 'UPDATE') {
-      return this.allow(uid);
+    // Add sidecar container
+    patches.push({
+      op: 'add',
+      path: '/spec/containers/-',
+      value: this.SIDECAR_CONTAINER,
+    });
+
+    // Add volume for shared metrics data
+    const volumes = pod.spec?.volumes ?? [];
+    if (volumes.length === 0) {
+      patches.push({ op: 'add', path: '/spec/volumes', value: [] });
     }
+    patches.push({
+      op: 'add',
+      path: '/spec/volumes/-',
+      value: {
+        name: 'monitoring-data',
+        emptyDir: { medium: 'Memory', sizeLimit: '10Mi' },
+      },
+    });
 
-    const containers = [
-      ...(pod.spec?.containers || []),
-      ...(pod.spec?.initContainers || []),
-    ];
-
-    for (const container of containers) {
-      const image = container.image;
-
-      // Policy: Only allow from approved registries
-      const isApproved = SCAN_POLICY.allowedImages.some((prefix) =>
-        image.startsWith(prefix)
-      );
-
-      if (!isApproved) {
-        return this.deny(uid, `Image ${image} is not from an approved registry`);
-      }
-
-      // Policy: No latest/master/main tags
-      const isBlockedTag = SCAN_POLICY.blockedBaseImages.some((tag) =>
-        image.includes(tag)
-      );
-
-      if (isBlockedTag) {
-        return this.deny(uid, `Image ${image} uses a blocked tag (latest/master/main)`);
-      }
-
-      // Scan image for vulnerabilities
-      try {
-        const scanResult = await this.scanImage(image);
-
-        if (scanResult.vulnerabilities.critical > SCAN_POLICY.maxCritical) {
-          return this.deny(
-            uid,
-            `Image ${image} has ${scanResult.vulnerabilities.critical} critical vulnerabilities`
-          );
-        }
-
-        if (scanResult.vulnerabilities.high > SCAN_POLICY.maxHigh) {
-          return this.deny(
-            uid,
-            `Image ${image} has ${scanResult.vulnerabilities.high} high vulnerabilities`
-          );
-        }
-
-        if (scanResult.vulnerabilities.medium > 10) {
-          warnings.push(
-            `Image ${image} has ${scanResult.vulnerabilities.medium} medium vulnerabilities`
-          );
-        }
-      } catch (error: any) {
-        // If scan fails and we're in strict mode, deny
-        if (process.env.SCAN_STRICT_MODE === 'true') {
-          return this.deny(uid, `Failed to scan image ${image}: ${error.message}`);
-        }
-        warnings.push(`Could not scan image ${image}: ${error.message}`);
-      }
+    // Add annotation to mark as injected
+    const annotations = pod.metadata?.annotations ?? {};
+    if (Object.keys(annotations).length === 0) {
+      patches.push({ op: 'add', path: '/metadata/annotations', value: {} });
     }
+    patches.push({
+      op: 'add',
+      path: '/metadata/annotations/sidecar-injected',
+      value: 'true',
+    });
+    patches.push({
+      op: 'add',
+      path: '/metadata/annotations/sidecar-injected-at',
+      value: new Date().toISOString(),
+    });
 
-    return this.allow(uid, warnings);
+    return patches;
   }
 
-  private async scanImage(image: string): Promise<ScanResult> {
-    const response = await axios.post(
-      `${this.trivyUrl}/scan`,
-      { image, scanType: 'vuln', format: 'json' },
-      { timeout: 60000 }
-    );
-
-    const data = response.data;
-    const vulns = { critical: 0, high: 0, medium: 0, low: 0 };
-    const details: string[] = [];
-
-    for (const result of data.Results || []) {
-      for (const vuln of result.Vulnerabilities || []) {
-        const severity = vuln.Severity?.toLowerCase() as keyof typeof vulns;
-        if (severity in vulns) {
-          vulns[severity]++;
-          if (severity === 'critical' || severity === 'high') {
-            details.push(`${vuln.VulnerabilityID}: ${vuln.Title} (${severity})`);
-          }
-        }
-      }
-    }
-
-    return {
-      image,
-      vulnerabilities: vulns,
-      passed: vulns.critical === 0 && vulns.high === 0,
-      details,
-    };
-  }
-
-  private allow(uid: string, warnings?: string[]): AdmissionReview {
+  private buildMutatingResponse(uid: string, patches: JSONPatch[]): MutatingAdmissionResponse {
+    const patchBytes = Buffer.from(JSON.stringify(patches)).toString('base64');
+    
     return {
       apiVersion: 'admission.k8s.io/v1',
       kind: 'AdmissionReview',
       response: {
         uid,
         allowed: true,
-        warnings,
+        patchType: 'JSONPatch',
+        patch: patchBytes,
       },
     };
   }
 
-  private deny(uid: string, message: string): AdmissionReview {
+  private allowWithoutPatch(uid: string): MutatingAdmissionResponse {
     return {
       apiVersion: 'admission.k8s.io/v1',
       kind: 'AdmissionReview',
-      response: {
-        uid,
-        allowed: false,
-        status: {
-          code: 403,
-          message,
-        },
-      },
+      response: { uid, allowed: true },
     };
   }
 
-  start(port: number, certPath: string, keyPath: string): void {
+  start(port: number, certFile: string, keyFile: string): void {
     const server = https.createServer(
-      {
-        cert: fs.readFileSync(certPath),
-        key: fs.readFileSync(keyPath),
-      },
+      { cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) },
       this.app
     );
-
+    
     server.listen(port, () => {
-      console.log(`Image scan admission controller running on port ${port}`);
+      console.log(`Mutating webhook server listening on port ${port}`);
     });
   }
 }
+
+const injector = new MutatingSidecarInjector();
+injector.start(
+  8443,
+  process.env.TLS_CERT_FILE ?? '/tls/tls.crt',
+  process.env.TLS_KEY_FILE ?? '/tls/tls.key'
+);
 ```
 
 ---
 
-## 4. Policy as Code ด้วย OPA/Conftest
+## 80.6 Multi-tenancy: Namespace per Tenant, ResourceQuota, NetworkPolicy
 
-### 4.1 OPA Policies สำหรับ Kubernetes
-
-```rego
-# policies/kubernetes/security.rego
-package kubernetes.security
-
-# Deny containers running as root
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  container.securityContext.runAsUser == 0
-  msg := sprintf("Container '%s' must not run as root (UID 0)", [container.name])
-}
-
-# Require resource limits
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  not container.resources.limits
-  msg := sprintf("Container '%s' must have resource limits defined", [container.name])
-}
-
-# Deny privileged containers
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  container.securityContext.privileged == true
-  msg := sprintf("Container '%s' must not run in privileged mode", [container.name])
-}
-
-# Require readOnlyRootFilesystem
-warn[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  not container.securityContext.readOnlyRootFilesystem
-  msg := sprintf("Container '%s' should have readOnlyRootFilesystem: true", [container.name])
-}
-
-# Require liveness and readiness probes
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  not container.livenessProbe
-  msg := sprintf("Container '%s' must have a livenessProbe defined", [container.name])
-}
-
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  not container.readinessProbe
-  msg := sprintf("Container '%s' must have a readinessProbe defined", [container.name])
-}
-
-# Require image tags (not latest)
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  endswith(container.image, ":latest")
-  msg := sprintf("Container '%s' must not use 'latest' image tag", [container.name])
-}
-
-# Require image digest for production
-deny[msg] {
-  input.kind == "Deployment"
-  input.metadata.namespace == "production"
-  container := input.spec.template.spec.containers[_]
-  not contains(container.image, "@sha256:")
-  msg := sprintf("Production container '%s' must use image digest, not tag", [container.name])
-}
-
-# Require non-root user
-deny[msg] {
-  input.kind == "Deployment"
-  not input.spec.template.spec.securityContext.runAsNonRoot
-  msg := "Pod must have securityContext.runAsNonRoot: true"
-}
-
-# Drop all capabilities
-deny[msg] {
-  input.kind == "Deployment"
-  container := input.spec.template.spec.containers[_]
-  not container.securityContext.capabilities.drop
-  msg := sprintf("Container '%s' must drop all capabilities", [container.name])
-}
-
-# Prevent hostNetwork
-deny[msg] {
-  input.kind == "Deployment"
-  input.spec.template.spec.hostNetwork == true
-  msg := "Pods must not use hostNetwork"
-}
-
-# Require namespace labels
-deny[msg] {
-  input.kind == "Namespace"
-  not input.metadata.labels["team"]
-  msg := "Namespace must have 'team' label"
-}
-```
-
-### 4.2 OPA Policy สำหรับ Terraform
-
-```rego
-# policies/terraform/network.rego
-package terraform.aws.network
-
-# Deny security groups that allow all traffic
-deny[msg] {
-  resource := input.resource.aws_security_group[name]
-  rule := resource.ingress[_]
-  rule.cidr_blocks[_] == "0.0.0.0/0"
-  rule.from_port == 0
-  rule.to_port == 0
-  msg := sprintf("Security group '%s' allows all ingress traffic from 0.0.0.0/0", [name])
-}
-
-# Deny unencrypted S3 buckets
-deny[msg] {
-  bucket := input.resource.aws_s3_bucket[name]
-  not bucket.server_side_encryption_configuration
-  msg := sprintf("S3 bucket '%s' must have server-side encryption enabled", [name])
-}
-
-# Require VPC flow logs
-deny[msg] {
-  vpc := input.resource.aws_vpc[name]
-  not input.resource.aws_flow_log
-  msg := sprintf("VPC '%s' must have flow logs enabled", [name])
-}
-
-# Require RDS encryption
-deny[msg] {
-  db := input.resource.aws_db_instance[name]
-  not db.storage_encrypted
-  msg := sprintf("RDS instance '%s' must have storage encryption enabled", [name])
-}
-
-# RDS must not be publicly accessible
-deny[msg] {
-  db := input.resource.aws_db_instance[name]
-  db.publicly_accessible == true
-  msg := sprintf("RDS instance '%s' must not be publicly accessible", [name])
-}
-
-# CloudTrail must be enabled
-deny[msg] {
-  not input.resource.aws_cloudtrail
-  msg := "AWS CloudTrail must be configured"
-}
-```
-
-### 4.3 Conftest Test Runner
-
-```typescript
-// scripts/run-conftest.ts
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { glob } from 'glob';
-import path from 'path';
-import fs from 'fs/promises';
-
-const execAsync = promisify(exec);
-
-interface ConftestResult {
-  filename: string;
-  namespace: string;
-  successes: number;
-  failures: ConftestFailure[];
-  warnings: ConftestWarning[];
-}
-
-interface ConftestFailure {
-  msg: string;
-  metadata?: Record<string, any>;
-}
-
-interface ConftestWarning {
-  msg: string;
-}
-
-async function runConftest(): Promise<void> {
-  console.log('Running Conftest policy checks...\n');
-
-  const kubernetesFiles = await glob('kubernetes/**/*.yaml', { cwd: process.cwd() });
-  const terraformFiles = await glob('infrastructure/terraform/**/*.tf', { cwd: process.cwd() });
-
-  let totalFailures = 0;
-  let totalWarnings = 0;
-
-  // Check Kubernetes manifests
-  for (const file of kubernetesFiles) {
-    try {
-      const { stdout } = await execAsync(
-        `conftest test ${file} --policy ./policies/kubernetes --output json`
-      );
-
-      const results: ConftestResult[] = JSON.parse(stdout);
-      
-      for (const result of results) {
-        if (result.failures.length > 0) {
-          console.error(`\n❌ FAILED: ${file}`);
-          for (const failure of result.failures) {
-            console.error(`   - ${failure.msg}`);
-            totalFailures++;
-          }
-        }
-
-        if (result.warnings.length > 0) {
-          console.warn(`\n⚠️  WARNINGS: ${file}`);
-          for (const warning of result.warnings) {
-            console.warn(`   - ${warning.msg}`);
-            totalWarnings++;
-          }
-        }
-
-        if (result.failures.length === 0 && result.warnings.length === 0) {
-          console.log(`✓ ${file}`);
-        }
-      }
-    } catch (error: any) {
-      if (error.stdout) {
-        // Parse failures from stdout
-        try {
-          const results: ConftestResult[] = JSON.parse(error.stdout);
-          for (const result of results) {
-            if (result.failures.length > 0) {
-              console.error(`\n❌ FAILED: ${file}`);
-              for (const failure of result.failures) {
-                console.error(`   - ${failure.msg}`);
-                totalFailures++;
-              }
-            }
-          }
-        } catch {
-          console.error(`Error parsing conftest output for ${file}`);
-        }
-      }
-    }
-  }
-
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Policy Check Summary`);
-  console.log(`${'='.repeat(60)}`);
-  console.log(`Files checked: ${kubernetesFiles.length + terraformFiles.length}`);
-  console.log(`Failures: ${totalFailures}`);
-  console.log(`Warnings: ${totalWarnings}`);
-
-  if (totalFailures > 0) {
-    console.error('\n❌ Policy checks failed!');
-    process.exit(1);
-  } else {
-    console.log('\n✅ All policy checks passed!');
-  }
-}
-
-runConftest().catch(console.error);
-```
-
----
-
-## 5. Secret Scanning และ Management
-
-### 5.1 Vault Integration Service
-
-```typescript
-// src/secrets/vault-client.ts
-import vault from 'node-vault';
-import NodeCache from 'node-cache';
-
-interface SecretConfig {
-  path: string;
-  version?: number;
-}
-
-interface VaultConfig {
-  endpoint: string;
-  roleId: string;
-  secretId: string;
-  namespace?: string;
-  cacheTtlSeconds: number;
-  renewThresholdSeconds: number;
-}
-
-export class VaultSecretsClient {
-  private client: ReturnType<typeof vault>;
-  private cache: NodeCache;
-  private token: string = '';
-  private tokenExpiry: number = 0;
-
-  constructor(private config: VaultConfig) {
-    this.client = vault({
-      endpoint: config.endpoint,
-      namespace: config.namespace,
-    });
-
-    this.cache = new NodeCache({
-      stdTTL: config.cacheTtlSeconds,
-      checkperiod: 60,
-    });
-  }
-
-  async authenticate(): Promise<void> {
-    const response = await this.client.approleLogin({
-      role_id: this.config.roleId,
-      secret_id: this.config.secretId,
-    });
-
-    this.token = response.auth.client_token;
-    this.tokenExpiry = Date.now() + response.auth.lease_duration * 1000;
-    this.client.token = this.token;
-
-    // Schedule renewal
-    const renewAt = response.auth.lease_duration * 1000 * 0.8;
-    setTimeout(() => this.renewToken(), renewAt);
-  }
-
-  async getSecret<T = Record<string, string>>(
-    path: string,
-    version?: number
-  ): Promise<T> {
-    const cacheKey = `secret:${path}:${version || 'latest'}`;
-    const cached = this.cache.get<T>(cacheKey);
-    if (cached) return cached;
-
-    await this.ensureAuthenticated();
-
-    const secretPath = path.startsWith('secret/') ? path : `secret/data/${path}`;
-    const options = version ? { version } : {};
-
-    const response = await this.client.read(secretPath, options);
-    const data = response.data?.data || response.data;
-
-    this.cache.set(cacheKey, data);
-    return data as T;
-  }
-
-  async setSecret(path: string, data: Record<string, string>): Promise<void> {
-    await this.ensureAuthenticated();
-    const secretPath = path.startsWith('secret/') ? path : `secret/data/${path}`;
-    await this.client.write(secretPath, { data });
-
-    // Invalidate cache
-    this.cache.del(`secret:${path}:latest`);
-  }
-
-  async getDatabaseCredentials(role: string): Promise<{ username: string; password: string }> {
-    await this.ensureAuthenticated();
-    const response = await this.client.read(`database/creds/${role}`);
-    return {
-      username: response.data.username,
-      password: response.data.password,
-    };
-  }
-
-  async generateAWSCredentials(role: string): Promise<{
-    accessKey: string;
-    secretKey: string;
-    sessionToken: string;
-  }> {
-    await this.ensureAuthenticated();
-    const response = await this.client.read(`aws/creds/${role}`);
-    return {
-      accessKey: response.data.access_key,
-      secretKey: response.data.secret_key,
-      sessionToken: response.data.security_token,
-    };
-  }
-
-  private async ensureAuthenticated(): Promise<void> {
-    if (!this.token || Date.now() > this.tokenExpiry - this.config.renewThresholdSeconds * 1000) {
-      await this.authenticate();
-    }
-  }
-
-  private async renewToken(): Promise<void> {
-    try {
-      const response = await this.client.tokenRenewSelf();
-      this.tokenExpiry = Date.now() + response.auth.lease_duration * 1000;
-
-      const renewAt = response.auth.lease_duration * 1000 * 0.8;
-      setTimeout(() => this.renewToken(), renewAt);
-    } catch {
-      await this.authenticate();
-    }
-  }
-}
-
-// External Secrets Operator configuration
-export const externalSecretsConfig = `
-# kubernetes/external-secrets.yaml
-apiVersion: external-secrets.io/v1beta1
-kind: SecretStore
+```yaml
+# tenant-namespace.yaml
+# สำหรับ tenant แต่ละ tenant จะมี namespace ของตัวเอง
+apiVersion: v1
+kind: Namespace
 metadata:
-  name: vault-secret-store
-  namespace: production
-spec:
-  provider:
-    vault:
-      server: "https://vault.company.com"
-      path: "secret"
-      version: "v2"
-      auth:
-        kubernetes:
-          mountPath: "kubernetes"
-          role: "product-service"
+  name: tenant-acme
+  labels:
+    tenant: acme
+    tenant-tier: premium
+    environment: production
+  annotations:
+    tenant/owner: "admin@acme.com"
+    tenant/cost-center: "CC-001"
+    tenant/created-at: "2024-01-01"
 ---
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
+# ResourceQuota จำกัด resource ต่อ tenant
+apiVersion: v1
+kind: ResourceQuota
 metadata:
-  name: product-service-secrets
-  namespace: production
+  name: tenant-acme-quota
+  namespace: tenant-acme
 spec:
-  refreshInterval: "5m"
-  secretStoreRef:
-    name: vault-secret-store
-    kind: SecretStore
-  target:
-    name: product-service-secrets
-    creationPolicy: Owner
-    template:
-      type: Opaque
-      data:
-        DATABASE_URL: "{{ .database_url }}"
-        REDIS_URL: "{{ .redis_url }}"
-        JWT_SECRET: "{{ .jwt_secret }}"
-  data:
-    - secretKey: database_url
-      remoteRef:
-        key: product-service/production
-        property: database_url
-    - secretKey: redis_url
-      remoteRef:
-        key: product-service/production
-        property: redis_url
-    - secretKey: jwt_secret
-      remoteRef:
-        key: product-service/production
-        property: jwt_secret
-`;
+  hard:
+    # Compute
+    requests.cpu: "20"
+    limits.cpu: "40"
+    requests.memory: "40Gi"
+    limits.memory: "80Gi"
+    
+    # Storage
+    requests.storage: "500Gi"
+    persistentvolumeclaims: "20"
+    
+    # Objects
+    pods: "100"
+    services: "20"
+    secrets: "50"
+    configmaps: "50"
+    deployments.apps: "20"
+    statefulsets.apps: "10"
+    
+    # Load balancers (cost control)
+    services.loadbalancers: "2"
+    services.nodeports: "0"
+---
+# LimitRange default limits
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-acme-limits
+  namespace: tenant-acme
+spec:
+  limits:
+    - type: Container
+      default:          # ค่า default limit ถ้าไม่ระบุ
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:   # ค่า default request ถ้าไม่ระบุ
+        cpu: "100m"
+        memory: "128Mi"
+      max:              # ค่าสูงสุดที่อนุญาต
+        cpu: "4"
+        memory: "8Gi"
+      min:              # ค่าต่ำสุด
+        cpu: "50m"
+        memory: "64Mi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "50Gi"
+      min:
+        storage: "1Gi"
+---
+# NetworkPolicy ป้องกัน cross-tenant communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenant-isolation
+  namespace: tenant-acme
+spec:
+  podSelector: {}  # Apply to all pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic only from same tenant namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              tenant: acme
+    # Allow from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+    # Allow from monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090   # Prometheus metrics
+  egress:
+    # Allow traffic to same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              tenant: acme
+    # Allow DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow external HTTPS
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# RBAC สำหรับ tenant admin
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tenant-admin
+  namespace: tenant-acme
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tenant-acme-admin-binding
+  namespace: tenant-acme
+subjects:
+  - kind: User
+    name: admin@acme.com
+    apiGroup: rbac.authorization.k8s.io
+  - kind: ServiceAccount
+    name: tenant-acme-sa
+    namespace: tenant-acme
+roleRef:
+  kind: Role
+  name: tenant-admin
+  apiGroup: rbac.authorization.k8s.io
 ```
 
 ---
 
-## 6. Compliance Automation
+## 80.7 GitOps กับ ArgoCD
 
-### 6.1 Compliance Scanner
+### Application YAML
 
-```python
-# src/compliance/compliance_scanner.py
-import boto3
-import json
-from typing import List, Dict, Any
-from dataclasses import dataclass, field
-from datetime import datetime
-import logging
-
-logger = logging.getLogger(__name__)
-
-@dataclass
-class ComplianceFinding:
-    rule_id: str
-    title: str
-    severity: str
-    resource_type: str
-    resource_id: str
-    status: str  # PASS, FAIL, SKIP
-    details: str
-    remediation: str
-
-@dataclass
-class ComplianceReport:
-    timestamp: str
-    framework: str
-    account_id: str
-    findings: List[ComplianceFinding] = field(default_factory=list)
+```yaml
+# argocd-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: order-service
+  namespace: argocd
+  labels:
+    team: platform
+    environment: production
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: microservices-production
+  
+  source:
+    repoURL: https://github.com/myorg/k8s-manifests.git
+    targetRevision: main
+    path: apps/order-service/production
     
-    @property
-    def passed(self) -> int:
-        return sum(1 for f in self.findings if f.status == 'PASS')
+    # Helm chart support
+    # helm:
+    #   valueFiles:
+    #     - values.yaml
+    #     - values-production.yaml
+    #   parameters:
+    #     - name: image.tag
+    #       value: "v1.2.3"
     
-    @property
-    def failed(self) -> int:
-        return sum(1 for f in self.findings if f.status == 'FAIL')
-    
-    @property
-    def compliance_score(self) -> float:
-        total = len(self.findings)
-        if total == 0:
-            return 100.0
-        return (self.passed / total) * 100
+    # Kustomize support
+    kustomize:
+      images:
+        - myregistry/order-service:v1.2.3
+      nameSuffix: -production
+      commonLabels:
+        environment: production
 
-class PCI_DSSComplianceScanner:
-    """PCI-DSS v4.0 Compliance Scanner"""
-    
-    def __init__(self):
-        self.ec2 = boto3.client('ec2')
-        self.rds = boto3.client('rds')
-        self.s3 = boto3.client('s3')
-        self.cloudtrail = boto3.client('cloudtrail')
-        self.config = boto3.client('config')
-        self.iam = boto3.client('iam')
-        self.account_id = boto3.client('sts').get_caller_identity()['Account']
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
 
-    def run_full_scan(self) -> ComplianceReport:
-        report = ComplianceReport(
-            timestamp=datetime.utcnow().isoformat(),
-            framework="PCI-DSS v4.0",
-            account_id=self.account_id,
-        )
+  syncPolicy:
+    automated:
+      prune: true           # ลบ resources ที่ไม่อยู่ใน Git
+      selfHeal: true        # Auto-heal drift
+      allowEmpty: false     # ไม่อนุญาต empty commit
+    syncOptions:
+      - Validate=true
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true  # Apply only changed resources
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
 
-        # Run all checks
-        report.findings.extend(self.check_req1_network_security())
-        report.findings.extend(self.check_req3_data_protection())
-        report.findings.extend(self.check_req7_access_control())
-        report.findings.extend(self.check_req10_logging())
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas    # ไม่สนใจ replicas (managed by HPA)
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/clusterIP   # IP assigned by Kubernetes
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/metrics    # May be modified by KEDA
 
-        return report
+  revisionHistoryLimit: 10
 
-    def check_req1_network_security(self) -> List[ComplianceFinding]:
-        """PCI-DSS Requirement 1: Network Security Controls"""
-        findings = []
-
-        # Check VPC Flow Logs
-        vpcs = self.ec2.describe_vpcs()['Vpcs']
-        flow_logs = self.ec2.describe_flow_logs()['FlowLogs']
-        vpc_with_logs = {fl['ResourceId'] for fl in flow_logs}
-
-        for vpc in vpcs:
-            vpc_id = vpc['VpcId']
-            status = 'PASS' if vpc_id in vpc_with_logs else 'FAIL'
-            findings.append(ComplianceFinding(
-                rule_id='PCI-1.1',
-                title='VPC Flow Logs Enabled',
-                severity='HIGH',
-                resource_type='VPC',
-                resource_id=vpc_id,
-                status=status,
-                details=f"VPC {vpc_id} {'has' if status == 'PASS' else 'does not have'} flow logs",
-                remediation='Enable VPC Flow Logs to monitor network traffic',
-            ))
-
-        # Check Security Groups for unrestricted access
-        sgs = self.ec2.describe_security_groups()['SecurityGroups']
-        for sg in sgs:
-            for rule in sg.get('IpPermissions', []):
-                for ip_range in rule.get('IpRanges', []):
-                    if ip_range.get('CidrIp') == '0.0.0.0/0' and rule.get('FromPort') in [22, 3389, 5432, 6379]:
-                        findings.append(ComplianceFinding(
-                            rule_id='PCI-1.2',
-                            title='No Unrestricted Access to Sensitive Ports',
-                            severity='CRITICAL',
-                            resource_type='SecurityGroup',
-                            resource_id=sg['GroupId'],
-                            status='FAIL',
-                            details=f"Security group {sg['GroupId']} allows unrestricted access to port {rule.get('FromPort')}",
-                            remediation='Restrict access to sensitive ports to known IP ranges only',
-                        ))
-
-        return findings
-
-    def check_req3_data_protection(self) -> List[ComplianceFinding]:
-        """PCI-DSS Requirement 3: Protect Stored Account Data"""
-        findings = []
-
-        # Check RDS encryption
-        dbs = self.rds.describe_db_instances()['DBInstances']
-        for db in dbs:
-            status = 'PASS' if db.get('StorageEncrypted') else 'FAIL'
-            findings.append(ComplianceFinding(
-                rule_id='PCI-3.4',
-                title='RDS Storage Encryption',
-                severity='HIGH',
-                resource_type='RDS',
-                resource_id=db['DBInstanceIdentifier'],
-                status=status,
-                details=f"RDS instance storage {'is' if status == 'PASS' else 'is not'} encrypted",
-                remediation='Enable storage encryption for RDS instances containing cardholder data',
-            ))
-
-            # Check TLS enforcement
-            if db.get('Engine') in ['mysql', 'postgres']:
-                param_group = db.get('DBParameterGroups', [{}])[0].get('DBParameterGroupName', '')
-                findings.append(ComplianceFinding(
-                    rule_id='PCI-3.5',
-                    title='TLS Enforcement on RDS',
-                    severity='HIGH',
-                    resource_type='RDS',
-                    resource_id=db['DBInstanceIdentifier'],
-                    status='SKIP',  # Would need to check parameter group
-                    details='Verify that ssl_mode=require or rds.force_ssl=1 is set',
-                    remediation='Set SSL/TLS enforcement in RDS parameter group',
-                ))
-
-        # Check S3 encryption
-        s3_buckets = self.s3.list_buckets()['Buckets']
-        for bucket in s3_buckets:
-            bucket_name = bucket['Name']
-            try:
-                encryption = self.s3.get_bucket_encryption(Bucket=bucket_name)
-                status = 'PASS'
-            except self.s3.exceptions.ClientError:
-                status = 'FAIL'
-
-            findings.append(ComplianceFinding(
-                rule_id='PCI-3.4',
-                title='S3 Bucket Encryption',
-                severity='HIGH',
-                resource_type='S3Bucket',
-                resource_id=bucket_name,
-                status=status,
-                details=f"S3 bucket '{bucket_name}' {'has' if status == 'PASS' else 'does not have'} server-side encryption",
-                remediation='Enable server-side encryption with AWS KMS for S3 buckets containing sensitive data',
-            ))
-
-        return findings
-
-    def check_req7_access_control(self) -> List[ComplianceFinding]:
-        """PCI-DSS Requirement 7: Restrict Access"""
-        findings = []
-
-        # Check for MFA on root account
-        account_summary = self.iam.get_account_summary()['SummaryMap']
-        mfa_status = 'PASS' if account_summary.get('AccountMFAEnabled') == 1 else 'FAIL'
-        findings.append(ComplianceFinding(
-            rule_id='PCI-7.1',
-            title='MFA on Root Account',
-            severity='CRITICAL',
-            resource_type='IAM',
-            resource_id='root',
-            status=mfa_status,
-            details=f"Root account MFA {'is' if mfa_status == 'PASS' else 'is not'} enabled",
-            remediation='Enable MFA on the AWS root account immediately',
-        ))
-
-        # Check for IAM users with console access (should use SSO)
-        users = self.iam.list_users()['Users']
-        for user in users:
-            try:
-                self.iam.get_login_profile(UserName=user['UserName'])
-                # Has console access
-                findings.append(ComplianceFinding(
-                    rule_id='PCI-7.2',
-                    title='No Direct IAM Console Users',
-                    severity='MEDIUM',
-                    resource_type='IAMUser',
-                    resource_id=user['UserName'],
-                    status='WARN',
-                    details=f"IAM user '{user['UserName']}' has console access. Use SSO instead.",
-                    remediation='Migrate console access to AWS SSO/Identity Center',
-                ))
-            except self.iam.exceptions.NoSuchEntityException:
-                pass
-
-        return findings
-
-    def check_req10_logging(self) -> List[ComplianceFinding]:
-        """PCI-DSS Requirement 10: Log and Monitor"""
-        findings = []
-
-        # Check CloudTrail
-        trails = self.cloudtrail.describe_trails()['trailList']
-        
-        if not trails:
-            findings.append(ComplianceFinding(
-                rule_id='PCI-10.1',
-                title='CloudTrail Enabled',
-                severity='CRITICAL',
-                resource_type='CloudTrail',
-                resource_id='account',
-                status='FAIL',
-                details='No CloudTrail trails found',
-                remediation='Enable AWS CloudTrail for all regions',
-            ))
-        
-        for trail in trails:
-            # Check log file validation
-            status = 'PASS' if trail.get('LogFileValidationEnabled') else 'FAIL'
-            findings.append(ComplianceFinding(
-                rule_id='PCI-10.5',
-                title='CloudTrail Log File Validation',
-                severity='HIGH',
-                resource_type='CloudTrail',
-                resource_id=trail['TrailARN'],
-                status=status,
-                details=f"Log file validation {'is' if status == 'PASS' else 'is not'} enabled",
-                remediation='Enable CloudTrail log file validation to detect tampering',
-            ))
-
-        return findings
-
-    def generate_html_report(self, report: ComplianceReport) -> str:
-        critical_findings = [f for f in report.findings if f.severity == 'CRITICAL' and f.status == 'FAIL']
-        high_findings = [f for f in report.findings if f.severity == 'HIGH' and f.status == 'FAIL']
-
-        rows = ''.join([
-            f'<tr class="{f.status.lower()}">'
-            f'<td>{f.rule_id}</td>'
-            f'<td>{f.title}</td>'
-            f'<td><span class="badge {f.severity.lower()}">{f.severity}</span></td>'
-            f'<td>{f.resource_type}</td>'
-            f'<td><code>{f.resource_id}</code></td>'
-            f'<td><span class="status {f.status.lower()}">{f.status}</span></td>'
-            f'<td>{f.details}</td>'
-            f'</tr>'
-            for f in report.findings
-        ])
-
-        return f"""<!DOCTYPE html>
-<html>
-<head>
-  <title>PCI-DSS Compliance Report</title>
-  <style>
-    body {{ font-family: sans-serif; margin: 20px; }}
-    .score {{ font-size: 48px; font-weight: bold; color: {'green' if report.compliance_score >= 80 else 'red'}; }}
-    .badge {{ padding: 2px 8px; border-radius: 3px; font-size: 12px; }}
-    .badge.critical {{ background: #dc3545; color: white; }}
-    .badge.high {{ background: #fd7e14; color: white; }}
-    .status.pass {{ color: green; }}
-    .status.fail {{ color: red; font-weight: bold; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-    tr.fail {{ background: #fff3f3; }}
-    tr.pass {{ background: #f3fff3; }}
-  </style>
-</head>
-<body>
-  <h1>PCI-DSS v4.0 Compliance Report</h1>
-  <p>Account: {report.account_id} | Date: {report.timestamp}</p>
-  <div class="score">{report.compliance_score:.1f}%</div>
-  <p>Passed: {report.passed} | Failed: {report.failed} | Critical Failures: {len(critical_findings)}</p>
-  <table>
-    <thead>
-      <tr><th>Rule</th><th>Title</th><th>Severity</th><th>Resource Type</th><th>Resource</th><th>Status</th><th>Details</th></tr>
-    </thead>
-    <tbody>{rows}</tbody>
-  </table>
-</body>
-</html>"""
+  info:
+    - name: slack-channel
+      value: "#deployments"
+    - name: team
+      value: "Platform Team"
+---
+# AppProject สำหรับ organization-level governance
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: microservices-production
+  namespace: argocd
+spec:
+  description: "Production microservices project"
+  
+  # Source repositories ที่อนุญาต
+  sourceRepos:
+    - "https://github.com/myorg/k8s-manifests.git"
+    - "https://charts.mycompany.com/*"
+  
+  # Destination clusters/namespaces ที่อนุญาต
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "production"
+    - server: https://kubernetes.default.svc
+      namespace: "staging"
+  
+  # Cluster resources ที่อนุญาต (cluster-scoped)
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+  
+  # Namespace resources ที่อนุญาต
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  
+  # ห้ามใช้ resources เหล่านี้
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+  
+  # Sync windows - control when syncs are allowed
+  syncWindows:
+    - kind: allow
+      schedule: "0 8-18 * * 1-5"   # Allow weekdays 8am-6pm
+      duration: 10h
+      applications:
+        - "*"
+      manualSync: true
+    - kind: deny
+      schedule: "0 0 * * 5"         # Deny Friday midnight
+      duration: 24h
+      applications:
+        - "*"
+  
+  # Roles within project
+  roles:
+    - name: developer
+      description: "Allow read access and manual sync"
+      policies:
+        - p, proj:microservices-production:developer, applications, get, microservices-production/*, allow
+        - p, proj:microservices-production:developer, applications, sync, microservices-production/*, allow
+      groups:
+        - "developers"
+    - name: platform-admin
+      description: "Full access"
+      policies:
+        - p, proj:microservices-production:platform-admin, applications, *, microservices-production/*, allow
+      groups:
+        - "platform-team"
+  
+  # Orphaned resources
+  orphanedResources:
+    warn: true
+    ignore:
+      - group: apps
+        kind: ReplicaSet
 ```
 
 ---
 
-## 7. Security Monitoring и Alerting
-
-### 7.1 Security Events Alerting
+## 80.8 Namespace Lifecycle Management TypeScript Script
 
 ```typescript
-// src/security/monitoring/security-alerting.ts
-import { Kafka } from 'kafkajs';
-import axios from 'axios';
-import { Redis } from 'ioredis';
+// namespace-lifecycle.ts
+import * as k8s from '@kubernetes/client-node';
+import * as yaml from 'js-yaml';
 
-type SecurityEventSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-
-interface SecurityEvent {
-  eventId: string;
-  type: string;
-  severity: SecurityEventSeverity;
-  source: string;
-  description: string;
-  details: Record<string, any>;
-  timestamp: string;
-}
-
-interface AlertChannel {
+interface NamespaceConfig {
   name: string;
-  minSeverity: SecurityEventSeverity;
-  send: (event: SecurityEvent) => Promise<void>;
+  tenant: string;
+  tier: 'free' | 'standard' | 'premium';
+  environment: 'development' | 'staging' | 'production';
+  owner: string;
+  costCenter: string;
+  labels?: Record<string, string>;
+  annotations?: Record<string, string>;
 }
 
-export class SecurityAlertingService {
-  private severityOrder: Record<SecurityEventSeverity, number> = {
-    LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3,
-  };
+const TIER_QUOTAS = {
+  free: {
+    'requests.cpu': '2',
+    'limits.cpu': '4',
+    'requests.memory': '4Gi',
+    'limits.memory': '8Gi',
+    'pods': '20',
+    'services': '5',
+  },
+  standard: {
+    'requests.cpu': '10',
+    'limits.cpu': '20',
+    'requests.memory': '20Gi',
+    'limits.memory': '40Gi',
+    'pods': '50',
+    'services': '15',
+  },
+  premium: {
+    'requests.cpu': '20',
+    'limits.cpu': '40',
+    'requests.memory': '40Gi',
+    'limits.memory': '80Gi',
+    'pods': '100',
+    'services': '30',
+  },
+};
 
-  constructor(
-    private channels: AlertChannel[],
-    private redis: Redis,
-    private deduplicationWindowMs: number = 300000 // 5 minutes
-  ) {}
+class NamespaceLifecycleManager {
+  private kc: k8s.KubeConfig;
+  private coreApi: k8s.CoreV1Api;
+  private rbacApi: k8s.RbacAuthorizationV1Api;
+  private networkingApi: k8s.NetworkingV1Api;
 
-  async handleEvent(event: SecurityEvent): Promise<void> {
-    // Deduplication
-    const dedupeKey = `security:alert:dedup:${event.type}:${JSON.stringify(event.details).substring(0, 100)}`;
-    const isDuplicate = await this.redis.get(dedupeKey);
-    
-    if (isDuplicate) {
-      return; // Skip duplicate
-    }
-
-    await this.redis.set(dedupeKey, '1', 'PX', this.deduplicationWindowMs);
-
-    // Enrich event
-    const enrichedEvent = await this.enrichEvent(event);
-
-    // Route to appropriate channels
-    const eligibleChannels = this.channels.filter(
-      (ch) => this.severityOrder[event.severity] >= this.severityOrder[ch.minSeverity]
-    );
-
-    await Promise.allSettled(
-      eligibleChannels.map((ch) => ch.send(enrichedEvent))
-    );
-
-    // Store in audit log
-    await this.storeAuditLog(enrichedEvent);
+  constructor() {
+    this.kc = new k8s.KubeConfig();
+    this.kc.loadFromDefault();
+    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
+    this.rbacApi = this.kc.makeApiClient(k8s.RbacAuthorizationV1Api);
+    this.networkingApi = this.kc.makeApiClient(k8s.NetworkingV1Api);
   }
 
-  private async enrichEvent(event: SecurityEvent): Promise<SecurityEvent> {
-    // Add MITRE ATT&CK mapping if applicable
-    const mitreMapping = this.getMitreMapping(event.type);
+  async provisionTenantNamespace(config: NamespaceConfig): Promise<void> {
+    console.log(`Provisioning namespace: ${config.name}`);
 
-    return {
-      ...event,
-      details: {
-        ...event.details,
-        mitreAttack: mitreMapping,
+    // 1. Create namespace
+    await this.createNamespace(config);
+    
+    // 2. Apply ResourceQuota
+    await this.applyResourceQuota(config);
+    
+    // 3. Apply LimitRange
+    await this.applyLimitRange(config);
+    
+    // 4. Apply NetworkPolicy
+    await this.applyNetworkPolicy(config);
+    
+    // 5. Create ServiceAccount
+    await this.createServiceAccount(config);
+    
+    // 6. Setup RBAC
+    await this.setupRBAC(config);
+    
+    console.log(`Namespace ${config.name} provisioned successfully`);
+  }
+
+  private async createNamespace(config: NamespaceConfig): Promise<void> {
+    const namespace: k8s.V1Namespace = {
+      metadata: {
+        name: config.name,
+        labels: {
+          tenant: config.tenant,
+          'tenant-tier': config.tier,
+          environment: config.environment,
+          'managed-by': 'namespace-lifecycle-manager',
+          ...config.labels,
+        },
+        annotations: {
+          'tenant/owner': config.owner,
+          'tenant/cost-center': config.costCenter,
+          'tenant/created-at': new Date().toISOString(),
+          'tenant/provisioned-by': 'namespace-lifecycle-manager',
+          ...config.annotations,
+        },
       },
     };
+
+    try {
+      await this.coreApi.createNamespace(namespace);
+      console.log(`  Created namespace: ${config.name}`);
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        console.log(`  Namespace ${config.name} already exists, updating...`);
+        await this.coreApi.patchNamespace(
+          config.name,
+          namespace,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { headers: { 'Content-Type': 'application/merge-patch+json' } }
+        );
+      } else {
+        throw err;
+      }
+    }
   }
 
-  private getMitreMapping(eventType: string): string | null {
-    const mappings: Record<string, string> = {
-      'brute_force': 'T1110 - Brute Force',
-      'sql_injection': 'T1190 - Exploit Public-Facing Application',
-      'privilege_escalation': 'T1068 - Exploitation for Privilege Escalation',
-      'lateral_movement': 'T1021 - Remote Services',
-      'data_exfiltration': 'T1041 - Exfiltration Over C2 Channel',
+  private async applyResourceQuota(config: NamespaceConfig): Promise<void> {
+    const quota = TIER_QUOTAS[config.tier];
+    
+    const resourceQuota: k8s.V1ResourceQuota = {
+      metadata: {
+        name: 'tenant-quota',
+        namespace: config.name,
+      },
+      spec: {
+        hard: quota as any,
+      },
     };
-    return mappings[eventType] || null;
+
+    try {
+      await this.coreApi.createNamespacedResourceQuota(config.name, resourceQuota);
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        await this.coreApi.replaceNamespacedResourceQuota(
+          'tenant-quota',
+          config.name,
+          resourceQuota
+        );
+      } else {
+        throw err;
+      }
+    }
+
+    console.log(`  Applied ResourceQuota for tier: ${config.tier}`);
   }
 
-  private async storeAuditLog(event: SecurityEvent): Promise<void> {
-    await this.redis.lpush('security:audit:log', JSON.stringify(event));
-    await this.redis.ltrim('security:audit:log', 0, 9999);
-  }
-}
+  private async applyLimitRange(config: NamespaceConfig): Promise<void> {
+    const limitRange: k8s.V1LimitRange = {
+      metadata: {
+        name: 'default-limits',
+        namespace: config.name,
+      },
+      spec: {
+        limits: [
+          {
+            type: 'Container' as any,
+            default: { cpu: '500m', memory: '512Mi' },
+            defaultRequest: { cpu: '100m', memory: '128Mi' },
+            max: { cpu: '4', memory: '8Gi' },
+            min: { cpu: '50m', memory: '64Mi' },
+          },
+        ],
+      },
+    };
 
-// PagerDuty alert channel
-export function createPagerDutyChannel(routingKey: string): AlertChannel {
-  return {
-    name: 'PagerDuty',
-    minSeverity: 'HIGH',
-    send: async (event) => {
-      await axios.post('https://events.pagerduty.com/v2/enqueue', {
-        routing_key: routingKey,
-        event_action: 'trigger',
-        dedup_key: event.eventId,
-        payload: {
-          summary: `[${event.severity}] ${event.type}: ${event.description}`,
-          source: event.source,
-          severity: event.severity.toLowerCase(),
-          custom_details: event.details,
-          timestamp: event.timestamp,
+    try {
+      await this.coreApi.createNamespacedLimitRange(config.name, limitRange);
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        await this.coreApi.replaceNamespacedLimitRange(
+          'default-limits',
+          config.name,
+          limitRange
+        );
+      } else {
+        throw err;
+      }
+    }
+
+    console.log(`  Applied LimitRange`);
+  }
+
+  private async applyNetworkPolicy(config: NamespaceConfig): Promise<void> {
+    const networkPolicy: k8s.V1NetworkPolicy = {
+      metadata: {
+        name: 'tenant-isolation',
+        namespace: config.name,
+      },
+      spec: {
+        podSelector: {},
+        policyTypes: ['Ingress', 'Egress'],
+        ingress: [
+          {
+            from: [
+              { namespaceSelector: { matchLabels: { tenant: config.tenant } } },
+              { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' } } },
+              { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'monitoring' } } },
+            ],
+          },
+        ],
+        egress: [
+          {
+            to: [{ namespaceSelector: { matchLabels: { tenant: config.tenant } } }],
+          },
+          {
+            to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } }],
+            ports: [{ protocol: 'UDP' as any, port: 53 as any }],
+          },
+        ],
+      },
+    };
+
+    try {
+      await this.networkingApi.createNamespacedNetworkPolicy(config.name, networkPolicy);
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        await this.networkingApi.replaceNamespacedNetworkPolicy(
+          'tenant-isolation',
+          config.name,
+          networkPolicy
+        );
+      } else {
+        throw err;
+      }
+    }
+
+    console.log(`  Applied NetworkPolicy`);
+  }
+
+  private async createServiceAccount(config: NamespaceConfig): Promise<void> {
+    const sa: k8s.V1ServiceAccount = {
+      metadata: {
+        name: `${config.tenant}-sa`,
+        namespace: config.name,
+      },
+    };
+
+    try {
+      await this.coreApi.createNamespacedServiceAccount(config.name, sa);
+    } catch (err: any) {
+      if (err.statusCode !== 409) throw err;
+    }
+
+    console.log(`  Created ServiceAccount: ${config.tenant}-sa`);
+  }
+
+  private async setupRBAC(config: NamespaceConfig): Promise<void> {
+    // Create Role
+    const role: k8s.V1Role = {
+      metadata: { name: 'tenant-developer', namespace: config.name },
+      rules: [
+        {
+          apiGroups: ['', 'apps', 'autoscaling'],
+          resources: ['pods', 'services', 'deployments', 'configmaps', 'horizontalpodautoscalers'],
+          verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete'],
         },
-      });
-    },
-  };
+      ],
+    };
+
+    try {
+      await this.rbacApi.createNamespacedRole(config.name, role);
+    } catch (err: any) {
+      if (err.statusCode !== 409) throw err;
+    }
+
+    console.log(`  Setup RBAC`);
+  }
+
+  async deprovisionNamespace(namespaceName: string, dryRun = false): Promise<void> {
+    console.log(`${dryRun ? '[DRY RUN] ' : ''}Deprovisioning namespace: ${namespaceName}`);
+
+    if (!dryRun) {
+      await this.coreApi.deleteNamespace(namespaceName);
+      console.log(`  Namespace ${namespaceName} deleted`);
+    } else {
+      console.log(`  Would delete namespace: ${namespaceName}`);
+    }
+  }
+
+  async listTenantNamespaces(tenant?: string): Promise<k8s.V1Namespace[]> {
+    const labelSelector = tenant
+      ? `tenant=${tenant}`
+      : 'managed-by=namespace-lifecycle-manager';
+    
+    const result = await this.coreApi.listNamespace(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      labelSelector
+    );
+    
+    return result.body.items;
+  }
 }
 
-// Slack alert channel
-export function createSlackChannel(webhookUrl: string, channel: string): AlertChannel {
-  return {
-    name: 'Slack',
-    minSeverity: 'MEDIUM',
-    send: async (event) => {
-      const color = event.severity === 'CRITICAL' ? 'danger' :
-                    event.severity === 'HIGH' ? 'warning' : 'good';
+// ตัวอย่างการใช้งาน
+async function main() {
+  const manager = new NamespaceLifecycleManager();
 
-      await axios.post(webhookUrl, {
-        channel,
-        attachments: [{
-          color,
-          title: `🚨 Security Alert: ${event.type}`,
-          text: event.description,
-          fields: [
-            { title: 'Severity', value: event.severity, short: true },
-            { title: 'Source', value: event.source, short: true },
-            ...Object.entries(event.details).slice(0, 4).map(([key, value]) => ({
-              title: key,
-              value: String(value),
-              short: true,
-            })),
-          ],
-          footer: `Event ID: ${event.eventId} | ${event.timestamp}`,
-        }],
-      });
-    },
-  };
+  // สร้าง namespace สำหรับ tenant ใหม่
+  await manager.provisionTenantNamespace({
+    name: 'tenant-acme',
+    tenant: 'acme',
+    tier: 'premium',
+    environment: 'production',
+    owner: 'admin@acme.com',
+    costCenter: 'CC-001',
+  });
+
+  // List ทุก tenant namespaces
+  const namespaces = await manager.listTenantNamespaces();
+  console.log('\nTenant namespaces:');
+  namespaces.forEach(ns => {
+    const labels = ns.metadata?.labels ?? {};
+    console.log(`  ${ns.metadata?.name} (tenant: ${labels.tenant}, tier: ${labels['tenant-tier']})`);
+  });
 }
+
+main().catch(console.error);
 ```
 
 ---
 
-## สรุป
+## 80.9 Kubernetes API Aggregation: APIService Registration
 
-บทนี้ครอบคลุม DevSecOps สำหรับ Microservices อย่างครบถ้วน:
+```yaml
+# api-service-registration.yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.platform.example.com
+  labels:
+    app: platform-api-server
+spec:
+  service:
+    name: platform-api-server
+    namespace: platform-system
+    port: 443
+  group: platform.example.com
+  version: v1alpha1
+  insecureSkipTLSVerify: false
+  caBundle: <base64-encoded-CA-bundle>
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+---
+# Platform API Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-api-server
+  namespace: platform-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: platform-api-server
+  template:
+    metadata:
+      labels:
+        app: platform-api-server
+    spec:
+      serviceAccountName: platform-api-server
+      containers:
+        - name: platform-api-server
+          image: myregistry/platform-api-server:v1.0.0
+          ports:
+            - containerPort: 443
+              name: https
+          args:
+            - --tls-cert-file=/tls/tls.crt
+            - --tls-private-key-file=/tls/tls.key
+            - --audit-log-path=/var/log/audit.log
+            - --audit-log-maxage=30
+            - --v=4
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: tls
+          secret:
+            secretName: platform-api-server-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-api-server
+  namespace: platform-system
+spec:
+  selector:
+    app: platform-api-server
+  ports:
+    - port: 443
+      targetPort: 443
+  type: ClusterIP
+```
 
-1. **Security CI/CD Pipeline** - GitHub Actions ที่รวม SAST, DAST, container scan, IaC scan, secret scan
-2. **SAST Integration** - CodeQL, Semgrep, ESLint security rules
-3. **Container Image Scanning** - Admission controller ด้วย Trivy, Grype, Docker Scout
-4. **Policy as Code** - OPA/Rego policies สำหรับ Kubernetes security requirements
-5. **Terraform Security** - tfsec, Checkov สำหรับ IaC scanning
-6. **Secret Management** - Vault integration, External Secrets Operator
-7. **Compliance Automation** - PCI-DSS compliance scanner สำหรับ AWS
-8. **Security Alerting** - MITRE ATT&CK mapping, PagerDuty, Slack integration
+---
 
-Key Takeaways:
-- Shift Left: ตรวจจับ security issues ใน development ก่อนถึง production
-- Policy as Code ทำให้ security requirements เป็น version-controlled และ testable
-- Image scanning ต้องอยู่ใน admission controller เพื่อป้องกัน vulnerable images จากถูก deploy
-- External Secrets Operator แยก secret management ออกจาก Kubernetes manifests
-- Compliance automation ลดเวลาในการ audit จากหลายวันเหลือไม่กี่นาที
-- Security events ต้องมี deduplication เพื่อป้องกัน alert fatigue
+## 80.10 Kubernetes Event-driven Automation: TypeScript EventWatcher
+
+```typescript
+// event-watcher.ts
+import * as k8s from '@kubernetes/client-node';
+
+interface WatchRule {
+  resourceType: string;
+  eventTypes: Array<'ADDED' | 'MODIFIED' | 'DELETED'>;
+  labelSelector?: string;
+  fieldSelector?: string;
+  namespaces?: string[];
+  handler: (event: WatchEvent) => Promise<void>;
+}
+
+interface WatchEvent {
+  type: 'ADDED' | 'MODIFIED' | 'DELETED';
+  object: k8s.KubernetesObject;
+  namespace?: string;
+  name?: string;
+  labels?: Record<string, string>;
+  annotations?: Record<string, string>;
+}
+
+interface AutomationAction {
+  name: string;
+  condition: (event: WatchEvent) => boolean;
+  action: (event: WatchEvent) => Promise<void>;
+}
+
+class KubernetesEventWatcher {
+  private kc: k8s.KubeConfig;
+  private coreApi: k8s.CoreV1Api;
+  private appsApi: k8s.AppsV1Api;
+  private watchers: k8s.Watch;
+  private activeWatches: Map<string, any>;
+  private rules: WatchRule[];
+  private automations: AutomationAction[];
+
+  constructor() {
+    this.kc = new k8s.KubeConfig();
+    this.kc.loadFromDefault();
+    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
+    this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
+    this.watchers = new k8s.Watch(this.kc);
+    this.activeWatches = new Map();
+    this.rules = [];
+    this.automations = [];
+  }
+
+  addRule(rule: WatchRule): void {
+    this.rules.push(rule);
+  }
+
+  addAutomation(automation: AutomationAction): void {
+    this.automations.push(automation);
+  }
+
+  async watchPods(namespace: string = ''): Promise<void> {
+    const path = namespace
+      ? `/api/v1/namespaces/${namespace}/pods`
+      : '/api/v1/pods';
+
+    const watch = await this.watchers.watch(
+      path,
+      { watch: true },
+      async (type, obj: k8s.V1Pod) => {
+        const event: WatchEvent = {
+          type: type as any,
+          object: obj,
+          namespace: obj.metadata?.namespace,
+          name: obj.metadata?.name,
+          labels: obj.metadata?.labels,
+          annotations: obj.metadata?.annotations,
+        };
+
+        await this.processEvent(event, 'pod');
+      },
+      (err) => {
+        if (err) {
+          console.error('Watch error:', err.message);
+          // Restart watch after delay
+          setTimeout(() => this.watchPods(namespace), 5000);
+        }
+      }
+    );
+
+    this.activeWatches.set(`pods-${namespace}`, watch);
+    console.log(`Watching pods in ${namespace || 'all namespaces'}`);
+  }
+
+  async watchDeployments(namespace: string = ''): Promise<void> {
+    const path = namespace
+      ? `/apis/apps/v1/namespaces/${namespace}/deployments`
+      : '/apis/apps/v1/deployments';
+
+    const watch = await this.watchers.watch(
+      path,
+      {},
+      async (type, obj: k8s.V1Deployment) => {
+        const event: WatchEvent = {
+          type: type as any,
+          object: obj,
+          namespace: obj.metadata?.namespace,
+          name: obj.metadata?.name,
+          labels: obj.metadata?.labels,
+          annotations: obj.metadata?.annotations,
+        };
+
+        await this.processEvent(event, 'deployment');
+      },
+      (err) => {
+        if (err) {
+          setTimeout(() => this.watchDeployments(namespace), 5000);
+        }
+      }
+    );
+
+    this.activeWatches.set(`deployments-${namespace}`, watch);
+  }
+
+  async watchKubernetesEvents(namespace: string = ''): Promise<void> {
+    const path = namespace
+      ? `/api/v1/namespaces/${namespace}/events`
+      : '/api/v1/events';
+
+    const watch = await this.watchers.watch(
+      path,
+      {},
+      async (type, event: k8s.CoreV1Event) => {
+        if (event.type === 'Warning') {
+          await this.handleWarningEvent(event);
+        }
+      },
+      (err) => {
+        if (err) {
+          setTimeout(() => this.watchKubernetesEvents(namespace), 5000);
+        }
+      }
+    );
+
+    this.activeWatches.set(`events-${namespace}`, watch);
+  }
+
+  private async processEvent(event: WatchEvent, resourceType: string): Promise<void> {
+    // Run all matching automations
+    for (const automation of this.automations) {
+      try {
+        if (automation.condition(event)) {
+          console.log(`[EventWatcher] Triggering automation: ${automation.name}`);
+          await automation.action(event);
+        }
+      } catch (err: any) {
+        console.error(`[EventWatcher] Automation ${automation.name} failed:`, err.message);
+      }
+    }
+  }
+
+  private async handleWarningEvent(event: k8s.CoreV1Event): Promise<void> {
+    const reason = event.reason ?? '';
+    const message = event.message ?? '';
+    const name = event.involvedObject.name;
+    const namespace = event.involvedObject.namespace;
+
+    console.log(`[Warning] ${namespace}/${name}: ${reason} - ${message}`);
+
+    // Auto-remediation actions
+    if (reason === 'OOMKilled') {
+      await this.handleOOMKilled(namespace!, name!, event);
+    } else if (reason === 'BackOff') {
+      await this.handleCrashLoopBackOff(namespace!, name!, event);
+    } else if (reason === 'FailedScheduling') {
+      await this.handleFailedScheduling(namespace!, name!, event);
+    }
+  }
+
+  private async handleOOMKilled(
+    namespace: string,
+    podName: string,
+    event: k8s.CoreV1Event
+  ): Promise<void> {
+    console.log(`[AutoRemediation] OOMKilled detected for ${namespace}/${podName}`);
+    
+    // ดึง deployment ที่เกี่ยวข้อง
+    const pod = await this.coreApi.readNamespacedPod(podName, namespace);
+    const deploymentName = pod.body.metadata?.ownerReferences?.find(
+      o => o.kind === 'ReplicaSet'
+    )?.name;
+    
+    if (!deploymentName) return;
+
+    // เพิ่ม memory limit อัตโนมัติ 20%
+    const deployment = await this.appsApi.readNamespacedDeployment(
+      deploymentName.replace(/-\w+$/, ''),  // Remove ReplicaSet suffix
+      namespace
+    );
+
+    const containers = deployment.body.spec?.template?.spec?.containers ?? [];
+    
+    for (const container of containers) {
+      const currentLimit = container.resources?.limits?.memory ?? '512Mi';
+      const newLimit = this.increaseMemory(currentLimit, 1.2);
+      
+      console.log(`  Increasing memory limit for ${container.name}: ${currentLimit} -> ${newLimit}`);
+      
+      // Patch deployment
+      if (container.resources?.limits) {
+        container.resources.limits.memory = newLimit;
+      }
+    }
+
+    // Send notification (webhook/Slack)
+    await this.sendNotification(
+      `OOMKilled: Increased memory for ${namespace}/${deploymentName}`
+    );
+  }
+
+  private async handleCrashLoopBackOff(
+    namespace: string,
+    podName: string,
+    event: k8s.CoreV1Event
+  ): Promise<void> {
+    console.log(`[AutoRemediation] CrashLoopBackOff for ${namespace}/${podName}`);
+    
+    // ดึง logs จาก pod ที่ crash
+    try {
+      const logs = await this.coreApi.readNamespacedPodLog(podName, namespace, undefined, undefined, false, undefined, undefined, undefined, 100);
+      console.log(`  Last 100 lines of logs:\n${logs.body.slice(-2000)}`);
+    } catch (err) {
+      console.log(`  Failed to get logs: ${err}`);
+    }
+  }
+
+  private async handleFailedScheduling(
+    namespace: string,
+    podName: string,
+    event: k8s.CoreV1Event
+  ): Promise<void> {
+    console.log(`[AutoRemediation] FailedScheduling for ${namespace}/${podName}: ${event.message}`);
+    
+    if (event.message?.includes('Insufficient memory')) {
+      await this.sendNotification(
+        `ALERT: Cluster running low on memory! Pod ${namespace}/${podName} cannot be scheduled.`
+      );
+    }
+  }
+
+  private increaseMemory(current: string, factor: number): string {
+    const units: Record<string, number> = {
+      'Ki': 1024,
+      'Mi': 1024 * 1024,
+      'Gi': 1024 * 1024 * 1024,
+    };
+
+    const match = current.match(/^(\d+)(Ki|Mi|Gi)$/);
+    if (!match) return current;
+
+    const value = parseInt(match[1]);
+    const unit = match[2];
+    const newValue = Math.ceil(value * factor);
+    
+    return `${newValue}${unit}`;
+  }
+
+  private async sendNotification(message: string): Promise<void> {
+    const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+    if (!webhookUrl) return;
+
+    await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: `🤖 K8s Auto-Remediation: ${message}`,
+        channel: '#alerts',
+      }),
+    });
+  }
+
+  stopAll(): void {
+    this.activeWatches.forEach((watch, key) => {
+      console.log(`Stopping watch: ${key}`);
+      watch.abort();
+    });
+    this.activeWatches.clear();
+  }
+}
+
+// Setup Event-driven Automations
+async function main() {
+  const watcher = new KubernetesEventWatcher();
+
+  // Automation: Auto-label new pods from specific deployments
+  watcher.addAutomation({
+    name: 'auto-label-cost-center',
+    condition: (event) => {
+      return event.type === 'ADDED' &&
+        event.labels?.['auto-cost-label'] !== 'done' &&
+        event.namespace === 'production';
+    },
+    action: async (event) => {
+      console.log(`Auto-labeling pod: ${event.namespace}/${event.name}`);
+      // Implement labeling logic
+    },
+  });
+
+  // Automation: Send notification when deployment fails
+  watcher.addAutomation({
+    name: 'deployment-failure-alert',
+    condition: (event) => {
+      const deployment = event.object as k8s.V1Deployment;
+      const conditions = deployment.status?.conditions ?? [];
+      const progressing = conditions.find(c => c.type === 'Progressing');
+      return event.type === 'MODIFIED' &&
+        progressing?.status === 'False' &&
+        progressing?.reason === 'ProgressDeadlineExceeded';
+    },
+    action: async (event) => {
+      console.log(`ALERT: Deployment ${event.namespace}/${event.name} failed!`);
+      // Send notification
+    },
+  });
+
+  // Start watching
+  await Promise.all([
+    watcher.watchPods('production'),
+    watcher.watchDeployments('production'),
+    watcher.watchKubernetesEvents('production'),
+  ]);
+
+  process.on('SIGTERM', () => {
+    watcher.stopAll();
+    process.exit(0);
+  });
+
+  console.log('Event watcher started. Watching for Kubernetes events...');
+}
+
+main().catch(console.error);
+```
+
+---
+
+## สรุปบทที่ 80
+
+| Pattern | เทคโนโลยี | ใช้สำหรับ |
+|---------|-----------|----------|
+| CRD | apiextensions.k8s.io/v1 | Custom Kubernetes resources |
+| Operator | @kubernetes/client-node + Informer | Automate complex application lifecycle |
+| ReconcileController | TypeScript + Exponential Backoff | Reliable state reconciliation |
+| ValidatingWebhook | Express + TLS | Enforce policies before resource creation |
+| MutatingWebhook | JSON Patch | Auto-inject sidecars, defaults |
+| API Aggregation | APIService | Extend Kubernetes API |
+| Multi-tenancy | Namespace + ResourceQuota + NetworkPolicy | Tenant isolation |
+| GitOps ArgoCD | Application + AppProject | Declarative, Git-driven deployments |
+| Namespace Lifecycle | TypeScript Manager | Automated tenant onboarding |
+| EventWatcher | k8s Watch API | Event-driven automation and auto-remediation |
+
+### Key Takeaways
+
+1. **CRD = Custom Kubernetes Resources**: สร้าง abstraction layer บน Kubernetes API
+2. **Operator Pattern = Automated Operations**: Replace manual runbooks ด้วย code
+3. **Exponential Backoff = Resilient Reconciliation**: ป้องกัน thundering herd ใน controller
+4. **Admission Webhooks = Policy Enforcement**: บังคับ best practices ก่อน resource สร้าง
+5. **Multi-tenancy ต้อง Defense-in-Depth**: Namespace + ResourceQuota + NetworkPolicy + RBAC
+6. **GitOps = Single Source of Truth**: Git เป็น desired state, ArgoCD sync เป็น actual state
+7. **EventWatcher = Proactive Operations**: ตอบสนองต่อ events อัตโนมัติ ลด MTTR
+
+---
+
+*Part 80 จบแล้ว - จบ Series: Service Mesh Advanced, Scalability Patterns, Kubernetes Advanced Patterns*

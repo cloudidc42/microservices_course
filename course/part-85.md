@@ -1196,3 +1196,345 @@ export class DebuggingRunbook {
 4. **Identify Bottleneck** -> Slow span ใน trace
 5. **Deep Dive** -> Remote debug หรือ heap snapshot
 6. **Fix & Verify** -> Deploy + monitor metrics
+
+---
+
+## 11. Advanced Logging Patterns
+
+### 11.1 Structured Logging Best Practices
+
+```typescript
+// src/utils/structured-logger.ts
+import winston from 'winston';
+
+// Log levels ตาม severity
+const LOG_LEVELS = {
+  error: 0,   // System errors ที่ต้องการ immediate action
+  warn: 1,    // สถานการณ์ที่อาจเป็นปัญหา
+  info: 2,    // Business events ที่สำคัญ
+  http: 3,    // HTTP requests
+  debug: 4,   // Debug information
+};
+
+// สิ่งที่ควร log เสมอ
+interface StandardLogFields {
+  // Identity
+  service: string;
+  version: string;
+  environment: string;
+  hostname: string;
+
+  // Request context
+  correlationId: string;
+  requestId?: string;
+  userId?: string;
+  sessionId?: string;
+
+  // Timing
+  timestamp: string;
+  duration?: number;
+
+  // Business context
+  action?: string;
+  resource?: string;
+  resourceId?: string;
+
+  // Error
+  error?: {
+    name: string;
+    message: string;
+    stack?: string;
+    code?: string;
+  };
+}
+
+// ตัวอย่าง structured log entries
+const EXAMPLE_LOGS = {
+  httpRequest: {
+    level: 'http',
+    message: 'HTTP Request',
+    method: 'GET',
+    path: '/api/v1/users/123',
+    statusCode: 200,
+    duration: 45,
+    userAgent: 'Mozilla/5.0',
+    correlationId: 'abc-123',
+    service: 'user-service',
+  },
+
+  businessEvent: {
+    level: 'info',
+    message: 'User created',
+    action: 'USER_CREATED',
+    userId: '550e8400-e29b-41d4-a716-446655440000',
+    email: 'j***@example.com',  // Masked PII
+    correlationId: 'abc-123',
+    service: 'user-service',
+  },
+
+  securityEvent: {
+    level: 'warn',
+    message: 'Failed login attempt',
+    action: 'LOGIN_FAILED',
+    email: 'j***@example.com',
+    ipAddress: '192.168.1.xxx',   // Partially masked
+    attemptCount: 3,
+    correlationId: 'def-456',
+    service: 'auth-service',
+  },
+
+  error: {
+    level: 'error',
+    message: 'Database connection failed',
+    error: {
+      name: 'ConnectionError',
+      message: 'ECONNREFUSED 127.0.0.1:5432',
+      code: 'DB_CONNECTION_FAILED',
+    },
+    correlationId: 'ghi-789',
+    service: 'user-service',
+  },
+};
+
+// Log sampling สำหรับ high-traffic endpoints
+export class LogSampler {
+  private readonly samplingRates: Record<string, number> = {
+    'GET /api/v1/health': 0.01,    // Log เพียง 1%
+    'GET /api/v1/metrics': 0.05,   // Log 5%
+    'POST /api/v1/orders': 1.0,    // Log ทั้งหมด
+    'default': 0.1,                // Default: 10%
+  };
+
+  shouldLog(path: string, level: string): boolean {
+    // Error ต้อง log เสมอ
+    if (level === 'error' || level === 'warn') return true;
+
+    const rate = this.samplingRates[path] || this.samplingRates['default'];
+    return Math.random() < rate;
+  }
+}
+```
+
+### 11.2 Log-Based Alerting
+
+```typescript
+// src/monitoring/log-alerter.ts
+// ใช้ Elasticsearch Watcher หรือ Kibana Alerting
+
+const KIBANA_ALERT_CONFIG = `
+# config/kibana-alerts/error-rate.json
+{
+  "name": "High Error Rate Alert",
+  "schedule": { "interval": "1m" },
+  "consumer": "alerts",
+  "rule_type_id": "metrics.alert.threshold",
+  "params": {
+    "criteria": [
+      {
+        "aggType": "count",
+        "comparator": ">",
+        "threshold": [100],
+        "timeSize": 5,
+        "timeUnit": "m",
+        "metric": "error",
+        "filterQuery": "level:error"
+      }
+    ],
+    "sourceId": "default",
+    "alertOnNoData": false
+  },
+  "actions": [
+    {
+      "id": "slack-connector",
+      "group": "threshold met",
+      "params": {
+        "message": "High error rate detected: {{context.reason}}"
+      }
+    }
+  ]
+}
+`;
+
+// Elasticsearch query สำหรับ error analysis
+export const ERROR_ANALYSIS_QUERIES = {
+  // Top errors ใน 1 ชั่วโมงที่ผ่านมา
+  topErrors: {
+    query: {
+      bool: {
+        filter: [
+          { term: { level: 'error' } },
+          { range: { '@timestamp': { gte: 'now-1h' } } }
+        ]
+      }
+    },
+    aggs: {
+      byError: {
+        terms: {
+          field: 'error.code.keyword',
+          size: 10
+        },
+        aggs: {
+          byService: {
+            terms: { field: 'service.keyword' }
+          }
+        }
+      }
+    }
+  },
+
+  // Error rate per service
+  errorRateByService: {
+    query: {
+      range: { '@timestamp': { gte: 'now-1h' } }
+    },
+    aggs: {
+      byService: {
+        terms: { field: 'service.keyword' },
+        aggs: {
+          totalRequests: { value_count: { field: 'correlationId.keyword' } },
+          errors: {
+            filter: { term: { level: 'error' } },
+            aggs: {
+              count: { value_count: { field: 'correlationId.keyword' } }
+            }
+          }
+        }
+      }
+    }
+  }
+};
+```
+
+---
+
+## 12. Production Debugging Tips
+
+### 12.1 Safe Production Debug Techniques
+
+```typescript
+// src/debugging/production-debug.ts
+
+/**
+ * เทคนิค debug ที่ปลอดภัยใน production:
+ * 1. Dynamic log level - เพิ่ม log level ชั่วคราว
+ * 2. Sampling - เพิ่ม sampling rate ชั่วคราว
+ * 3. Feature flags - เปิด debug mode สำหรับ user ที่เฉพาะ
+ * 4. Request tagging - เพิ่ม detail สำหรับ specific requests
+ */
+
+import { Injectable } from '@nestjs/common';
+import Redis from 'ioredis';
+
+interface DebugConfig {
+  userId?: string;
+  correlationIdPattern?: string;
+  servicePattern?: string;
+  logLevel: 'debug' | 'info' | 'warn' | 'error';
+  expiresAt: Date;
+  enabledBy: string;
+}
+
+@Injectable()
+export class ProductionDebugService {
+  constructor(private redis: Redis) {}
+
+  // เปิด debug mode สำหรับ user ที่เฉพาะ
+  async enableUserDebug(
+    userId: string,
+    durationMinutes: number = 30,
+    enabledBy: string
+  ): Promise<void> {
+    const config: DebugConfig = {
+      userId,
+      logLevel: 'debug',
+      expiresAt: new Date(Date.now() + durationMinutes * 60 * 1000),
+      enabledBy,
+    };
+
+    await this.redis.setex(
+      `debug:user:${userId}`,
+      durationMinutes * 60,
+      JSON.stringify(config)
+    );
+
+    console.warn({
+      message: 'Debug mode enabled for user',
+      userId,
+      durationMinutes,
+      enabledBy,
+    });
+  }
+
+  // ตรวจสอบว่า request นี้ควร debug หรือไม่
+  async shouldDebug(userId?: string, correlationId?: string): Promise<boolean> {
+    if (userId) {
+      const config = await this.redis.get(`debug:user:${userId}`);
+      if (config) return true;
+    }
+
+    if (correlationId) {
+      const config = await this.redis.get(`debug:correlation:${correlationId}`);
+      if (config) return true;
+    }
+
+    return false;
+  }
+
+  // Debug middleware
+  debugMiddleware() {
+    return async (req: any, res: any, next: any) => {
+      const userId = req.user?.id;
+      const correlationId = req.headers['x-correlation-id'];
+
+      if (await this.shouldDebug(userId, correlationId)) {
+        req.debugMode = true;
+        req.debugStartTime = Date.now();
+
+        // เพิ่ม detailed logging
+        console.debug({
+          message: 'DEBUG REQUEST',
+          method: req.method,
+          path: req.path,
+          headers: req.headers,
+          body: req.body,
+          userId,
+          correlationId,
+        });
+      }
+
+      next();
+    };
+  }
+}
+
+// k6 debug script
+export const K6_DEBUG_SCRIPT = `
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  vus: 1,
+  duration: '30s',
+};
+
+export default function() {
+  const correlationId = 'debug-k6-' + __ITER;
+  
+  const res = http.get('http://localhost:3000/api/v1/users', {
+    headers: {
+      'X-Correlation-ID': correlationId,
+      'X-Debug-Token': __ENV.DEBUG_TOKEN,
+    },
+  });
+  
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'has correlation id': (r) => r.headers['X-Correlation-ID'] !== undefined,
+  });
+  
+  console.log('Correlation ID:', correlationId);
+  console.log('Response Time:', res.timings.duration, 'ms');
+  console.log('Response:', res.body.substring(0, 200));
+}
+`;
+```

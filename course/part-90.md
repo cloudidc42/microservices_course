@@ -2,356 +2,279 @@
 
 ## บทนำ
 
-Microservices Maturity Model เป็นกรอบการประเมินความพร้อมและความก้าวหน้าของ microservices adoption ในองค์กร การรู้ว่าตัวเองอยู่ที่ไหนช่วยให้วางแผน roadmap ได้ชัดเจนและหลีกเลี่ยงการ over-engineer
+Microservices Maturity Model เป็น framework สำหรับประเมินและพัฒนาความสามารถขององค์กรในการสร้างและดำเนินงาน Microservices บทนี้เป็นบทสรุปของ course ทั้งหมด โดยเชื่อมโยงทุกหัวข้อที่เรียนมาเข้าด้วยกันผ่าน maturity model ที่สามารถนำไปใช้ประเมินองค์กรได้จริง
 
 ---
 
-## Maturity Levels: Level 0-5
+## 1. Microservices Maturity Levels
 
-```
-Microservices Maturity Model:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Level 0: MONOLITH
-  → Single deployable unit
-  → ไม่มี CI/CD pipeline ที่เป็นระบบ
-  → Manual deployments
-  → Zero observability
-  → Thai examples: ระบบ internal ขนาดเล็กของ SME
-
-Level 1: MODULAR MONOLITH  
-  → Well-structured monolith with clear modules
-  → Basic CI/CD (automated build + test)
-  → Containerization (Docker)
-  → Basic logging
-
-Level 2: INITIAL MICROSERVICES
-  → 3-10 services แยกกัน
-  → REST API ระหว่าง services
-  → Kubernetes deployment
-  → Centralized logging (ELK)
-
-Level 3: MANAGED MICROSERVICES
-  → 10-30 services
-  → Service mesh (Istio/Linkerd)
-  → Distributed tracing (Jaeger)
-  → Service catalog (Backstage)
-  → SLO defined
-
-Level 4: OPTIMIZED MICROSERVICES
-  → 30+ services
-  → Event-driven architecture
-  → GitOps (ArgoCD)
-  → Chaos engineering
-  → Cost optimization active
-
-Level 5: CLOUD-NATIVE EXCELLENCE
-  → Fully autonomous teams
-  → Self-healing systems
-  → Predictive scaling
-  → Zero-trust security
-  → Full automation
-```
-
----
-
-## Level Assessment Framework
+### 1.1 Overview ของ 5 ระดับ
 
 ```typescript
-// tools/maturity/src/maturity-assessor.ts
+// src/maturity/levels.ts
 
-interface MaturityDimension {
+export enum MaturityLevel {
+  LEVEL_1 = 1, // Initial - เพิ่งเริ่มต้น
+  LEVEL_2 = 2, // Managed - มีกระบวนการ
+  LEVEL_3 = 3, // Defined - มีมาตรฐาน
+  LEVEL_4 = 4, // Quantitatively Managed - วัดผลได้
+  LEVEL_5 = 5, // Optimizing - ปรับปรุงต่อเนื่อง
+}
+
+export const MATURITY_LEVEL_DESCRIPTIONS = {
+  [MaturityLevel.LEVEL_1]: {
+    name: 'Initial',
+    description: 'เพิ่งเริ่ม migrate จาก Monolith หรือสร้าง Microservices แรก',
+    characteristics: [
+      'Services แยกออกจาก monolith แบบ ad-hoc',
+      'ไม่มีมาตรฐาน API design',
+      'Deploy ด้วย manual processes',
+      'Monitoring พื้นฐานหรือไม่มีเลย',
+      'ทีมเดียวดูแลทุก service',
+      'ไม่มี CI/CD pipeline ที่สมบูรณ์',
+    ],
+    challenges: [
+      'ขาดความรู้ distributed systems',
+      'Network latency ที่ไม่เคยเจอ',
+      'Data consistency ยาก',
+      'Testing ซับซ้อนขึ้น',
+    ],
+    timeline: '0-6 months',
+  },
+  [MaturityLevel.LEVEL_2]: {
+    name: 'Managed',
+    description: 'มีกระบวนการพื้นฐาน แต่ยังไม่ consistent ทุก service',
+    characteristics: [
+      'CI/CD pipeline สำหรับบาง services',
+      'มี basic monitoring (metrics, logs)',
+      'API design เริ่มมีมาตรฐาน',
+      'Docker containers บน Kubernetes',
+      'Service discovery พื้นฐาน',
+      'การจัดการ secrets ดีขึ้น',
+    ],
+    challenges: [
+      'Inconsistent practices ระหว่าง teams',
+      'Manual deployment ยังมีอยู่บ้าง',
+      'Distributed tracing ยังไม่มี',
+      'Service mesh ยังไม่ได้ใช้',
+    ],
+    timeline: '6-18 months',
+  },
+  [MaturityLevel.LEVEL_3]: {
+    name: 'Defined',
+    description: 'มีมาตรฐานที่ชัดเจนและ apply กับทุก service',
+    characteristics: [
+      'Golden path สำหรับ service creation',
+      'Distributed tracing (Jaeger/Zipkin)',
+      'Service mesh (Istio/Linkerd)',
+      'Centralized configuration',
+      'Automated testing pyramid',
+      'Feature flags',
+      'Blue/Green deployments',
+    ],
+    challenges: [
+      'Service mesh complexity',
+      'Too many services to manage',
+      'Data consistency at scale',
+    ],
+    timeline: '18-36 months',
+  },
+  [MaturityLevel.LEVEL_4]: {
+    name: 'Quantitatively Managed',
+    description: 'วัดผลได้ทุกอย่าง มี SLOs สำหรับทุก service',
+    characteristics: [
+      'SLOs defined สำหรับทุก service',
+      'Error budget management',
+      'Automated capacity planning',
+      'Chaos engineering regular practice',
+      'Self-service infrastructure',
+      'Developer productivity metrics',
+      'Cost attribution per service',
+    ],
+    challenges: [
+      'Data-driven decision fatigue',
+      'Alert fatigue ถ้า threshold ผิด',
+    ],
+    timeline: '3-5 years',
+  },
+  [MaturityLevel.LEVEL_5]: {
+    name: 'Optimizing',
+    description: 'ปรับปรุงต่อเนื่อง มี culture ที่แข็งแกร่ง',
+    characteristics: [
+      'Continuous experimentation (A/B testing at infra level)',
+      'ML-based anomaly detection',
+      'Auto-remediation of common issues',
+      'Progressive delivery',
+      'Internal developer platform (IDP)',
+      'Blameless culture deeply embedded',
+      'Contributing back to open source',
+    ],
+    challenges: [
+      'Maintaining culture at scale',
+      'Preventing over-engineering',
+      'Keeping simplicity despite scale',
+    ],
+    timeline: '5+ years',
+  },
+};
+```
+
+---
+
+## 2. Assessment Framework
+
+### 2.1 Maturity Assessment Tool
+
+```typescript
+// src/maturity/assessment.ts
+
+interface AssessmentDimension {
   name: string;
-  weight: number; // 1-5 importance
-  criteria: MaturityCriteria[];
-}
-
-interface MaturityCriteria {
-  level: number; // 0-5
   description: string;
-  evidence: string[]; // how to verify
+  questions: AssessmentQuestion[];
+  weight: number;  // 1-5 importance weight
 }
 
-export const MATURITY_DIMENSIONS: MaturityDimension[] = [
+interface AssessmentQuestion {
+  id: string;
+  question: string;
+  options: Array<{
+    score: number;  // 1-5
+    label: string;
+    description: string;
+  }>;
+}
+
+interface AssessmentResult {
+  overallLevel: MaturityLevel;
+  overallScore: number;        // 0-100
+  dimensionScores: Record<string, number>;
+  strengths: string[];
+  gaps: string[];
+  topPriorities: string[];
+  roadmap: RoadmapItem[];
+}
+
+export const ASSESSMENT_DIMENSIONS: AssessmentDimension[] = [
   {
-    name: 'Architecture',
+    name: 'Service Design',
+    description: 'How well are services designed and organized',
     weight: 5,
-    criteria: [
+    questions: [
       {
-        level: 0,
-        description: 'Single monolith, no clear boundaries',
-        evidence: ['One deployable artifact', 'Shared database for all features'],
-      },
-      {
-        level: 1,
-        description: 'Modular monolith with layered architecture',
-        evidence: [
-          'Clear module structure',
-          'Separation of concerns',
-          'Domain-driven design applied',
+        id: 'sd-1',
+        question: 'How are service boundaries defined?',
+        options: [
+          { score: 1, label: 'Ad-hoc', description: 'No clear strategy, split by technical concerns' },
+          { score: 2, label: 'By team', description: 'Split by team ownership' },
+          { score: 3, label: 'By domain', description: 'DDD with bounded contexts' },
+          { score: 4, label: 'Optimized', description: 'Regularly reviewed and refined' },
+          { score: 5, label: 'Autonomous', description: 'Services are independently deployable with clear contracts' },
         ],
       },
       {
-        level: 2,
-        description: 'Core services separated (3-10 services)',
-        evidence: [
-          'Each service has its own repository',
-          'Database per service',
-          'REST APIs defined with OpenAPI',
-        ],
-      },
-      {
-        level: 3,
-        description: 'Service mesh, API Gateway, Event-driven for async',
-        evidence: [
-          'Service mesh deployed (Istio/Linkerd)',
-          'API Gateway implemented',
-          'Message broker for async communication',
-          'CQRS for complex domains',
-        ],
-      },
-      {
-        level: 4,
-        description: 'Event sourcing, SAGA patterns, BFF',
-        evidence: [
-          'Event sourcing implemented',
-          'SAGA for distributed transactions',
-          'BFF per client type',
-          'Anti-corruption layer',
-        ],
-      },
-      {
-        level: 5,
-        description: 'Cell-based architecture, autonomous systems',
-        evidence: [
-          'Cell-based deployment',
-          'Self-healing architecture',
-          'Zero-downtime deployments',
+        id: 'sd-2',
+        question: 'How are APIs designed and documented?',
+        options: [
+          { score: 1, label: 'No standard', description: 'Each service has different patterns' },
+          { score: 2, label: 'Basic REST', description: 'HTTP endpoints, some documentation' },
+          { score: 3, label: 'OpenAPI', description: 'OpenAPI 3.0 spec, versioning' },
+          { score: 4, label: 'Contract-first', description: 'API design before implementation, consumer-driven contracts' },
+          { score: 5, label: 'Self-service', description: 'API portal, automatic SDK generation, deprecation management' },
         ],
       },
     ],
   },
   {
-    name: 'CI/CD & Deployment',
+    name: 'Deployment & Operations',
+    description: 'CI/CD, infrastructure, and deployment practices',
     weight: 5,
-    criteria: [
+    questions: [
       {
-        level: 0,
-        description: 'Manual deployments',
-        evidence: ['No CI pipeline', 'Manual FTP/SSH deployments'],
-      },
-      {
-        level: 1,
-        description: 'Basic CI pipeline',
-        evidence: [
-          'Automated build on push',
-          'Automated unit tests',
-          'Manual deployment',
+        id: 'do-1',
+        question: 'What is your deployment process?',
+        options: [
+          { score: 1, label: 'Manual', description: 'Manual SSH and copy files' },
+          { score: 2, label: 'Scripts', description: 'Shell scripts, some automation' },
+          { score: 3, label: 'CI/CD Pipeline', description: 'Automated builds, tests, deployments' },
+          { score: 4, label: 'GitOps', description: 'Git-based, automated rollbacks' },
+          { score: 5, label: 'Progressive Delivery', description: 'Canary, feature flags, automatic rollback on SLO breach' },
         ],
       },
       {
-        level: 2,
-        description: 'CI/CD pipeline, containerization',
-        evidence: [
-          'Docker images built automatically',
-          'Automated deployment to staging',
-          'Manual production deployment',
-          'Basic Kubernetes deployment',
-        ],
-      },
-      {
-        level: 3,
-        description: 'Full CI/CD, blue-green/canary deployments',
-        evidence: [
-          'Automated production deployment',
-          'Blue-green or canary deployment',
-          'Automated rollback',
-          'Feature flags',
-        ],
-      },
-      {
-        level: 4,
-        description: 'GitOps, multiple environments, progressive delivery',
-        evidence: [
-          'ArgoCD or Flux GitOps',
-          'Progressive delivery (Argo Rollouts)',
-          'Environment promotion automation',
-          'DORA metrics tracked',
-        ],
-      },
-      {
-        level: 5,
-        description: 'Fully automated, self-healing deployments',
-        evidence: [
-          'Automatic rollback on SLO breach',
-          'ML-based deployment risk assessment',
-          'Zero manual steps',
+        id: 'do-2',
+        question: 'How is infrastructure managed?',
+        options: [
+          { score: 1, label: 'Manual', description: 'Click-ops in cloud console' },
+          { score: 2, label: 'Scripts', description: 'Bash scripts, some automation' },
+          { score: 3, label: 'IaC', description: 'Terraform, Helm charts' },
+          { score: 4, label: 'Self-service', description: 'Developers provision infra via templates' },
+          { score: 5, label: 'Platform', description: 'Internal Developer Platform, golden paths' },
         ],
       },
     ],
   },
   {
     name: 'Observability',
+    description: 'Monitoring, logging, tracing, and alerting',
     weight: 4,
-    criteria: [
+    questions: [
       {
-        level: 0,
-        description: 'No observability',
-        evidence: ['No logs', 'No metrics', 'No alerting'],
-      },
-      {
-        level: 1,
-        description: 'Basic logging',
-        evidence: ['Application logs to file', 'Manual log inspection'],
-      },
-      {
-        level: 2,
-        description: 'Centralized logging + basic metrics',
-        evidence: [
-          'ELK/Loki centralized logging',
-          'Prometheus metrics',
-          'Basic Grafana dashboards',
-          'Email alerts',
+        id: 'obs-1',
+        question: 'What observability capabilities do you have?',
+        options: [
+          { score: 1, label: 'Basic logs', description: 'Server logs only' },
+          { score: 2, label: 'Metrics + Logs', description: 'Prometheus, centralized logging' },
+          { score: 3, label: 'Full observability', description: 'Metrics, logs, traces (three pillars)' },
+          { score: 4, label: 'Correlated', description: 'Correlation IDs, unified view' },
+          { score: 5, label: 'Proactive', description: 'ML-based anomaly detection, predictive alerts' },
         ],
       },
       {
-        level: 3,
-        description: 'Distributed tracing, SLO monitoring',
-        evidence: [
-          'Distributed tracing (Jaeger/Tempo)',
-          'SLO/SLA defined and tracked',
-          'Error budget monitoring',
-          'PagerDuty on-call',
-        ],
-      },
-      {
-        level: 4,
-        description: 'Full observability stack, AIOps',
-        evidence: [
-          'Correlation between traces, logs, metrics',
-          'Anomaly detection',
-          'Business metrics connected to technical metrics',
-          'Real-time user monitoring',
-        ],
-      },
-      {
-        level: 5,
-        description: 'Predictive, self-healing observability',
-        evidence: [
-          'ML anomaly detection',
-          'Predictive scaling',
-          'Automated root cause analysis',
-        ],
-      },
-    ],
-  },
-  {
-    name: 'Team Organization',
-    weight: 4,
-    criteria: [
-      {
-        level: 0,
-        description: 'Siloed functional teams',
-        evidence: ['Separate Dev, QA, Ops teams', 'Handoff-based workflow'],
-      },
-      {
-        level: 1,
-        description: 'Dev+QA integrated, basic DevOps',
-        evidence: [
-          'QA embedded in dev teams',
-          'Developers own testing',
-        ],
-      },
-      {
-        level: 2,
-        description: 'Cross-functional product teams',
-        evidence: [
-          'Full-stack teams',
-          'Teams own specific services',
-          'Basic on-call rotation',
-        ],
-      },
-      {
-        level: 3,
-        description: 'Stream-aligned teams, Platform team',
-        evidence: [
-          'Team Topologies implemented',
-          'Platform team providing IDP',
-          'You build it, you run it',
-          'Formal on-call + runbooks',
-        ],
-      },
-      {
-        level: 4,
-        description: 'Fully autonomous teams with SRE culture',
-        evidence: [
-          'Teams own full service lifecycle',
-          'SRE practices (error budgets)',
-          'Blameless postmortems',
-          'Game days / chaos engineering',
-        ],
-      },
-      {
-        level: 5,
-        description: 'Self-organizing, continuous learning organization',
-        evidence: [
-          'Teams self-direct based on business outcomes',
-          'Continuous improvement embedded in culture',
-          'Industry-leading DORA metrics',
+        id: 'obs-2',
+        question: 'How are SLOs/SLAs managed?',
+        options: [
+          { score: 1, label: 'None', description: 'No formal SLOs' },
+          { score: 2, label: 'Uptime only', description: 'Basic uptime monitoring' },
+          { score: 3, label: 'SLOs defined', description: 'SLOs with error budget' },
+          { score: 4, label: 'SLO-driven', description: 'Alerts based on error budget burn rate' },
+          { score: 5, label: 'Full lifecycle', description: 'SLOs inform product decisions, automated budget management' },
         ],
       },
     ],
   },
   {
     name: 'Security',
+    description: 'Security practices and compliance',
     weight: 4,
-    criteria: [
+    questions: [
       {
-        level: 0,
-        description: 'No security practices',
-        evidence: ['No authentication', 'No encryption', 'No security testing'],
-      },
-      {
-        level: 1,
-        description: 'Basic security',
-        evidence: ['HTTPS', 'Basic authentication', 'Password hashing'],
-      },
-      {
-        level: 2,
-        description: 'JWT/OAuth2, basic secrets management',
-        evidence: [
-          'JWT authentication',
-          'Environment variables for secrets',
-          'CORS configured',
+        id: 'sec-1',
+        question: 'How is service-to-service authentication handled?',
+        options: [
+          { score: 1, label: 'None', description: 'No authentication between services' },
+          { score: 2, label: 'API keys', description: 'Shared API keys' },
+          { score: 3, label: 'JWT/mTLS', description: 'JWT tokens or mutual TLS' },
+          { score: 4, label: 'Zero trust', description: 'Zero-trust network, SPIFFE/SPIRE' },
+          { score: 5, label: 'Policy-driven', description: 'OPA policies, automated cert rotation' },
         ],
       },
+    ],
+  },
+  {
+    name: 'Team & Culture',
+    description: 'Team structure, autonomy, and engineering culture',
+    weight: 3,
+    questions: [
       {
-        level: 3,
-        description: 'Service mesh mTLS, vault, RBAC',
-        evidence: [
-          'mTLS between services',
-          'HashiCorp Vault for secrets',
-          'RBAC implemented',
-          'Security scanning in CI',
-        ],
-      },
-      {
-        level: 4,
-        description: 'Zero-trust, SAST/DAST, compliance automation',
-        evidence: [
-          'Zero-trust network architecture',
-          'Automated security testing',
-          'PDPA/GDPR compliance tooling',
-          'Vulnerability management',
-        ],
-      },
-      {
-        level: 5,
-        description: 'Security as code, self-healing security',
-        evidence: [
-          'Policy as code (OPA)',
-          'Automated compliance reporting',
-          'Real-time threat detection',
+        id: 'team-1',
+        question: 'How are teams structured?',
+        options: [
+          { score: 1, label: 'Functional', description: 'Dev team + Ops team, siloed' },
+          { score: 2, label: 'DevOps', description: 'Mixed teams, basic DevOps' },
+          { score: 3, label: 'Product teams', description: 'Cross-functional, own their services' },
+          { score: 4, label: 'Platform + Stream', description: 'Platform team + stream-aligned teams' },
+          { score: 5, label: 'Full autonomy', description: 'Teams own full lifecycle, minimal coordination needed' },
         ],
       },
     ],
@@ -359,688 +282,824 @@ export const MATURITY_DIMENSIONS: MaturityDimension[] = [
 ];
 
 export class MaturityAssessor {
-  assess(responses: AssessmentResponse[]): MaturityReport {
+  assess(responses: Record<string, number>): AssessmentResult {
     const dimensionScores: Record<string, number> = {};
     
-    for (const dimension of MATURITY_DIMENSIONS) {
-      const response = responses.find(r => r.dimension === dimension.name);
-      dimensionScores[dimension.name] = response?.level || 0;
+    for (const dimension of ASSESSMENT_DIMENSIONS) {
+      const questionScores = dimension.questions
+        .map(q => responses[q.id] || 1);
+      
+      const avgScore = questionScores.reduce((a, b) => a + b, 0) / questionScores.length;
+      dimensionScores[dimension.name] = avgScore;
     }
-
-    const weightedTotal = MATURITY_DIMENSIONS.reduce((sum, dim) => {
-      return sum + (dimensionScores[dim.name] || 0) * dim.weight;
-    }, 0);
-
-    const maxPossible = MATURITY_DIMENSIONS.reduce(
-      (sum, dim) => sum + 5 * dim.weight, 0
-    );
-
-    const overallLevel = Math.floor(
-      (weightedTotal / maxPossible) * 5
-    );
-
+    
+    // Calculate weighted overall score
+    const totalWeight = ASSESSMENT_DIMENSIONS.reduce((sum, d) => sum + d.weight, 0);
+    const weightedScore = ASSESSMENT_DIMENSIONS.reduce((sum, d) => {
+      return sum + (dimensionScores[d.name] * d.weight);
+    }, 0) / totalWeight;
+    
+    const overallScore = Math.round((weightedScore / 5) * 100);
+    
+    // Determine level
+    const overallLevel = weightedScore <= 1.5 ? MaturityLevel.LEVEL_1
+      : weightedScore <= 2.5 ? MaturityLevel.LEVEL_2
+      : weightedScore <= 3.5 ? MaturityLevel.LEVEL_3
+      : weightedScore <= 4.5 ? MaturityLevel.LEVEL_4
+      : MaturityLevel.LEVEL_5;
+    
+    // Find strengths and gaps
+    const sortedDimensions = Object.entries(dimensionScores)
+      .sort(([,a], [,b]) => b - a);
+    
+    const strengths = sortedDimensions.slice(0, 2).map(([name]) => name);
+    const gaps = sortedDimensions.slice(-2).map(([name]) => name);
+    
     return {
       overallLevel,
+      overallScore,
       dimensionScores,
-      gaps: this.identifyGaps(dimensionScores),
-      recommendations: this.generateRecommendations(dimensionScores),
+      strengths,
+      gaps,
+      topPriorities: this.generatePriorities(dimensionScores, overallLevel),
+      roadmap: this.generateRoadmap(overallLevel, dimensionScores),
     };
   }
 
-  private identifyGaps(scores: Record<string, number>): Gap[] {
-    const avgLevel = Object.values(scores).reduce((a, b) => a + b, 0) / 
-      Object.values(scores).length;
-
-    return Object.entries(scores)
-      .filter(([, score]) => score < avgLevel - 0.5)
-      .map(([dimension, score]) => ({
-        dimension,
-        currentLevel: score,
-        targetLevel: Math.ceil(avgLevel),
-        priority: avgLevel - score > 1 ? 'HIGH' : 'MEDIUM',
-      }));
-  }
-
-  private generateRecommendations(
-    scores: Record<string, number>
-  ): Recommendation[] {
-    const recommendations: Recommendation[] = [];
-
+  private generatePriorities(
+    scores: Record<string, number>,
+    level: MaturityLevel
+  ): string[] {
+    const priorities: string[] = [];
+    
     for (const [dimension, score] of Object.entries(scores)) {
-      if (score < 5) {
-        const nextLevel = score + 1;
-        const dim = MATURITY_DIMENSIONS.find(d => d.name === dimension);
-        const nextCriteria = dim?.criteria.find(c => c.level === nextLevel);
-        
-        if (nextCriteria) {
-          recommendations.push({
-            dimension,
-            currentLevel: score,
-            targetLevel: nextLevel,
-            description: nextCriteria.description,
-            steps: nextCriteria.evidence,
-            estimatedEffort: this.estimateEffort(score, nextLevel),
-          });
-        }
+      if (score < level) {
+        priorities.push(`Improve ${dimension} from level ${Math.round(score)} to ${level}`);
       }
     }
-
-    return recommendations.sort((a, b) => {
-      // Sort by dimension weight (importance) first
-      const dimA = MATURITY_DIMENSIONS.find(d => d.name === a.dimension);
-      const dimB = MATURITY_DIMENSIONS.find(d => d.name === b.dimension);
-      return (dimB?.weight || 0) - (dimA?.weight || 0);
-    });
+    
+    return priorities.slice(0, 5);
   }
 
-  private estimateEffort(currentLevel: number, targetLevel: number): string {
-    const effortMap: Record<string, string> = {
-      '0-1': '1-2 weeks',
-      '1-2': '2-4 weeks',
-      '2-3': '1-3 months',
-      '3-4': '3-6 months',
-      '4-5': '6-12 months',
-    };
-    return effortMap[`${currentLevel}-${targetLevel}`] || 'Unknown';
+  private generateRoadmap(
+    currentLevel: MaturityLevel,
+    scores: Record<string, number>
+  ): RoadmapItem[] {
+    const roadmap: RoadmapItem[] = [];
+    
+    if (currentLevel < MaturityLevel.LEVEL_3) {
+      roadmap.push({
+        phase: 'Phase 1: Foundation (0-3 months)',
+        items: [
+          'Implement CI/CD pipeline for all services',
+          'Set up centralized logging (ELK Stack)',
+          'Define API design standards',
+          'Implement health checks and basic metrics',
+          'Document service boundaries and ownership',
+        ],
+      });
+    }
+    
+    if (currentLevel < MaturityLevel.LEVEL_4) {
+      roadmap.push({
+        phase: 'Phase 2: Standardization (3-12 months)',
+        items: [
+          'Implement distributed tracing',
+          'Set up service mesh',
+          'Define and track SLOs',
+          'Implement feature flags',
+          'Adopt GitOps',
+          'Implement security scanning in pipeline',
+        ],
+      });
+    }
+    
+    if (currentLevel < MaturityLevel.LEVEL_5) {
+      roadmap.push({
+        phase: 'Phase 3: Optimization (12-24 months)',
+        items: [
+          'Build Internal Developer Platform',
+          'Implement chaos engineering',
+          'Set up cost attribution',
+          'Implement progressive delivery',
+          'Establish blameless post-mortem culture',
+          'ML-based anomaly detection',
+        ],
+      });
+    }
+    
+    return roadmap;
   }
+}
+
+interface RoadmapItem {
+  phase: string;
+  items: string[];
 }
 ```
 
 ---
 
-## Migration Roadmap
+## 3. Migration Path from Monolith
 
-### Phase-by-Phase Migration Plan
+### 3.1 Strangler Fig Pattern Implementation
 
 ```typescript
-// tools/migration/src/migration-planner.ts
+// src/migration/strangler-fig.ts
+import express, { Request, Response, NextFunction } from 'express';
+import httpProxy from 'http-proxy';
 
-interface MigrationPhase {
-  name: string;
-  duration: string;
-  targetMaturityLevel: number;
-  objectives: string[];
-  milestones: Milestone[];
-  risks: Risk[];
-  successCriteria: string[];
+interface RouteMigration {
+  path: string;
+  method: string;
+  percentage: number;    // % ของ traffic ที่ไป new service
+  newService: string;
+  phase: 'planning' | 'testing' | 'migrating' | 'complete';
 }
 
-export const MIGRATION_ROADMAP: MigrationPhase[] = [
-  {
-    name: 'Foundation (Level 0 → 2)',
-    duration: '3-6 months',
-    targetMaturityLevel: 2,
-    objectives: [
-      'Establish infrastructure foundation',
-      'Extract first 2-3 core services',
-      'Implement basic observability',
-    ],
-    milestones: [
-      {
-        week: 4,
-        deliverable: 'Docker + Kubernetes cluster ใน staging',
-        owner: 'DevOps Team',
-      },
-      {
-        week: 8,
-        deliverable: 'CI/CD pipeline สำหรับทุก services',
-        owner: 'DevOps Team',
-      },
-      {
-        week: 12,
-        deliverable: 'User Service แยกจาก monolith',
-        owner: 'User Team',
-      },
-      {
-        week: 16,
-        deliverable: 'Order Service แยกจาก monolith',
-        owner: 'Order Team',
-      },
-      {
-        week: 20,
-        deliverable: 'Centralized logging + Prometheus metrics',
-        owner: 'Platform Team',
-      },
-    ],
-    risks: [
-      {
-        description: 'Data migration errors',
-        probability: 'MEDIUM',
-        impact: 'HIGH',
-        mitigation: 'ใช้ Strangler Fig pattern, dual-write period',
-      },
-      {
-        description: 'Team learning curve',
-        probability: 'HIGH',
-        impact: 'MEDIUM',
-        mitigation: 'Training program, Enabling team support',
-      },
-    ],
-    successCriteria: [
-      'Services deploy อิสระได้โดยไม่ต้องรอกัน',
-      'Deployment frequency เพิ่มขึ้น 2x จากเดิม',
-      'MTTR ลดลง 30%',
+export class StranglerFigProxy {
+  private proxy = httpProxy.createProxy();
+  private migrations: RouteMigration[] = [];
+  
+  constructor(
+    private legacyUrl: string,
+    private newServicesMap: Record<string, string>
+  ) {}
+
+  registerMigration(migration: RouteMigration): void {
+    this.migrations.push(migration);
+    console.log(`Registered migration: ${migration.method} ${migration.path} -> ${migration.newService} (${migration.percentage}%)`);
+  }
+
+  // Middleware ที่ route traffic ระหว่าง legacy และ new service
+  middleware() {
+    return (req: Request, res: Response, next: NextFunction) => {
+      const migration = this.findMigration(req.method, req.path);
+      
+      if (!migration) {
+        // ไม่มี migration: ส่งไป legacy
+        this.proxyToLegacy(req, res);
+        return;
+      }
+      
+      // Shadow mode: ส่งไปทั้งคู่ แต่ return จาก legacy
+      if (migration.phase === 'testing') {
+        this.shadowProxy(req, res, migration);
+        return;
+      }
+      
+      // Canary: route ตาม percentage
+      const useNew = Math.random() * 100 < migration.percentage;
+      
+      if (useNew || migration.phase === 'complete') {
+        this.proxyToNewService(req, res, migration.newService);
+      } else {
+        this.proxyToLegacy(req, res);
+      }
+    };
+  }
+
+  private findMigration(method: string, path: string): RouteMigration | null {
+    return this.migrations.find(m => {
+      const pathPattern = m.path.replace(/:[^/]+/g, '[^/]+');
+      return m.method === method && new RegExp(`^${pathPattern}`).test(path);
+    }) || null;
+  }
+
+  private proxyToLegacy(req: Request, res: Response): void {
+    this.proxy.web(req, res, { target: this.legacyUrl });
+  }
+
+  private proxyToNewService(req: Request, res: Response, service: string): void {
+    const target = this.newServicesMap[service];
+    this.proxy.web(req, res, { target });
+  }
+
+  private async shadowProxy(
+    req: Request, 
+    res: Response, 
+    migration: RouteMigration
+  ): Promise<void> {
+    // ส่งไปยัง new service แบบ async (shadow)
+    this.sendShadowRequest(req, migration.newService)
+      .then(shadowResponse => {
+        this.compareResponses(req.path, null, shadowResponse);
+      })
+      .catch(err => {
+        console.error('Shadow request failed:', err);
+      });
+    
+    // Return จาก legacy
+    this.proxyToLegacy(req, res);
+  }
+
+  private async sendShadowRequest(req: Request, service: string): Promise<any> {
+    const target = this.newServicesMap[service];
+    const response = await fetch(`${target}${req.path}`, {
+      method: req.method,
+      headers: req.headers as any,
+      body: req.method !== 'GET' ? JSON.stringify(req.body) : undefined,
+    });
+    return response.json();
+  }
+
+  private compareResponses(path: string, legacy: any, newService: any): void {
+    const diffs = this.diff(legacy, newService);
+    if (diffs.length > 0) {
+      console.warn({
+        message: 'Shadow response diff detected',
+        path,
+        diffs,
+      });
+    }
+  }
+
+  private diff(a: any, b: any): string[] {
+    // Simple diff implementation
+    return [];
+  }
+}
+
+// Migration phases
+export const MIGRATION_PHASES = {
+  1: {
+    name: 'Identify',
+    steps: [
+      'Map all modules in monolith',
+      'Identify bounded contexts using DDD',
+      'Define service boundaries',
+      'Map data ownership',
+      'Identify shared databases',
     ],
   },
-  {
-    name: 'Scaling (Level 2 → 3)',
-    duration: '4-8 months',
-    targetMaturityLevel: 3,
-    objectives: [
-      'Implement service mesh',
-      'Establish event-driven architecture',
-      'Deploy distributed tracing',
-      'Formalize team structure',
-    ],
-    milestones: [
-      {
-        week: 4,
-        deliverable: 'Istio service mesh ใน production',
-        owner: 'Platform Team',
-      },
-      {
-        week: 8,
-        deliverable: 'Kafka cluster + first event-driven service',
-        owner: 'Platform Team',
-      },
-      {
-        week: 12,
-        deliverable: 'Jaeger distributed tracing',
-        owner: 'Platform Team',
-      },
-      {
-        week: 16,
-        deliverable: 'SLO defined สำหรับทุก customer-facing services',
-        owner: 'All Teams',
-      },
-      {
-        week: 24,
-        deliverable: 'Team Topologies fully implemented',
-        owner: 'Engineering Management',
-      },
-    ],
-    risks: [
-      {
-        description: 'Istio complexity',
-        probability: 'HIGH',
-        impact: 'MEDIUM',
-        mitigation: 'Start with basic mTLS, add features gradually',
-      },
-    ],
-    successCriteria: [
-      'All services have defined SLOs',
-      'Distributed tracing coverage > 95%',
-      'Event-driven for all async workflows',
+  2: {
+    name: 'Prepare',
+    steps: [
+      'Set up API gateway/proxy (strangler fig)',
+      'Add feature flags',
+      'Set up CI/CD for new services',
+      'Create monitoring baseline',
+      'Train team on microservices patterns',
     ],
   },
+  3: {
+    name: 'Extract',
+    steps: [
+      'Start with least-coupled, highest-value service',
+      'Implement anti-corruption layer',
+      'Run shadow mode first (dual write)',
+      'Validate data consistency',
+      'Gradual traffic shifting (10% -> 50% -> 100%)',
+    ],
+  },
+  4: {
+    name: 'Decommission',
+    steps: [
+      'Route 100% traffic to new service',
+      'Monitor for 2 weeks',
+      'Remove legacy code',
+      'Clean up database tables',
+      'Update documentation',
+    ],
+  },
+};
+```
+
+---
+
+## 4. Team Autonomy Model
+
+### 4.1 Team Topologies Implementation
+
+```typescript
+// src/teams/team-topology.ts
+
+export type TeamType = 
+  | 'stream_aligned'    // Product team ที่ own a stream of work
+  | 'platform'          // Platform team ที่สร้าง tools สำหรับ stream teams
+  | 'enabling'          // ช่วย stream teams adopt new practices
+  | 'complicated_subsystem'; // ดูแล system ที่ซับซ้อนเป็นพิเศษ
+
+export type InteractionMode = 
+  | 'collaboration'     // ทำงานร่วมกัน (temporary)
+  | 'x_as_a_service'   // ให้บริการ (arms-length)
+  | 'facilitating';     // coaching/mentoring
+
+interface TeamDefinition {
+  id: string;
+  name: string;
+  type: TeamType;
+  missionStatement: string;
+  services: string[];
+  ownedCapabilities: string[];
+  dependencies: Array<{
+    team: string;
+    mode: InteractionMode;
+    description: string;
+  }>;
+  metrics: TeamMetrics;
+}
+
+interface TeamMetrics {
+  deploymentFrequency: string;   // 'multiple/day', 'daily', 'weekly'
+  changeLeadTime: string;        // 'hours', 'days', 'weeks'
+  changeFailureRate: string;     // '<5%', '5-10%', '>10%'
+  mttrMinutes: number;
+  cognitiveLoad: 'low' | 'medium' | 'high';
+}
+
+const TEAM_DEFINITIONS: TeamDefinition[] = [
   {
-    name: 'Excellence (Level 3 → 4)',
-    duration: '6-12 months',
-    targetMaturityLevel: 4,
-    objectives: [
-      'GitOps deployment pipeline',
-      'Chaos engineering practice',
-      'Cost optimization',
-      'Advanced security (zero-trust)',
+    id: 'team-platform',
+    name: 'Platform Team',
+    type: 'platform',
+    missionStatement: 'Enable stream teams to deliver value quickly and safely',
+    services: ['kubernetes', 'ci-cd', 'monitoring', 'security'],
+    ownedCapabilities: [
+      'Kubernetes cluster management',
+      'CI/CD pipelines as a service',
+      'Observability platform',
+      'Security scanning',
+      'Internal developer portal',
     ],
-    milestones: [
+    dependencies: [],
+    metrics: {
+      deploymentFrequency: 'multiple/day',
+      changeLeadTime: 'hours',
+      changeFailureRate: '<5%',
+      mttrMinutes: 30,
+      cognitiveLoad: 'high',
+    },
+  },
+  {
+    id: 'team-user',
+    name: 'User Team',
+    type: 'stream_aligned',
+    missionStatement: 'Own the user registration, authentication, and profile experience',
+    services: ['user-service', 'auth-service'],
+    ownedCapabilities: [
+      'User registration and onboarding',
+      'Authentication and authorization',
+      'User profile management',
+      'User preferences',
+    ],
+    dependencies: [
       {
-        week: 8,
-        deliverable: 'ArgoCD GitOps สำหรับทุก services',
-        owner: 'Platform Team',
-      },
-      {
-        week: 16,
-        deliverable: 'First chaos engineering game day',
-        owner: 'SRE Team',
-      },
-      {
-        week: 24,
-        deliverable: 'Zero-trust network architecture',
-        owner: 'Security Team',
-      },
-      {
-        week: 32,
-        deliverable: 'Cost per transaction tracked และ optimized',
-        owner: 'FinOps Team',
+        team: 'team-platform',
+        mode: 'x_as_a_service',
+        description: 'Use CI/CD, monitoring, k8s',
       },
     ],
-    risks: [],
-    successCriteria: [
-      'Deployment frequency > 10 per day across all services',
-      'MTTR < 30 minutes',
-      'Error budget compliance > 95%',
-      'Infrastructure cost per transaction ลด 20%',
+    metrics: {
+      deploymentFrequency: 'multiple/day',
+      changeLeadTime: 'hours',
+      changeFailureRate: '<5%',
+      mttrMinutes: 60,
+      cognitiveLoad: 'low',
+    },
+  },
+  {
+    id: 'team-payment',
+    name: 'Payment Team',
+    type: 'complicated_subsystem',
+    missionStatement: 'Provide secure, reliable payment processing',
+    services: ['payment-service', 'fraud-detection-service'],
+    ownedCapabilities: [
+      'Payment processing',
+      'Fraud detection',
+      'PCI-DSS compliance',
+      'Refund processing',
     ],
+    dependencies: [
+      {
+        team: 'team-platform',
+        mode: 'x_as_a_service',
+        description: 'Use CI/CD, monitoring',
+      },
+    ],
+    metrics: {
+      deploymentFrequency: 'weekly',
+      changeLeadTime: 'days',
+      changeFailureRate: '<1%',
+      mttrMinutes: 15,
+      cognitiveLoad: 'high',
+    },
   },
 ];
 ```
 
 ---
 
-## KPIs for Microservices
+## 5. Technical, Operational, Security, and Documentation Maturity
 
-### DORA Metrics Dashboard
+### 5.1 Comprehensive Maturity Scorecard
 
 ```typescript
-// platform/src/metrics/dora-metrics.service.ts
+// src/maturity/scorecard.ts
 
-export interface DORAMetrics {
-  // Deployment Frequency - how often we deploy
-  deploymentFrequency: {
-    value: number;           // deploys per day
-    category: 'Elite' | 'High' | 'Medium' | 'Low';
+interface MaturityScorecard {
+  technical: TechnicalMaturity;
+  operational: OperationalMaturity;
+  security: SecurityMaturity;
+  documentation: DocumentationMaturity;
+  testing: TestingMaturity;
+  overallScore: number;
+  level: MaturityLevel;
+}
+
+interface TechnicalMaturity {
+  score: number;
+  indicators: {
+    serviceDesign: number;        // 1-5
+    apiDesign: number;
+    dataManagement: number;
+    messaging: number;
+    resilience: number;
+    performance: number;
   };
-  
-  // Lead Time for Changes - commit to production
-  leadTimeForChanges: {
-    p50Hours: number;
-    p95Hours: number;
-    category: 'Elite' | 'High' | 'Medium' | 'Low';
-  };
-  
-  // Change Failure Rate - % of deployments causing incidents
-  changeFailureRate: {
-    percentage: number;
-    category: 'Elite' | 'High' | 'Medium' | 'Low';
-  };
-  
-  // Mean Time to Restore
-  mttr: {
-    p50Hours: number;
-    p95Hours: number;
-    category: 'Elite' | 'High' | 'Medium' | 'Low';
+  strengths: string[];
+  improvements: string[];
+}
+
+interface OperationalMaturity {
+  score: number;
+  indicators: {
+    ciCd: number;
+    monitoring: number;
+    logging: number;
+    tracing: number;
+    alerting: number;
+    capacityPlanning: number;
+    incidentManagement: number;
   };
 }
 
-@Injectable()
-export class DORAMetricsService {
-  async calculateDORAMetrics(
-    team: string,
-    periodDays = 90
-  ): Promise<DORAMetrics> {
-    const deployments = await this.getDeployments(team, periodDays);
-    const incidents = await this.getIncidents(team, periodDays);
-    const leadTimes = await this.getLeadTimes(team, periodDays);
+interface SecurityMaturity {
+  score: number;
+  indicators: {
+    authentication: number;
+    authorization: number;
+    dataEncryption: number;
+    secretManagement: number;
+    vulnerabilityScanning: number;
+    complianceGDPR: number;
+  };
+}
 
-    // Deployment Frequency
-    const deploysPerDay = deployments.length / periodDays;
-    const deploymentFrequencyCategory = 
-      deploysPerDay >= 1 ? 'Elite' :
-      deploysPerDay >= 1/7 ? 'High' :
-      deploysPerDay >= 1/30 ? 'Medium' : 'Low';
+interface DocumentationMaturity {
+  score: number;
+  indicators: {
+    apiDocumentation: number;
+    runbooks: number;
+    architecture: number;
+    onboarding: number;
+    postMortems: number;
+  };
+}
 
-    // Lead Time
-    const sortedLeadTimes = leadTimes.map(d => d.hours).sort((a, b) => a - b);
-    const leadTimeP50 = this.percentile(sortedLeadTimes, 50);
-    const leadTimeP95 = this.percentile(sortedLeadTimes, 95);
-    const leadTimeCategory =
-      leadTimeP50 < 1 ? 'Elite' :
-      leadTimeP50 < 24 ? 'High' :
-      leadTimeP50 < 24 * 7 ? 'Medium' : 'Low';
+interface TestingMaturity {
+  score: number;
+  indicators: {
+    unitTests: number;
+    integrationTests: number;
+    contractTests: number;
+    e2eTests: number;
+    performanceTests: number;
+    chaosEngineering: number;
+  };
+}
 
-    // Change Failure Rate
-    const failedDeployments = deployments.filter(d => d.causedIncident);
-    const cfr = (failedDeployments.length / deployments.length) * 100;
-    const cfrCategory =
-      cfr < 5 ? 'Elite' :
-      cfr < 10 ? 'High' :
-      cfr < 15 ? 'Medium' : 'Low';
-
-    // MTTR
-    const resolutionTimes = incidents
-      .filter(i => i.resolvedAt)
-      .map(i => (i.resolvedAt!.getTime() - i.startedAt.getTime()) / 3600000);
-    const sortedMTTR = resolutionTimes.sort((a, b) => a - b);
-    const mttrP50 = this.percentile(sortedMTTR, 50);
-    const mttrP95 = this.percentile(sortedMTTR, 95);
-    const mttrCategory =
-      mttrP50 < 1 ? 'Elite' :
-      mttrP50 < 24 ? 'High' :
-      mttrP50 < 24 * 7 ? 'Medium' : 'Low';
-
+export class MaturityScorecardGenerator {
+  generate(answers: Record<string, number>): MaturityScorecard {
+    const technical = this.scoreTechnical(answers);
+    const operational = this.scoreOperational(answers);
+    const security = this.scoreSecurity(answers);
+    const documentation = this.scoreDocumentation(answers);
+    const testing = this.scoreTesting(answers);
+    
+    const overallScore = (
+      technical.score * 0.30 +
+      operational.score * 0.25 +
+      security.score * 0.20 +
+      documentation.score * 0.10 +
+      testing.score * 0.15
+    );
+    
+    const level = this.determineLevel(overallScore);
+    
     return {
-      deploymentFrequency: {
-        value: deploysPerDay,
-        category: deploymentFrequencyCategory as any,
-      },
-      leadTimeForChanges: {
-        p50Hours: leadTimeP50,
-        p95Hours: leadTimeP95,
-        category: leadTimeCategory as any,
-      },
-      changeFailureRate: {
-        percentage: cfr,
-        category: cfrCategory as any,
-      },
-      mttr: {
-        p50Hours: mttrP50,
-        p95Hours: mttrP95,
-        category: mttrCategory as any,
-      },
+      technical,
+      operational,
+      security,
+      documentation,
+      testing,
+      overallScore: Math.round(overallScore * 100) / 100,
+      level,
     };
   }
 
-  private percentile(sorted: number[], p: number): number {
-    const idx = Math.floor((p / 100) * sorted.length);
-    return sorted[idx] || 0;
+  private scoreTechnical(answers: Record<string, number>): TechnicalMaturity {
+    const indicators = {
+      serviceDesign: answers['tech_service_design'] || 1,
+      apiDesign: answers['tech_api_design'] || 1,
+      dataManagement: answers['tech_data_mgmt'] || 1,
+      messaging: answers['tech_messaging'] || 1,
+      resilience: answers['tech_resilience'] || 1,
+      performance: answers['tech_performance'] || 1,
+    };
+    
+    const score = Object.values(indicators).reduce((a, b) => a + b) / 
+                 Object.values(indicators).length;
+    
+    const strengths: string[] = [];
+    const improvements: string[] = [];
+    
+    for (const [key, value] of Object.entries(indicators)) {
+      if (value >= 4) strengths.push(this.getIndicatorName(key));
+      if (value <= 2) improvements.push(this.getIndicatorName(key));
+    }
+    
+    return { score, indicators, strengths, improvements };
+  }
+
+  private scoreOperational(answers: Record<string, number>): OperationalMaturity {
+    const indicators = {
+      ciCd: answers['ops_cicd'] || 1,
+      monitoring: answers['ops_monitoring'] || 1,
+      logging: answers['ops_logging'] || 1,
+      tracing: answers['ops_tracing'] || 1,
+      alerting: answers['ops_alerting'] || 1,
+      capacityPlanning: answers['ops_capacity'] || 1,
+      incidentManagement: answers['ops_incident'] || 1,
+    };
+    
+    const score = Object.values(indicators).reduce((a, b) => a + b) / 
+                 Object.values(indicators).length;
+    
+    return { score, indicators };
+  }
+
+  private scoreSecurity(answers: Record<string, number>): SecurityMaturity {
+    const indicators = {
+      authentication: answers['sec_authn'] || 1,
+      authorization: answers['sec_authz'] || 1,
+      dataEncryption: answers['sec_encryption'] || 1,
+      secretManagement: answers['sec_secrets'] || 1,
+      vulnerabilityScanning: answers['sec_scanning'] || 1,
+      complianceGDPR: answers['sec_gdpr'] || 1,
+    };
+    
+    const score = Object.values(indicators).reduce((a, b) => a + b) / 
+                 Object.values(indicators).length;
+    
+    return { score, indicators };
+  }
+
+  private scoreDocumentation(answers: Record<string, number>): DocumentationMaturity {
+    const indicators = {
+      apiDocumentation: answers['doc_api'] || 1,
+      runbooks: answers['doc_runbooks'] || 1,
+      architecture: answers['doc_architecture'] || 1,
+      onboarding: answers['doc_onboarding'] || 1,
+      postMortems: answers['doc_postmortems'] || 1,
+    };
+    
+    const score = Object.values(indicators).reduce((a, b) => a + b) / 
+                 Object.values(indicators).length;
+    
+    return { score, indicators };
+  }
+
+  private scoreTesting(answers: Record<string, number>): TestingMaturity {
+    const indicators = {
+      unitTests: answers['test_unit'] || 1,
+      integrationTests: answers['test_integration'] || 1,
+      contractTests: answers['test_contract'] || 1,
+      e2eTests: answers['test_e2e'] || 1,
+      performanceTests: answers['test_performance'] || 1,
+      chaosEngineering: answers['test_chaos'] || 1,
+    };
+    
+    const score = Object.values(indicators).reduce((a, b) => a + b) / 
+                 Object.values(indicators).length;
+    
+    return { score, indicators };
+  }
+
+  private determineLevel(score: number): MaturityLevel {
+    if (score <= 1.5) return MaturityLevel.LEVEL_1;
+    if (score <= 2.5) return MaturityLevel.LEVEL_2;
+    if (score <= 3.5) return MaturityLevel.LEVEL_3;
+    if (score <= 4.5) return MaturityLevel.LEVEL_4;
+    return MaturityLevel.LEVEL_5;
+  }
+
+  private getIndicatorName(key: string): string {
+    const names: Record<string, string> = {
+      serviceDesign: 'Service Design',
+      apiDesign: 'API Design',
+      dataManagement: 'Data Management',
+      messaging: 'Messaging',
+      resilience: 'Resilience Patterns',
+      performance: 'Performance Optimization',
+    };
+    return names[key] || key;
   }
 }
 ```
 
-```
-DORA Metrics Categories:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-                    │  Elite    │  High     │  Medium   │  Low
-────────────────────┼───────────┼───────────┼───────────┼──────────
-Deployment          │ > 1/day   │ 1/week -  │ 1/month - │ < 1/6
-Frequency           │           │ 1/day     │ 1/week    │ months
-────────────────────┼───────────┼───────────┼───────────┼──────────
-Lead Time for       │ < 1 hour  │ 1 day -   │ 1 week -  │ > 6
-Changes             │           │ 1 week    │ 1 month   │ months
-────────────────────┼───────────┼───────────┼───────────┼──────────
-Change Failure      │ < 5%      │ 5-10%     │ 10-15%    │ 15-60%
-Rate                │           │           │           │
-────────────────────┼───────────┼───────────┼───────────┼──────────
-MTTR                │ < 1 hour  │ < 1 day   │ < 1 week  │ > 1 week
-────────────────────┴───────────┴───────────┴───────────┴──────────
-```
-
 ---
 
-## Success Metrics
+## 6. Architecture Decision Framework
 
-### Business Metrics ที่เชื่อมกับ Technical Metrics
+### 6.1 Architecture Decision Record (ADR)
 
 ```typescript
-// platform/src/metrics/business-tech-correlation.ts
+// src/architecture/adr.ts
 
-interface BusinessTechMetrics {
-  // Conversion Rate vs. API Latency
-  conversionRateVsP99Latency: Correlation;
+interface ArchitectureDecisionRecord {
+  id: string;                   // ADR-001, ADR-002, ...
+  title: string;
+  status: 'proposed' | 'accepted' | 'deprecated' | 'superseded';
+  date: Date;
+  deciders: string[];
   
-  // Revenue vs. Availability
-  revenueVsAvailability: Correlation;
+  context: string;              // สถานการณ์ที่นำมาสู่การตัดสินใจ
+  decision: string;             // การตัดสินใจที่ทำ
+  rationale: string;            // เหตุผลของการตัดสินใจ
   
-  // User Retention vs. Error Rate
-  userRetentionVsErrorRate: Correlation;
+  alternatives: Array<{
+    option: string;
+    pros: string[];
+    cons: string[];
+    rejected: boolean;
+    rejectionReason?: string;
+  }>;
   
-  // Cost per Transaction
-  costPerTransaction: {
-    infrastructureCost: number;
-    orderCount: number;
-    costPerOrder: number;
-    trend: 'improving' | 'stable' | 'degrading';
+  consequences: {
+    positive: string[];
+    negative: string[];
+    risks: string[];
   };
+  
+  relatedADRs?: string[];
+  supersededBy?: string;
 }
 
-// Dashboard ที่แสดง business impact ของ technical decisions
-export const BUSINESS_METRICS_DASHBOARD_QUERIES = {
-  // Revenue at risk during incidents
-  revenueAtRisk: `
-    sum(
-      rate(http_requests_total{
-        service="order-service",
-        endpoint="/api/v1/orders",
-        status="201"
-      }[5m])
-    ) * avg_order_value_thb
-  `,
-
-  // Orders lost due to high latency (>3s = user abandons)
-  ordersLostToLatency: `
-    sum(
-      rate(http_request_duration_seconds_bucket{
-        service="order-service",
-        le="3.0"
-      }[5m])
-    ) - sum(
-      rate(http_requests_total{
-        service="order-service",
-        status="201"
-      }[5m])
-    )
-  `,
-
-  // Infrastructure cost per successful order
-  costPerSuccessfulOrder: `
-    sum(container_cpu_usage_seconds_total{namespace="production"}) * cpu_cost_per_second +
-    sum(container_memory_working_set_bytes{namespace="production"}) * memory_cost_per_byte_second
-    / 
-    sum(rate(http_requests_total{
-      service="order-service",
-      status="201"
-    }[1h])) * 3600
-  `,
-};
+// ตัวอย่าง ADR
+export const EXAMPLE_ADRS: ArchitectureDecisionRecord[] = [
+  {
+    id: 'ADR-001',
+    title: 'Use Event-Driven Architecture for Inter-Service Communication',
+    status: 'accepted',
+    date: new Date('2024-01-15'),
+    deciders: ['Tech Lead', 'Architect', 'Engineering Manager'],
+    
+    context: `
+      เราต้องการสื่อสารระหว่าง services โดยมี requirements:
+      - Loose coupling ระหว่าง services
+      - ทนต่อ service failures
+      - รองรับ scale ได้
+      - Audit trail สำหรับทุก business event
+    `,
+    
+    decision: 'ใช้ Apache Kafka เป็น message broker หลักสำหรับ async communication',
+    
+    rationale: `
+      Kafka ให้ทั้ง durability, replay capability, และ high throughput
+      ที่จำเป็นสำหรับ event-driven architecture ของเรา
+      Consumer groups ช่วยให้ scale ได้โดยไม่ต้อง coordinate กัน
+    `,
+    
+    alternatives: [
+      {
+        option: 'RabbitMQ',
+        pros: ['ง่ายกว่า Kafka', 'routing patterns หลากหลาย'],
+        cons: ['ไม่รองรับ message replay', 'throughput ต่ำกว่า'],
+        rejected: true,
+        rejectionReason: 'ต้องการ message replay สำหรับ audit',
+      },
+      {
+        option: 'Synchronous REST calls',
+        pros: ['ง่ายต่อการ debug', 'immediate consistency'],
+        cons: ['coupling สูง', 'cascade failures', 'ไม่ scale ได้ดี'],
+        rejected: true,
+        rejectionReason: 'ทำให้เกิด tight coupling และ cascade failures',
+      },
+    ],
+    
+    consequences: {
+      positive: [
+        'Services decoupled จากกัน',
+        'Replay events สำหรับ audit และ debugging',
+        'High throughput',
+        'Resilient ต่อ downstream failures',
+      ],
+      negative: [
+        'Eventual consistency ยาก debug',
+        'Operational complexity เพิ่มขึ้น',
+        'ต้องดูแล Kafka cluster',
+      ],
+      risks: [
+        'Message ordering จะเป็นประเด็นถ้า partition key ไม่ถูกต้อง',
+        'Schema evolution ต้องระวังเรื่อง backward compatibility',
+      ],
+    },
+  },
+  
+  {
+    id: 'ADR-002',
+    title: 'Adopt Domain-Driven Design for Service Boundaries',
+    status: 'accepted',
+    date: new Date('2024-02-01'),
+    deciders: ['Tech Lead', 'Architect', 'Domain Experts'],
+    
+    context: `
+      เราต้องการ define service boundaries ที่ชัดเจนและ align กับ business
+      หลังจากประสบปัญหา:
+      - Services ที่ tight coupled กัน
+      - ไม่ชัดเจนว่า service ไหน own data อะไร
+      - Changes บ่อยทำให้ต้อง update หลาย services พร้อมกัน
+    `,
+    
+    decision: 'ใช้ Domain-Driven Design (DDD) โดยเฉพาะ Bounded Contexts เพื่อ define service boundaries',
+    
+    rationale: 'Bounded Contexts ช่วยให้ services มี clear ownership และ align กับ business domains',
+    
+    alternatives: [],
+    
+    consequences: {
+      positive: [
+        'Clear ownership ของแต่ละ domain',
+        'Independent deployability สูงขึ้น',
+        'Teams align กับ business domains',
+      ],
+      negative: [
+        'ต้องลงทุนเวลาเพื่อเรียนรู้ DDD',
+        'อาจมี initial overhead',
+      ],
+      risks: [
+        'Over-decomposition ถ้าไม่ระวัง',
+        'Anemic domain model ถ้าใช้ DDD ไม่ถูกต้อง',
+      ],
+    },
+  },
+];
 ```
 
 ---
 
-## Case Studies: Thai Tech Companies
+## สรุปท้ายบท - ภาพรวม Course ทั้งหมด
 
-### Case Study 1: ร้านค้าออนไลน์ขนาดกลาง (Retail E-commerce)
+| Part | หัวข้อ | Maturity Level | ความสำคัญ |
+|------|--------|----------------|-----------|
+| 1-10 | Microservices Foundations | Level 1-2 | สูงมาก |
+| 11-20 | Docker & Kubernetes | Level 2 | สูงมาก |
+| 21-30 | Service Communication | Level 2-3 | สูง |
+| 31-40 | Data Management | Level 3 | สูง |
+| 41-50 | Security | Level 3-4 | สูงมาก |
+| 51-60 | Observability | Level 3 | สูงมาก |
+| 61-70 | Advanced Patterns | Level 3-4 | กลาง |
+| 71-80 | Platform Engineering | Level 4 | กลาง |
+| 81-90 | Mastery & Optimization | Level 4-5 | กลาง |
+| Part 83 | API Design Best Practices | Level 2-3 | สูง |
+| Part 84 | Data Privacy & GDPR | Level 3 | สูงมาก |
+| Part 85 | Debugging Microservices | Level 2-3 | สูง |
+| Part 86 | Message Brokers | Level 3 | สูง |
+| Part 87 | gRPC | Level 3 | กลาง |
+| Part 88 | Capacity Planning | Level 4 | กลาง |
+| Part 89 | Incident Management | Level 3-4 | สูง |
+| Part 90 | Maturity Model | Level 4-5 | สูง |
 
-```
-Context:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+### Microservices Maturity Levels Summary
 
-บริษัท: สมมติว่าเป็น "ShopThai" (ชื่อสมมติ)
-ขนาด: Engineering team 20 คน
-Traffic: 50K orders/day (peak 200K ช่วง 11.11, 12.12)
-เริ่มต้น: PHP Monolith บน cPanel shared hosting (Maturity Level 0)
+| Level | ชื่อ | Timeline | Key Capabilities |
+|-------|------|----------|-----------------|
+| 1 | Initial | 0-6 เดือน | Services แยกออกจาก monolith, basic CI/CD |
+| 2 | Managed | 6-18 เดือน | Container, basic monitoring, API standards |
+| 3 | Defined | 18-36 เดือน | Distributed tracing, service mesh, SLOs |
+| 4 | Quantitatively Managed | 3-5 ปี | Error budgets, chaos engineering, cost attribution |
+| 5 | Optimizing | 5+ ปี | ML-based detection, auto-remediation, IDP |
 
-Journey:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+### คำแนะนำสำหรับ Journey
 
-Year 1 (Level 0 → 2):
-  - เปลี่ยนจาก PHP monolith เป็น NestJS + Docker
-  - Deploy บน GCP Kubernetes Engine
-  - แยก User Service และ Product Service ก่อน
-  - ใช้ Cloud SQL สำหรับ PostgreSQL
-  - Setup Stackdriver (Cloud Operations) logging
+1. **อย่า rush** - การก้าวข้าม level ที่เร็วเกินไปทำให้เกิดปัญหา technical debt
+2. **People first** - Technical tools ไม่ work ถ้าคนไม่พร้อม
+3. **Measure everything** - ถ้าวัดไม่ได้ ปรับปรุงไม่ได้
+4. **Blameless culture** - สำคัญที่สุดในการ scale organization
+5. **Platform thinking** - ลงทุน developer experience เพื่อ velocity
+6. **Start small** - Prove value ก่อน scale
+7. **Document decisions** - ADR ช่วยให้ team เข้าใจ context
+8. **Celebrate progress** - การ migrate เป็น marathon ไม่ใช่ sprint
 
-Year 2 (Level 2 → 3):
-  - แยก Payment Service (ความสำคัญสูง, security concern)
-  - แยก Order Service
-  - เพิ่ม Pub/Sub สำหรับ async communication
-  - ตั้ง team structure ตาม domain
-  - เพิ่ม monitoring ด้วย Grafana Cloud
-
-Year 3 (Level 3 → 4):
-  - Istio service mesh สำหรับ mTLS
-  - GitOps ด้วย Argo CD
-  - SLO monitoring สำหรับ customer-facing services
-  - Chaos engineering ก่อน campaign
-
-Results:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Deployment frequency: 2 ครั้ง/เดือน → 15 ครั้ง/วัน
-MTTR: 4 ชั่วโมง → 20 นาที
-11.11 Campaign uptime: 95% → 99.95%
-Infrastructure cost per order: ลดลง 40%
-
-Lessons:
-- ทำ Domain Analysis ก่อนแยก services
-- เริ่ม Strangler Fig pattern อย่างระมัดระวัง
-- ลงทุนกับ observability เร็วกว่าที่คิด
-- Platform team สำคัญมากสำหรับ developer productivity
-```
-
-### Case Study 2: FinTech Payment Platform
+### Continuous Improvement Framework
 
 ```
-Context:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Plan -> Do -> Check -> Act (PDCA)
 
-บริษัท: สมมติว่าเป็น "PayThai" (ชื่อสมมติ)
-ขนาด: Engineering team 50 คน
-Traffic: 500K transactions/day
-Regulatory: BOT (Bank of Thailand) compliance required
-เริ่มต้น: Java Spring Boot semi-monolith (Maturity Level 1)
-
-Special Challenges:
-- PCI DSS compliance สำหรับ payment data
-- PDPA compliance สำหรับ user data
-- High availability requirement: 99.99%
-- Regulatory audit logging requirement
-
-Architecture Decisions:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-┌──────────────────────────────────────────────────────────┐
-│                   Payment Domain                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
-│  │  Payment    │  │   Fraud     │  │   Settlement    │  │
-│  │  Gateway    │  │ Detection   │  │   Service       │  │
-│  │  Service    │  │  Service    │  │                 │  │
-│  └─────────────┘  └─────────────┘  └─────────────────┘  │
-│         │                                               │
-│    Kafka (audit log, immutable)                        │
-│         │                                               │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │           Compliance & Audit Service            │   │
-│  │  (immutable audit log, PDPA, regulatory report) │   │
-│  └─────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────┘
-
-Key Decisions:
-1. Kafka เป็น immutable audit log (ไม่ใช่แค่ event bus)
-2. Payment Service ใช้ separate Kubernetes namespace
-   ที่มี strict network policies
-3. Vault สำหรับ all secrets (including encryption keys)
-4. Multi-region active-active สำหรับ 99.99% SLA
-
-Results:
-- Passed BOT examination ครั้งแรก
-- Zero security incidents ใน 18 เดือน
-- Transaction throughput: 5K/s peak
-- Availability: 99.997% (2024)
+สำหรับ Microservices:
+1. PLAN: กำหนด target maturity level และ roadmap
+2. DO: Implement ตาม roadmap
+3. CHECK: Assess maturity ทุกไตรมาส
+4. ACT: Adjust roadmap ตาม learnings
 ```
-
-### Case Study 3: Healthcare Platform (Digital Health)
-
-```
-Context:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-บริษัท: สมมติว่าเป็น "HealthConnect" (ชื่อสมมติ)
-ขนาด: Engineering team 15 คน
-Users: 1M+ registered patients
-Regulatory: PDPA + Healthcare data compliance
-เริ่มต้น: React + Node.js small monolith (Maturity Level 1)
-
-Unique Requirements:
-- Health data เป็น PDPA Sensitive Data
-- ต้องการ data residency ใน Thailand
-- FHIR (Fast Healthcare Interoperability Resources) standard
-- Integration กับ hospitals (HL7 messaging)
-
-Architecture:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Services:
-├── Patient Identity Service (สร้าง Thai FHIR Patient resources)
-├── Medical Records Service (encrypted, Thailand region only)
-├── Appointment Service
-├── Telemedicine Service (WebRTC)
-├── Prescription Service
-└── Integration Service (HL7 → FHIR converter)
-
-Privacy Architecture:
-├── Health data encrypted at rest (AES-256-GCM)
-├── Separate encryption key per patient
-├── Zero-knowledge architecture (even DBAs can't read patient data)
-└── Consent management ที่ granular (consent per data type)
-
-Microservices Maturity: Level 3 (after 2 years)
-
-Current Focus:
-- Achieving Level 4 ด้วย AI-assisted health recommendations
-- Federated learning (AI training โดยไม่ต้อง share patient data)
-```
-
----
-
-## Self-Assessment Checklist
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│              MICROSERVICES SELF-ASSESSMENT CHECKLIST                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  Level 1 (Foundations)                                                  │
-│  [ ] Services ใช้ Docker containers                                     │
-│  [ ] มี CI pipeline (automated build + test)                            │
-│  [ ] Services communicate ผ่าน HTTP APIs                                │
-│  [ ] มี health check endpoints                                          │
-│  [ ] มี basic logging                                                   │
-│                                                                         │
-│  Level 2 (Basic Microservices)                                          │
-│  [ ] Each service มี database ของตัวเอง                                 │
-│  [ ] Deployed บน Kubernetes                                             │
-│  [ ] มี automated deployment pipeline                                   │
-│  [ ] Centralized logging (ELK/Loki)                                    │
-│  [ ] Basic metrics (Prometheus + Grafana)                               │
-│  [ ] Services scale อิสระได้                                            │
-│                                                                         │
-│  Level 3 (Managed)                                                      │
-│  [ ] Service mesh (mTLS, traffic management)                           │
-│  [ ] Distributed tracing                                                │
-│  [ ] SLO defined สำหรับ customer-facing services                        │
-│  [ ] On-call rotation + runbooks                                        │
-│  [ ] Event-driven architecture สำหรับ async workflows                   │
-│  [ ] API Gateway                                                        │
-│  [ ] Canary/Blue-green deployments                                      │
-│                                                                         │
-│  Level 4 (Optimized)                                                    │
-│  [ ] GitOps deployment                                                  │
-│  [ ] Chaos engineering practice                                         │
-│  [ ] Zero-trust security                                                │
-│  [ ] Cost optimization active                                           │
-│  [ ] DORA metrics tracked                                               │
-│  [ ] Blameless postmortem culture                                       │
-│  [ ] Service catalog (Backstage)                                        │
-│                                                                         │
-│  Level 5 (Excellence)                                                   │
-│  [ ] ML-based anomaly detection                                         │
-│  [ ] Predictive scaling                                                 │
-│  [ ] Automated root cause analysis                                      │
-│  [ ] Industry-leading DORA metrics                                      │
-│  [ ] Self-healing systems                                               │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## สรุป
-
-Microservices Maturity Model ช่วยให้เราเห็น:
-
-1. **ตำแหน่งปัจจุบัน** — รู้ว่าอยู่ที่ไหน ไม่ต้องเดา
-2. **เป้าหมายที่ชัดเจน** — Level ถัดไปคืออะไร ต้องทำอะไร
-3. **ลำดับความสำคัญ** — ทำอะไรก่อน-หลัง
-
-### สรุปบทเรียนจาก 90 Parts
-
-| Part | หัวข้อ | Key Takeaway |
-|------|--------|--------------|
-| 81 | Anti-Patterns | เริ่มจาก Monolith, แยกเมื่อมี business justification |
-| 82 | Team Organization | Conway's Law: team structure กำหนด architecture |
-| 83 | API Design | API คือ contract, backward compatibility คือ must |
-| 84 | Privacy & Compliance | Privacy by Design, ไม่ใช่ add-on |
-| 85 | Debugging | Trace ID คือกุญแจ, structured logs คือ foundation |
-| 86 | Message Brokers | เลือก broker ตาม use case ไม่ใช่ hype |
-| 87 | gRPC | gRPC for internal, REST for public |
-| 88 | Capacity Planning | Plan for 2x, test at 3x |
-| 89 | Incident Management | MTTR > MTBF, blameless culture |
-| 90 | Maturity Model | รู้ว่าอยู่ที่ไหน, ก้าวทีละ level |
-
-**กุญแจสำคัญที่สุดของ Microservices:**
-
-> "Don't start with microservices. Start with a well-structured monolith, extract services when you feel the pain of scale, and let your team structure guide your architecture." — Sam Newman
-
-สิ่งที่สำคัญที่สุดไม่ใช่ technology แต่คือ **people และ process** — ทีมที่มีวัฒนธรรมการทำงานที่ดี ฟังก์ชั่น blameless learning และ continuous improvement จะสร้าง microservices ที่ดีได้ ไม่ว่าจะใช้ tool ไหน

@@ -1463,6 +1463,160 @@ spec:
 
 ---
 
+## 78.11 Istio Circuit Breaker และ Outlier Detection
+
+### DestinationRule สำหรับ Circuit Breaker
+
+```yaml
+# circuit-breaker-dr.yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payment-service-circuit-breaker
+  namespace: production
+spec:
+  host: payment-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 5s
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+        idleTimeout: 90s
+        h2UpgradePolicy: UPGRADE
+    outlierDetection:
+      # Circuit breaker triggers
+      consecutiveGatewayErrors: 5
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+      # Panic threshold - ถ้า healthy hosts ต่ำกว่า 50% จะ load balance ทุก host
+      splitExternalLocalOriginErrors: true
+      consecutiveLocalOriginFailures: 5
+```
+
+### TypeScript Circuit Breaker Monitor
+
+```typescript
+// circuit-breaker-monitor.ts
+interface CircuitBreakerState {
+  service: string;
+  namespace: string;
+  ejectedHosts: string[];
+  totalHosts: number;
+  healthyHosts: number;
+  state: 'closed' | 'open' | 'half-open';
+  lastStateChange: Date;
+  consecutiveErrors: number;
+}
+
+class CircuitBreakerMonitor {
+  private prometheusUrl: string;
+
+  constructor(prometheusUrl: string) {
+    this.prometheusUrl = prometheusUrl;
+  }
+
+  async getCircuitBreakerStates(namespace: string): Promise<CircuitBreakerState[]> {
+    const url = `${this.prometheusUrl}/api/v1/query?query=` +
+      encodeURIComponent(
+        `envoy_cluster_outlier_detection_ejections_active{namespace="${namespace}"}`
+      );
+
+    const response = await fetch(url);
+    const data = await response.json();
+
+    return (data.data?.result ?? []).map((result: any) => {
+      const ejectedCount = parseInt(result.value[1]);
+      const service = result.metric.cluster_name?.replace('outbound|80||', '').split('.')[0] ?? '';
+      
+      return {
+        service,
+        namespace,
+        ejectedHosts: [],
+        totalHosts: 0,
+        healthyHosts: 0,
+        state: ejectedCount > 0 ? 'open' : 'closed',
+        lastStateChange: new Date(),
+        consecutiveErrors: ejectedCount,
+      } as CircuitBreakerState;
+    });
+  }
+
+  async watchAndAlert(namespace: string, intervalMs: number = 30000): Promise<void> {
+    console.log(`Monitoring circuit breakers in namespace: ${namespace}`);
+    
+    const check = async () => {
+      const states = await this.getCircuitBreakerStates(namespace);
+      
+      states.filter(s => s.state !== 'closed').forEach(state => {
+        console.log(
+          `[CIRCUIT BREAKER OPEN] ${state.namespace}/${state.service}: ` +
+          `${state.consecutiveErrors} consecutive errors`
+        );
+      });
+    };
+
+    await check();
+    setInterval(check, intervalMs);
+  }
+}
+
+export { CircuitBreakerMonitor };
+```
+
+---
+
+## สรุปบทที่ 78
+
+| หัวข้อ | สิ่งที่เรียนรู้ |
+|--------|----------------|
+| Service Mesh Comparison | Istio vs Linkerd vs Consul Connect - feature, performance, complexity |
+| Linkerd Setup | Installation, namespace injection, TypeScript health check client |
+| Canary Deployment | TrafficSplit YAML 90/10, TypeScript canary controller |
+| Golden Signals | Error rate, latency, traffic, saturation dashboard |
+| mTLS Rotation | Certificate lifecycle, auto-rotation TypeScript script |
+| Performance Benchmark | Direct vs mesh overhead measurement |
+| Multi-cluster Istio | ServiceEntry, cross-cluster VirtualService, east-west gateway |
+| Migration Strategy | Gradual opt-in, PERMISSIVE → STRICT mTLS |
+| VM Integration | WorkloadEntry, WorkloadGroup, VM proxy install |
+| Debugging | istioctl analyze, proxy-status, proxy-config |
+| Circuit Breaker | DestinationRule outlierDetection, TypeScript monitor |
+
+| Feature | Istio | Linkerd | Consul Connect |
+|---------|-------|---------|----------------|
+| Data Plane | Envoy | linkerd2-proxy (Rust) | Envoy |
+| Memory/sidecar | ~50MB | ~10MB | ~30MB |
+| CPU overhead | Medium | Low | Medium |
+| mTLS | Auto/SPIFFE | Auto | Auto/Intentions |
+| Traffic Management | Advanced | Basic-Medium | Medium |
+| Learning Curve | Steep | Gentle | Medium |
+| Multi-cluster | Yes | Yes | Yes |
+| VM Support | Yes | Limited | Yes (native) |
+| Dashboard | Kiali | Linkerd Viz | Consul UI |
+| Commercial Support | Yes (Tetrate) | Yes (Buoyant) | Yes (HashiCorp) |
+
+| Traffic Pattern | Istio Config | Use Case |
+|----------------|-------------|---------|
+| Canary Deployment | VirtualService weight | New version testing |
+| A/B Testing | Header-based routing | Feature testing |
+| Circuit Breaker | DestinationRule outlierDetection | Failure isolation |
+| Retry | VirtualService retries | Transient failures |
+| Fault Injection | VirtualService fault | Chaos testing |
+| Traffic Mirror | VirtualService mirror | Shadow testing |
+| Rate Limiting | EnvoyFilter/Ratelimit | DDoS protection |
+
+---
+
 ## สรุป
 
 Service Mesh Advanced Patterns:

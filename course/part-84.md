@@ -1333,3 +1333,376 @@ privacy:
 - [ ] PII masking ใน logs
 - [ ] DPA (Data Processing Agreement) กับ third parties
 - [ ] Privacy policy อัปเดตและเข้าถึงได้
+
+---
+
+## 11. Data Breach Notification System
+
+### 11.1 Breach Detection and Reporting
+
+```typescript
+// src/gdpr/breach-notification.ts
+import { Injectable } from '@nestjs/common';
+
+export enum BreachSeverity {
+  LOW = 'low',          // ไม่มีความเสี่ยง
+  MEDIUM = 'medium',    // มีความเสี่ยงแต่ไม่สูง
+  HIGH = 'high',        // ความเสี่ยงสูง
+  CRITICAL = 'critical' // ความเสี่ยงสูงมาก
+}
+
+interface DataBreach {
+  id: string;
+  detectedAt: Date;
+  notifiedAuthorityAt?: Date;
+  notifiedDataSubjectsAt?: Date;
+  type: 'confidentiality' | 'integrity' | 'availability';
+  severity: BreachSeverity;
+  affectedDataCategories: DataCategory[];
+  affectedSubjectCount: number;
+  description: string;
+  technicalCause: string;
+  containmentMeasures: string[];
+  status: 'detected' | 'contained' | 'authority_notified' | 'subjects_notified' | 'closed';
+}
+
+@Injectable()
+export class BreachNotificationService {
+  private readonly AUTHORITY_NOTIFICATION_HOURS = 72;
+  private readonly HIGH_RISK_CATEGORIES: DataCategory[] = [
+    'health', 'biometric', 'financial'
+  ];
+
+  async reportBreach(breach: Omit<DataBreach, 'id' | 'status'>): Promise<DataBreach> {
+    const record: DataBreach = {
+      ...breach,
+      id: crypto.randomUUID(),
+      status: 'detected',
+    };
+
+    // บันทึก breach
+    await this.breachRepository.save(record);
+
+    // Alert security team ทันที
+    await this.alertSecurityTeam(record);
+
+    // ตรวจสอบว่าต้องแจ้ง authority หรือไม่
+    if (this.requiresAuthorityNotification(record)) {
+      await this.scheduleAuthorityNotification(record);
+    }
+
+    return record;
+  }
+
+  private requiresAuthorityNotification(breach: DataBreach): boolean {
+    // GDPR: ต้องแจ้ง authority ถ้าเป็นความเสี่ยงต่อสิทธิ์และเสรีภาพ
+    return breach.severity !== BreachSeverity.LOW ||
+           breach.affectedSubjectCount > 100;
+  }
+
+  async notifyAuthority(breachId: string): Promise<void> {
+    const breach = await this.breachRepository.findOne({ where: { id: breachId } });
+    if (!breach) throw new Error(`Breach ${breachId} not found`);
+
+    const notification = this.buildAuthorityNotification(breach);
+
+    // ส่งไปยัง Data Protection Authority (PDPA office ในกรณีไทย)
+    await this.emailService.send({
+      to: process.env.DPA_EMAIL!,
+      subject: `Personal Data Breach Notification - ${breach.id}`,
+      body: notification,
+    });
+
+    breach.notifiedAuthorityAt = new Date();
+    breach.status = 'authority_notified';
+    await this.breachRepository.save(breach);
+  }
+
+  async notifyDataSubjects(breachId: string): Promise<void> {
+    const breach = await this.breachRepository.findOne({ where: { id: breachId } });
+    if (!breach) throw new Error(`Breach ${breachId} not found`);
+
+    // ต้องแจ้ง data subjects เฉพาะเมื่อมีความเสี่ยงสูง
+    if (!this.requiresSubjectNotification(breach)) return;
+
+    // ดึง affected users
+    const affectedUsers = await this.getAffectedUsers(breach);
+
+    // ส่ง notification
+    for (const user of affectedUsers) {
+      await this.emailService.send({
+        to: user.email,
+        subject: 'Important: Personal Data Security Notice',
+        body: this.buildSubjectNotification(breach, user),
+      });
+    }
+
+    breach.notifiedDataSubjectsAt = new Date();
+    breach.status = 'subjects_notified';
+    await this.breachRepository.save(breach);
+  }
+
+  private buildAuthorityNotification(breach: DataBreach): string {
+    const hoursSinceDetection = Math.round(
+      (Date.now() - breach.detectedAt.getTime()) / (1000 * 60 * 60)
+    );
+
+    return `
+PERSONAL DATA BREACH NOTIFICATION
+Article 33, GDPR / PDPA Section 37
+
+Organization: Example Co., Ltd.
+DPO Contact: dpo@example.com
+
+Breach Reference: ${breach.id}
+Date/Time of Detection: ${breach.detectedAt.toISOString()}
+Notification Date: ${new Date().toISOString()}
+Hours Since Detection: ${hoursSinceDetection} hours
+
+NATURE OF BREACH:
+Type: ${breach.type}
+Severity: ${breach.severity}
+
+CATEGORIES OF DATA AFFECTED:
+${breach.affectedDataCategories.map(c => `- ${c}`).join('\n')}
+
+APPROXIMATE NUMBER OF DATA SUBJECTS AFFECTED:
+${breach.affectedSubjectCount}
+
+DESCRIPTION OF THE BREACH:
+${breach.description}
+
+TECHNICAL CAUSE:
+${breach.technicalCause}
+
+LIKELY CONSEQUENCES:
+${breach.severity === BreachSeverity.HIGH || breach.severity === BreachSeverity.CRITICAL
+  ? 'High risk to rights and freedoms of data subjects'
+  : 'Moderate risk to data subjects'}
+
+MEASURES TAKEN TO ADDRESS THE BREACH:
+${breach.containmentMeasures.map((m, i) => `${i + 1}. ${m}`).join('\n')}
+    `.trim();
+  }
+
+  private buildSubjectNotification(breach: DataBreach, user: any): string {
+    return `
+Dear ${user.name},
+
+We are writing to inform you of a personal data security incident that may affect your data.
+
+WHAT HAPPENED:
+${breach.description}
+
+WHAT DATA WAS AFFECTED:
+${breach.affectedDataCategories.join(', ')}
+
+WHAT WE ARE DOING:
+${breach.containmentMeasures.join('\n')}
+
+WHAT YOU CAN DO:
+1. Monitor your accounts for suspicious activity
+2. Change your password if you haven't recently
+3. Enable two-factor authentication
+4. Contact us if you notice any unusual activity
+
+CONTACT:
+Data Protection Officer: dpo@example.com
+Support: support@example.com
+
+We sincerely apologize for this incident and are committed to protecting your data.
+
+Regards,
+Example Co., Ltd. Data Protection Team
+    `.trim();
+  }
+
+  private requiresSubjectNotification(breach: DataBreach): boolean {
+    return breach.severity === BreachSeverity.HIGH ||
+           breach.severity === BreachSeverity.CRITICAL ||
+           this.HIGH_RISK_CATEGORIES.some(c =>
+             breach.affectedDataCategories.includes(c)
+           );
+  }
+
+  private async scheduleAuthorityNotification(breach: DataBreach): Promise<void> {
+    const notifyAt = new Date(
+      breach.detectedAt.getTime() + this.AUTHORITY_NOTIFICATION_HOURS * 60 * 60 * 1000
+    );
+
+    // Schedule job สำหรับ auto-notify
+    await this.scheduler.scheduleJob({
+      name: `breach-notify-${breach.id}`,
+      runAt: notifyAt,
+      handler: () => this.notifyAuthority(breach.id),
+    });
+  }
+
+  private async alertSecurityTeam(breach: DataBreach): Promise<void> {
+    await this.slackService.post('#security-alerts', {
+      text: `🚨 DATA BREACH DETECTED\nID: ${breach.id}\nSeverity: ${breach.severity}\nAffected: ${breach.affectedSubjectCount} subjects\nType: ${breach.type}`,
+    });
+  }
+
+  private async getAffectedUsers(breach: DataBreach): Promise<any[]> {
+    return [];
+  }
+}
+```
+
+### 11.2 DPIA (Data Protection Impact Assessment)
+
+```typescript
+// src/gdpr/dpia.ts
+
+interface DPIASection {
+  title: string;
+  questions: string[];
+  riskLevel?: 'low' | 'medium' | 'high';
+  mitigations?: string[];
+}
+
+export function generateDPIATemplate(
+  processingActivity: string,
+  dataCategories: DataCategory[]
+): DPIASection[] {
+  return [
+    {
+      title: '1. Description of Processing',
+      questions: [
+        `What is the purpose of processing ${dataCategories.join(', ')} for ${processingActivity}?`,
+        'What is the lawful basis for this processing?',
+        'Who are the data subjects?',
+        'How long will data be retained?',
+      ],
+    },
+    {
+      title: '2. Necessity and Proportionality Assessment',
+      questions: [
+        'Is this processing necessary for the stated purpose?',
+        'Could the purpose be achieved with less data?',
+        'Are there less privacy-intrusive alternatives?',
+      ],
+    },
+    {
+      title: '3. Risk Assessment',
+      questions: [
+        'What are the risks to data subjects?',
+        'What is the likelihood of harm?',
+        'What is the severity of potential harm?',
+      ],
+      riskLevel: dataCategories.some(c =>
+        ['health', 'biometric', 'financial'].includes(c)
+      ) ? 'high' : 'medium',
+    },
+    {
+      title: '4. Mitigation Measures',
+      questions: [
+        'What technical measures will be implemented?',
+        'What organizational measures will be implemented?',
+        'How will compliance be monitored?',
+      ],
+      mitigations: [
+        'Encryption at rest and in transit',
+        'Access controls and audit logging',
+        'Data minimization',
+        'Staff training',
+        'Regular security assessments',
+      ],
+    },
+    {
+      title: '5. Consultation',
+      questions: [
+        'Was the DPO consulted?',
+        'Were data subjects consulted?',
+        'Was the supervisory authority consulted (if required)?',
+      ],
+    },
+    {
+      title: '6. Sign-off',
+      questions: [
+        'Who approved this DPIA?',
+        'When was it approved?',
+        'When will it be reviewed?',
+      ],
+    },
+  ];
+}
+```
+
+---
+
+## 12. Cross-Border Data Transfers
+
+```typescript
+// src/gdpr/cross-border.ts
+
+type TransferMechanism = 
+  | 'adequacy_decision'      // EU Commission ยืนยันว่าประเทศมีมาตรฐานเพียงพอ
+  | 'standard_contractual_clauses'  // SCCs
+  | 'binding_corporate_rules'       // BCRs สำหรับ multinational
+  | 'explicit_consent'       // ได้รับ consent จาก data subject
+  | 'vital_interests';       // จำเป็นสำหรับ vital interests
+
+interface CrossBorderTransfer {
+  destinationCountry: string;
+  transferMechanism: TransferMechanism;
+  dataCategories: DataCategory[];
+  recipientOrganization: string;
+  dpaReference?: string;
+  validUntil?: Date;
+}
+
+export const CROSS_BORDER_TRANSFERS: CrossBorderTransfer[] = [
+  {
+    destinationCountry: 'United States',
+    transferMechanism: 'standard_contractual_clauses',
+    dataCategories: ['basic_identity', 'behavioral'],
+    recipientOrganization: 'AWS (Amazon Web Services)',
+    dpaReference: 'DPA-AWS-2024-001',
+    validUntil: new Date('2025-12-31'),
+  },
+  {
+    destinationCountry: 'Japan',
+    transferMechanism: 'adequacy_decision',
+    dataCategories: ['basic_identity'],
+    recipientOrganization: 'Analytics Partner Japan Ltd.',
+    validUntil: new Date('2025-06-30'),
+  },
+];
+
+export class CrossBorderTransferService {
+  validateTransfer(transfer: CrossBorderTransfer): {
+    valid: boolean;
+    issues: string[];
+  } {
+    const issues: string[] = [];
+
+    if (transfer.validUntil && transfer.validUntil < new Date()) {
+      issues.push(`Transfer mechanism expired on ${transfer.validUntil.toISOString()}`);
+    }
+
+    if (
+      transfer.dataCategories.some(c => ['health', 'biometric'].includes(c)) &&
+      transfer.transferMechanism === 'explicit_consent'
+    ) {
+      issues.push('Special category data requires stronger safeguards than consent alone');
+    }
+
+    return {
+      valid: issues.length === 0,
+      issues,
+    };
+  }
+
+  generateTransferRecord(): string {
+    return CROSS_BORDER_TRANSFERS.map(t => `
+Country: ${t.destinationCountry}
+Mechanism: ${t.transferMechanism}
+Recipient: ${t.recipientOrganization}
+Data Categories: ${t.dataCategories.join(', ')}
+Valid Until: ${t.validUntil?.toISOString() || 'Indefinite'}
+`).join('\n---\n');
+  }
+}
+```
