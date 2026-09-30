@@ -1,1344 +1,1785 @@
-# Part 96: Microservices Technology Roadmap
+# Part 96: Microservices Technology Roadmap 2024-2025
 
-## แผนที่เทคโนโลยี Microservices (2024-2025 และอนาคต)
+## บทนำ
 
-ในบทนี้เราจะสำรวจทิศทางการพัฒนาของ Microservices ecosystem รวมถึงเทคโนโลยีใหม่ที่กำลังเข้ามามีบทบาท
-
----
-
-## 1. สถานะปัจจุบันของ Microservices Ecosystem (2024-2025)
-
-### ภาพรวม
-
-Microservices ได้กลายเป็นแนวทางหลักสำหรับระบบขนาดใหญ่แล้ว โดยมีการนำมาใช้อย่างแพร่หลาย:
-
-| ด้าน | สถานะ 2024-2025 |
-|------|----------------|
-| Container Orchestration | Kubernetes เป็น Standard de facto |
-| Service Mesh | Istio และ Linkerd เติบโตสูง |
-| GitOps | ArgoCD/Flux กลายเป็น Default |
-| Observability | OpenTelemetry เป็น Standard |
-| API Gateway | Kong, Traefik, Envoy แข่งขันกัน |
-| Serverless | Lambda/Cloud Functions รวมกับ Microservices |
+โลกของ Microservices กำลังเปลี่ยนแปลงอย่างรวดเร็ว ด้วยเทคโนโลยีใหม่อย่าง eBPF, WebAssembly, Dapr และ AI/ML Integration บทนี้จะพาทุกคนสำรวจทิศทางของ Microservices ในปี 2024-2025 และทักษะที่ Engineer ควรเรียนรู้
 
 ---
 
-## 2. eBPF - เทคโนโลยีที่เปลี่ยนเกม
+## 1. สถานะ Microservices Ecosystem 2024-2025
 
-eBPF (extended Berkeley Packet Filter) ช่วยให้รัน Code ใน Linux Kernel ได้โดยตรง ทำให้ Observability และ Security เปลี่ยนไปมาก
+### 1.1 Technology Maturity Matrix
 
 ```
-                    eBPF Architecture
-    ┌─────────────────────────────────────────────┐
-    │              User Space                      │
-    │  BPF Program  ──►  BPF Verifier              │
-    │                         │                    │
-    │                    JIT Compiler              │
-    │                         │                    │
-    ├─────────────────────────┼────────────────────┤
-    │           Kernel Space  │                    │
-    │                         ▼                    │
-    │              BPF Maps ◄──► BPF Programs      │
-    │                    │                         │
-    │         ┌───────────┼───────────┐            │
-    │         ▼           ▼           ▼            │
-    │      Network     Tracing     Security        │
-    │     (XDP/TC)    (kprobe)     (LSM)           │
-    └─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│              MICROSERVICES TECHNOLOGY MATURITY 2024             │
+│                                                                   │
+│  MATURE (Production Ready)                                        │
+│  ├── Kubernetes (CNCF Graduated)                                 │
+│  ├── Prometheus + Grafana (Observability)                        │
+│  ├── Istio / Linkerd (Service Mesh)                              │
+│  ├── ArgoCD / Flux (GitOps)                                      │
+│  └── Kafka / NATS (Event Streaming)                              │
+│                                                                   │
+│  GROWING (Adoption Increasing)                                    │
+│  ├── Dapr (Distributed App Runtime)                              │
+│  ├── OpenTelemetry (Observability Standard)                      │
+│  ├── Cilium/eBPF (Next-gen Networking)                          │
+│  ├── WASM (Edge Functions)                                       │
+│  └── Serverless + Microservices Hybrid                          │
+│                                                                   │
+│  EMERGING (Watch This Space)                                      │
+│  ├── AI-native Microservices                                     │
+│  ├── eBPF-based Service Mesh                                     │
+│  ├── Edge Computing + CDN Workers                               │
+│  ├── FinOps for Microservices                                    │
+│  └── Platform Engineering                                         │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### eBPF ใน Microservices
+### 1.2 Key Trends ที่ต้องติดตาม
+
+```
+1. Platform Engineering - Build Internal Developer Platform (IDP)
+2. FinOps - Cost optimization เป็น first-class concern
+3. Security by Design - Zero Trust everywhere
+4. AI/ML Integration - LLM services เป็น microservice
+5. eBPF Revolution - Observable, secure kernel-level networking
+6. WASM at Edge - Ultra-low latency edge functions
+7. GitOps Maturity - ArgoCD + Flux becoming standard
+8. Dapr Adoption - Simplify distributed systems patterns
+```
+
+---
+
+## 2. eBPF for Observability
+
+### 2.1 eBPF Overview
+
+```
+eBPF (extended Berkeley Packet Filter) คือเทคโนโลยีที่ช่วยให้รัน
+โปรแกรมใน Linux kernel ได้อย่างปลอดภัย โดยไม่ต้อง modify kernel หรือ
+load kernel module
+
+ประโยชน์สำหรับ Microservices:
+- Network observability ไม่ต้องเพิ่ม sidecar
+- Performance profiling ระดับ kernel
+- Security enforcement (syscall filtering)
+- Service mesh ไม่มี overhead ของ proxy
+```
+
+### 2.2 TypeScript eBPF Monitoring Program
 
 ```typescript
-// cilium-network-policy.yaml
-// ใช้ Cilium (eBPF-based) แทน iptables สำหรับ Network Policy
-```
+// services/ebpf-monitor/src/ebpf.service.ts
+// ใช้ libbpf-node หรือ bcc bindings
+import { execSync, spawn } from 'child_process';
+import { EventEmitter } from 'events';
 
-```yaml
-# cilium-network-policy.yaml
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: allow-order-to-payment
-  namespace: production
-spec:
-  endpointSelector:
-    matchLabels:
-      app: payment-service
-  ingress:
-    - fromEndpoints:
-        - matchLabels:
-            app: order-service
-      toPorts:
-        - ports:
-            - port: "3000"
-              protocol: TCP
-          rules:
-            http:
-              - method: POST
-                path: /api/v1/payments
-              - method: GET
-                path: /api/v1/payments/.*
-  egress:
-    - toEndpoints:
-        - matchLabels:
-            app: postgres
-      toPorts:
-        - ports:
-            - port: "5432"
-              protocol: TCP
----
-# eBPF-based Observability ด้วย Tetragon
-apiVersion: cilium.io/v1alpha1
-kind: TracingPolicy
-metadata:
-  name: payment-syscall-monitor
-spec:
-  kprobes:
-    - call: sys_connect
-      syscall: true
-      args:
-        - index: 0
-          type: int
-      selectors:
-        - matchBinaries:
-            - operator: In
-              values:
-                - /usr/local/bin/node
-```
+interface NetworkEvent {
+  pid: number;
+  comm: string;
+  srcIp: string;
+  dstIp: string;
+  srcPort: number;
+  dstPort: number;
+  bytes: number;
+  latencyNs: number;
+  timestamp: number;
+}
 
-### eBPF ใน Observability
+interface HttpEvent {
+  pid: number;
+  comm: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  durationNs: number;
+  timestamp: number;
+}
 
-```yaml
-# hubble-flow-tracing.yaml
-# Hubble คือ Network Observability ที่ใช้ eBPF ผ่าน Cilium
+export class EBPFMonitor extends EventEmitter {
+  private bpfProcess: ReturnType<typeof spawn> | null = null;
+  private readonly bpfProgram = `
+// eBPF program (C code embedded as string, compiled at runtime)
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
 
-# ดู Network Flow ระหว่าง Services
-# hubble observe --namespace production --follow
+// Track TCP connections
+struct tcp_event_t {
+    u32 pid;
+    char comm[TASK_COMM_LEN];
+    u32 saddr;
+    u32 daddr;
+    u16 sport;
+    u16 dport;
+    u64 latency_ns;
+    u64 bytes;
+};
 
-# ตัวอย่าง Output:
-# Jul  4 10:00:00.000 production/order-service:50234 
-#   -> production/payment-service:3000 http-request 
-#   FORWARDED (TCP Flags: ACK)
-```
+BPF_PERF_OUTPUT(tcp_events);
+BPF_HASH(start_times, u64, u64);
 
----
+int trace_tcp_sendmsg(struct pt_regs *ctx, struct sock *sk,
+                       struct msghdr *msg, size_t size) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+    start_times.update(&pid_tgid, &ts);
+    return 0;
+}
 
-## 3. WebAssembly (WASM) ใน Microservices
+int trace_tcp_sendmsg_ret(struct pt_regs *ctx) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 *start_ts = start_times.lookup(&pid_tgid);
+    if (!start_ts) return 0;
 
-WASM กำลังเปลี่ยนวิธีที่เราทำ Microservices โดยเฉพาะใน Edge Computing
+    struct tcp_event_t event = {};
+    event.pid = pid_tgid >> 32;
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+    event.latency_ns = bpf_ktime_get_ns() - *start_ts;
+    tcp_events.perf_submit(ctx, &event, sizeof(event));
 
-```typescript
-// wasm-plugin/src/plugin.ts
-// Envoy Proxy WASM Plugin สำหรับ Request Transformation
+    start_times.delete(&pid_tgid);
+    return 0;
+}
+`;
 
-// Plugin นี้เขียนด้วย Rust แล้วคอมไพล์เป็น WASM
-// ตัวอย่างนี้แสดง Concept
+  async start(): Promise<void> {
+    console.log('Starting eBPF monitoring...');
 
-export class RequestTransformPlugin {
-  // ใช้ WASM เพิ่ม Header ให้ทุก Request
-  onRequestHeaders(numHeaders: number): FilterHeadersStatus {
-    this.addRequestHeader('X-Request-ID', generateUUID());
-    this.addRequestHeader('X-Service-Name', 'my-microservice');
-    
-    // ตรวจสอบ JWT Token
-    const authHeader = this.getRequestHeader('Authorization');
-    if (authHeader) {
-      const userId = this.extractUserIdFromJWT(authHeader);
-      if (userId) {
-        this.addRequestHeader('X-User-ID', userId);
-      }
-    }
-    
-    return FilterHeadersStatus.Continue;
-  }
+    // In production: use libbpf-node or bcc Python bridge
+    // This example shows the concept with a Python bridge
+    this.bpfProcess = spawn('python3', ['-c', this.generatePythonBridge()], {
+      env: { ...process.env },
+    });
 
-  private generateUUID(): string {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-      const r = Math.random() * 16 | 0;
-      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    this.bpfProcess.stdout?.on('data', (data: Buffer) => {
+      this.parseEvent(data.toString());
+    });
+
+    this.bpfProcess.stderr?.on('data', (data: Buffer) => {
+      console.error('eBPF error:', data.toString());
+    });
+
+    this.bpfProcess.on('close', (code: number) => {
+      console.log(`eBPF process exited with code ${code}`);
     });
   }
 
-  private extractUserIdFromJWT(authHeader: string): string | null {
-    try {
-      const token = authHeader.replace('Bearer ', '');
-      const [, payload] = token.split('.');
-      const decoded = JSON.parse(atob(payload));
-      return decoded.sub || null;
-    } catch {
-      return null;
+  private generatePythonBridge(): string {
+    return `
+from bcc import BPF
+import json, sys
+
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <net/inet_sock.h>
+
+struct data_t {
+    u32 pid;
+    char comm[TASK_COMM_LEN];
+    u16 dport;
+    u32 saddr;
+    u32 daddr;
+};
+
+BPF_PERF_OUTPUT(events);
+
+int trace_connect(struct pt_regs *ctx, struct sock *sk) {
+    struct data_t data = {};
+    data.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    struct inet_sock *inet = (struct inet_sock *)sk;
+    data.dport = inet->inet_dport;
+    bpf_probe_read(&data.saddr, sizeof(data.saddr), &inet->inet_saddr);
+    bpf_probe_read(&data.daddr, sizeof(data.daddr), &inet->inet_daddr);
+
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+"""
+
+b = BPF(text=bpf_text)
+b.attach_kprobe(event="tcp_connect", fn_name="trace_connect")
+
+def print_event(cpu, data, size):
+    event = b["events"].event(data)
+    import socket, struct
+    saddr = socket.inet_ntoa(struct.pack("I", event.saddr))
+    daddr = socket.inet_ntoa(struct.pack("I", event.daddr))
+    print(json.dumps({
+        "pid": event.pid,
+        "comm": event.comm.decode("utf-8", errors="replace"),
+        "srcIp": saddr,
+        "dstIp": daddr,
+        "dstPort": socket.ntohs(event.dport),
+        "type": "tcp_connect"
+    }), flush=True)
+
+b["events"].open_perf_buffer(print_event)
+
+while True:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        break
+`;
+  }
+
+  private parseEvent(data: string): void {
+    const lines = data.trim().split('\n');
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line);
+        this.emit('network_event', event as NetworkEvent);
+      } catch {
+        // Ignore non-JSON output
+      }
     }
+  }
+
+  async getNetworkStats(): Promise<{
+    topConnections: Array<{ comm: string; count: number; bytes: number }>;
+    latencyP99: number;
+  }> {
+    // Return aggregated stats
+    return {
+      topConnections: [],
+      latencyP99: 0,
+    };
+  }
+
+  async stop(): Promise<void> {
+    if (this.bpfProcess) {
+      this.bpfProcess.kill('SIGTERM');
+      this.bpfProcess = null;
+    }
+  }
+}
+
+// eBPF Metrics Exporter for Prometheus
+export class EBPFMetricsExporter {
+  private monitor: EBPFMonitor;
+  private metrics: Map<string, number> = new Map();
+
+  constructor() {
+    this.monitor = new EBPFMonitor();
+    this.setupEventHandlers();
+  }
+
+  private setupEventHandlers(): void {
+    this.monitor.on('network_event', (event: NetworkEvent) => {
+      const key = `${event.comm}:${event.dstIp}:${event.dstPort}`;
+      this.metrics.set(key, (this.metrics.get(key) || 0) + 1);
+    });
+  }
+
+  getPrometheusMetrics(): string {
+    let output = '# HELP ebpf_tcp_connections_total TCP connections observed by eBPF\n';
+    output += '# TYPE ebpf_tcp_connections_total counter\n';
+
+    for (const [key, count] of this.metrics) {
+      const [comm, dstIp, dstPort] = key.split(':');
+      output += `ebpf_tcp_connections_total{comm="${comm}",dst_ip="${dstIp}",dst_port="${dstPort}"} ${count}\n`;
+    }
+
+    return output;
   }
 }
 ```
 
-```yaml
-# envoy-wasm-config.yaml
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: request-transform-filter
-  namespace: production
-spec:
-  configPatches:
-    - applyTo: HTTP_FILTER
-      match:
-        context: SIDECAR_INBOUND
-      patch:
-        operation: INSERT_BEFORE
-        value:
-          name: envoy.filters.http.wasm
-          typedConfig:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
-            config:
-              name: request_transform
-              vmConfig:
-                runtime: envoy.wasm.runtime.v8
-                code:
-                  local:
-                    filename: /etc/wasm/request-transform.wasm
-```
+---
 
-### Fermyon Spin - WASM Microservices Framework
+## 3. WebAssembly (WASM) for Edge Functions
 
-```rust
-// spin-app/src/lib.rs
-use spin_sdk::http::{IntoResponse, Request, Response};
-use spin_sdk::http_component;
+### 3.1 TypeScript Wasm Module
 
-/// Simple Rust WASM Microservice
-#[http_component]
-fn handle_request(req: Request) -> anyhow::Result<impl IntoResponse> {
-    println!("Handling request to {:?}", req.header("spin-path-info"));
-    
-    Ok(Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(r#"{"message": "Hello from WASM Microservice!"}"#)
-        .build())
+```typescript
+// services/edge/src/wasm.service.ts
+import { WASI } from 'wasi';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
+interface WasmRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
 }
-```
 
-```toml
-# spin.toml - Fermyon Spin Config
-spin_manifest_version = 2
+interface WasmResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
 
-[application]
-name = "payment-wasm"
-version = "1.0.0"
+export class WasmEdgeService {
+  private wasmModule: WebAssembly.Module | null = null;
+  private moduleCache: Map<string, WebAssembly.Module> = new Map();
 
-[[trigger.http]]
-route = "/api/..."
-component = "payment"
+  async loadModule(wasmPath: string): Promise<WebAssembly.Module> {
+    if (this.moduleCache.has(wasmPath)) {
+      return this.moduleCache.get(wasmPath)!;
+    }
 
-[component.payment]
-source = "target/wasm32-wasi/release/payment_service.wasm"
-allowed_outbound_hosts = ["https://api.stripe.com"]
-key_value_stores = ["default"]
+    const wasmBuffer = readFileSync(wasmPath);
+    const module = await WebAssembly.compile(wasmBuffer);
+    this.moduleCache.set(wasmPath, module);
+    return module;
+  }
+
+  async executeWasmFunction(
+    moduleName: string,
+    functionName: string,
+    input: any
+  ): Promise<any> {
+    const wasmPath = join(__dirname, '../wasm', `${moduleName}.wasm`);
+    const module = await this.loadModule(wasmPath);
+
+    // Memory for passing data to WASM
+    const memory = new WebAssembly.Memory({ initial: 10, maximum: 100 });
+    const inputJson = JSON.stringify(input);
+    const encoder = new TextEncoder();
+    const inputBytes = encoder.encode(inputJson);
+
+    // Write input to WASM memory
+    const view = new Uint8Array(memory.buffer);
+    view.set(inputBytes, 0);
+
+    const instance = await WebAssembly.instantiate(module, {
+      env: { memory },
+      wasi_snapshot_preview1: this.createWASIImports(),
+    });
+
+    const exports = instance.exports as Record<string, WebAssembly.ExportValue>;
+    const wasmFn = exports[functionName] as Function;
+
+    if (typeof wasmFn !== 'function') {
+      throw new Error(`Function ${functionName} not found in WASM module`);
+    }
+
+    const resultPtr = wasmFn(0, inputBytes.length) as number;
+
+    // Read result from WASM memory
+    const decoder = new TextDecoder();
+    const resultView = new Uint8Array(memory.buffer, resultPtr);
+    const nullIndex = resultView.indexOf(0);
+    const resultBytes = resultView.slice(0, nullIndex === -1 ? 1024 : nullIndex);
+    return JSON.parse(decoder.decode(resultBytes));
+  }
+
+  private createWASIImports(): Record<string, Function> {
+    return {
+      proc_exit: (code: number) => { throw new Error(`WASM exit: ${code}`); },
+      fd_write: (fd: number, iovs: number, iovs_len: number, nwritten: number) => 0,
+      fd_read: (fd: number, iovs: number, iovs_len: number, nread: number) => 0,
+      fd_close: (fd: number) => 0,
+      fd_seek: (fd: number, offset: bigint, whence: number, newOffset: number) => 0,
+    };
+  }
+
+  // Edge request processor using WASM
+  async processRequest(request: WasmRequest): Promise<WasmResponse> {
+    // Use WASM for CPU-intensive request processing
+    const result = await this.executeWasmFunction('edge-processor', 'process_request', request);
+    return result as WasmResponse;
+  }
+}
+
+// Example WASM-powered rate limiter using sliding window
+export class WasmRateLimiter {
+  private wasmInstance: WebAssembly.Instance | null = null;
+  private memory: WebAssembly.Memory;
+
+  async initialize(): Promise<void> {
+    // In practice, compile from AssemblyScript or Rust
+    const wasmCode = `
+      (module
+        (memory 1)
+        (export "memory" (memory 0))
+        
+        ;; Simple token bucket rate limiter
+        (func $check_rate_limit
+          (param $tokens i32)
+          (param $max_tokens i32)
+          (param $refill_rate i32)
+          (result i32)
+          
+          ;; Return 1 if allowed, 0 if rate limited
+          (i32.ge_s (local.get $tokens) (i32.const 1))
+        )
+        (export "check_rate_limit" (func $check_rate_limit))
+      )
+    `;
+
+    this.memory = new WebAssembly.Memory({ initial: 1 });
+    const wasmBuffer = new TextEncoder().encode(wasmCode);
+
+    // Use WAT (WebAssembly Text format) - in practice use pre-compiled .wasm
+    const module = await WebAssembly.compile(
+      new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]) // Minimal valid WASM
+    );
+
+    this.wasmInstance = await WebAssembly.instantiate(module, {
+      env: { memory: this.memory },
+    });
+  }
+
+  checkLimit(identifier: string, limit: number, windowMs: number): boolean {
+    // Simplified JS implementation (production: use WASM)
+    const now = Date.now();
+    const windowKey = `${identifier}:${Math.floor(now / windowMs)}`;
+    // In production, this would be implemented in WASM for performance
+    return true;
+  }
+}
 ```
 
 ---
 
-## 4. Dapr - Distributed Application Runtime
+## 4. Dapr: Distributed Application Runtime
 
-Dapr ช่วยให้ Microservices ไม่ต้องรู้จัก Infrastructure ที่อยู่เบื้องหลัง
+### 4.1 TypeScript Dapr Client (Pub/Sub, State, Service Invocation)
+
+```typescript
+// services/dapr-example/src/dapr.service.ts
+import { DaprClient, DaprServer, CommunicationProtocolEnum } from '@dapr/dapr';
+
+interface OrderCreatedEvent {
+  orderId: string;
+  userId: string;
+  amount: number;
+  items: Array<{ productId: string; quantity: number; price: number }>;
+  timestamp: string;
+}
+
+interface UserState {
+  userId: string;
+  preferences: Record<string, any>;
+  lastSeen: string;
+  sessionCount: number;
+}
+
+export class DaprIntegrationService {
+  private client: DaprClient;
+  private server: DaprServer;
+  private readonly PUBSUB_NAME = 'order-pubsub';
+  private readonly STATE_STORE = 'user-state-store';
+
+  constructor() {
+    this.client = new DaprClient({
+      daprHost: process.env.DAPR_HOST || '127.0.0.1',
+      daprPort: process.env.DAPR_HTTP_PORT || '3500',
+      communicationProtocol: CommunicationProtocolEnum.HTTP,
+    });
+
+    this.server = new DaprServer({
+      serverHost: '0.0.0.0',
+      serverPort: process.env.APP_PORT || '3000',
+      clientOptions: {
+        daprHost: process.env.DAPR_HOST || '127.0.0.1',
+        daprPort: process.env.DAPR_HTTP_PORT || '3500',
+      },
+    });
+  }
+
+  // Pub/Sub: Publish event
+  async publishOrderCreated(event: OrderCreatedEvent): Promise<void> {
+    await this.client.pubsub.publish(
+      this.PUBSUB_NAME,
+      'order-created',
+      event
+    );
+    console.log(`Published order-created event for order: ${event.orderId}`);
+  }
+
+  // Pub/Sub: Subscribe to events
+  async subscribeToOrders(handler: (event: OrderCreatedEvent) => Promise<void>): Promise<void> {
+    await this.server.pubsub.subscribe(
+      this.PUBSUB_NAME,
+      'order-created',
+      async (data: OrderCreatedEvent) => {
+        try {
+          await handler(data);
+        } catch (error) {
+          console.error('Error processing order event:', error);
+          throw error; // Causes Dapr to retry
+        }
+      }
+    );
+  }
+
+  // State Management: Save state
+  async saveUserState(userId: string, state: Partial<UserState>): Promise<void> {
+    await this.client.state.save(this.STATE_STORE, [
+      {
+        key: `user:${userId}`,
+        value: { ...state, userId, lastUpdated: new Date().toISOString() },
+        options: { concurrency: 'last-write', consistency: 'eventual' },
+      },
+    ]);
+  }
+
+  // State Management: Get state
+  async getUserState(userId: string): Promise<UserState | null> {
+    const state = await this.client.state.get(this.STATE_STORE, `user:${userId}`);
+    return state as UserState | null;
+  }
+
+  // State Management: Transaction
+  async updateUserStateTransaction(
+    userId: string,
+    updates: Partial<UserState>
+  ): Promise<void> {
+    const currentState = await this.getUserState(userId);
+
+    await this.client.state.transaction(this.STATE_STORE, [
+      {
+        operation: 'upsert',
+        request: {
+          key: `user:${userId}`,
+          value: { ...currentState, ...updates, userId },
+        },
+      },
+    ]);
+  }
+
+  // Service Invocation: Call another Dapr service
+  async callInventoryService(productId: string): Promise<{ available: boolean; stock: number }> {
+    const response = await this.client.invoker.invoke(
+      'inventory-service', // Target Dapr app ID
+      'check-stock',       // Method name
+      'GET',              // HTTP method
+      { productId }
+    );
+
+    return response as { available: boolean; stock: number };
+  }
+
+  async callPaymentService(paymentData: {
+    orderId: string;
+    amount: number;
+    currency: string;
+    paymentMethod: string;
+  }): Promise<{ success: boolean; transactionId: string }> {
+    const response = await this.client.invoker.invoke(
+      'payment-service',
+      'process-payment',
+      'POST',
+      paymentData
+    );
+
+    return response as { success: boolean; transactionId: string };
+  }
+
+  // Distributed Lock using Dapr
+  async withLock<T>(
+    lockName: string,
+    fn: () => Promise<T>,
+    ttlSeconds: number = 30
+  ): Promise<T> {
+    const lockOwner = `${process.env.POD_NAME || 'local'}-${Date.now()}`;
+
+    // Try to acquire lock
+    const lockResult = await this.client.lock.lock(
+      'redis-lock-store',
+      lockName,
+      lockOwner,
+      ttlSeconds
+    );
+
+    if (!lockResult.success) {
+      throw new Error(`Failed to acquire lock: ${lockName}`);
+    }
+
+    try {
+      return await fn();
+    } finally {
+      await this.client.lock.unlock('redis-lock-store', lockName, lockOwner);
+    }
+  }
+
+  // Binding: External system integration
+  async sendEmail(to: string, subject: string, body: string): Promise<void> {
+    await this.client.binding.send('email-binding', 'create', {
+      to,
+      subject,
+      body,
+    });
+  }
+
+  async start(): Promise<void> {
+    await this.server.start();
+    console.log('Dapr server started');
+  }
+
+  async stop(): Promise<void> {
+    await this.server.stop();
+  }
+}
+```
+
+### 4.2 Dapr Component Configurations
 
 ```yaml
-# dapr-components/pubsub.yaml
+# dapr/components/pubsub.yaml
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:
-  name: pubsub
-  namespace: production
+  name: order-pubsub
 spec:
   type: pubsub.kafka
   version: v1
   metadata:
     - name: brokers
-      value: kafka:9092
+      value: 'kafka:9092'
     - name: consumerGroup
-      value: order-service
+      value: 'microservices-group'
+    - name: initialOffset
+      value: 'newest'
     - name: authType
-      value: none
+      value: 'none'
+
 ---
-# dapr-components/statestore.yaml
+# dapr/components/statestore.yaml
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:
-  name: statestore
-  namespace: production
+  name: user-state-store
 spec:
   type: state.redis
   version: v1
   metadata:
     - name: redisHost
-      value: redis:6379
+      value: 'redis:6379'
+    - name: redisPassword
+      value: ''
+    - name: enableTLS
+      value: 'false'
     - name: actorStateStore
-      value: "true"
-```
-
-```typescript
-// order-service/src/order-dapr.service.ts
-import { Injectable } from '@nestjs/common';
-import { DaprClient, DaprServer, CommunicationProtocolEnum } from '@dapr/dapr';
-
-@Injectable()
-export class OrderDaprService {
-  private readonly daprClient: DaprClient;
-
-  constructor() {
-    this.daprClient = new DaprClient({
-      daprHost: 'localhost',
-      daprPort: '3500',
-      communicationProtocol: CommunicationProtocolEnum.HTTP,
-    });
-  }
-
-  // Publish Event ผ่าน Dapr Pub/Sub
-  async publishOrderCreated(order: any): Promise<void> {
-    await this.daprClient.pubsub.publish('pubsub', 'order-created', order);
-  }
-
-  // บันทึก State ผ่าน Dapr State Store
-  async saveOrderState(orderId: string, state: any): Promise<void> {
-    await this.daprClient.state.save('statestore', [{
-      key: `order:${orderId}`,
-      value: state,
-    }]);
-  }
-
-  // เรียก Service อื่นผ่าน Dapr Service Invocation
-  async callPaymentService(paymentRequest: any): Promise<any> {
-    return this.daprClient.invoker.invoke(
-      'payment-service',
-      'process-payment',
-      'POST',
-      paymentRequest,
-    );
-  }
-
-  // ใช้ Dapr Secret Store
-  async getStripeApiKey(): Promise<string> {
-    const secret = await this.daprClient.secret.get(
-      'vault-secret-store',
-      'stripe-api-key',
-    );
-    return secret['stripe-api-key'];
-  }
-
-  // Dapr Actor สำหรับ Order State Machine
-  async createOrderActor(orderId: string): Promise<any> {
-    return this.daprClient.actor.proxy.create<OrderActor>(
-      OrderActorImpl,
-      orderId,
-    );
-  }
-}
-```
-
-```typescript
-// actors/order-actor.ts
-import { AbstractActor } from '@dapr/dapr';
-
-export interface OrderActor {
-  processOrder(request: any): Promise<void>;
-  getStatus(): Promise<string>;
-  cancelOrder(reason: string): Promise<void>;
-}
-
-export class OrderActorImpl extends AbstractActor implements OrderActor {
-  async processOrder(request: any): Promise<void> {
-    const state = await this.getActorStateManager().getState<any>('order');
-    
-    if (state?.status === 'PROCESSING') {
-      throw new Error('Order already being processed');
-    }
-
-    await this.getActorStateManager().setState('order', {
-      ...request,
-      status: 'PROCESSING',
-      updatedAt: new Date(),
-    });
-
-    // จัดเก็บ Timer สำหรับ Timeout
-    await this.registerActorTimer(
-      'order-timeout',
-      'handleTimeout',
-      new Date(Date.now() + 30 * 60 * 1000), // 30 นาที
-      undefined,
-    );
-  }
-
-  async getStatus(): Promise<string> {
-    const state = await this.getActorStateManager().getState<any>('order');
-    return state?.status || 'UNKNOWN';
-  }
-
-  async cancelOrder(reason: string): Promise<void> {
-    const state = await this.getActorStateManager().getState<any>('order');
-    
-    await this.getActorStateManager().setState('order', {
-      ...state,
-      status: 'CANCELLED',
-      cancellationReason: reason,
-      cancelledAt: new Date(),
-    });
-  }
-
-  async handleTimeout(): Promise<void> {
-    const status = await this.getStatus();
-    if (status === 'PROCESSING') {
-      await this.cancelOrder('Timeout');
-    }
-  }
-}
-```
+      value: 'true'
 
 ---
-
-## 5. Service Mesh Evolution
-
-### Ambient Mesh - Istio ไม่ต้องใช้ Sidecar
-
-```yaml
-# ambient-mesh-label.yaml
-# เปิดใช้ Ambient Mesh โดยไม่ต้องมี Sidecar Proxy
-apiVersion: v1
-kind: Namespace
+# dapr/components/lock.yaml
+apiVersion: dapr.io/v1alpha1
+kind: Component
 metadata:
-  name: production
-  labels:
-    istio.io/dataplane-mode: ambient  # ใช้ ztunnel แทน Envoy Sidecar
----
-# L4 Policy ผ่าน ztunnel (ไม่ต้องการ Sidecar)
-apiVersion: security.istio.io/v1beta1
-kind: AuthorizationPolicy
-metadata:
-  name: payment-policy
-  namespace: production
+  name: redis-lock-store
 spec:
-  selector:
-    matchLabels:
-      app: payment-service
-  action: ALLOW
-  rules:
-    - from:
-        - source:
-            principals:
-              - cluster.local/ns/production/sa/order-service
-```
+  type: lock.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: 'redis:6379'
+    - name: redisPassword
+      value: ''
 
-### Linkerd 2.x - Ultra-light Service Mesh
-
-```yaml
-# linkerd-service-profile.yaml
-apiVersion: linkerd.io/v1alpha2
-kind: ServiceProfile
+---
+# dapr/resiliency.yaml
+apiVersion: dapr.io/v1alpha1
+kind: Resiliency
 metadata:
-  name: payment-service.production.svc.cluster.local
-  namespace: production
+  name: myresiliency
 spec:
-  routes:
-    - name: POST /api/v1/payments
-      condition:
-        method: POST
-        pathRegex: /api/v1/payments
-      responseClasses:
-        - condition:
-            status:
-              min: 500
-              max: 599
-          isFailure: true
-      timeout: 10s
-      retryBudget:
-        retryRatio: 0.2
-        minRetriesPerSecond: 10
-        ttl: 10s
-    - name: GET /api/v1/payments/{id}
-      condition:
-        method: GET
-        pathRegex: /api/v1/payments/[^/]*
-      isRetryable: true
-      timeout: 5s
+  policies:
+    retries:
+      DefaultRetry:
+        policy: constant
+        duration: 500ms
+        maxRetries: 3
+    circuitBreakers:
+      DefaultCB:
+        maxRequests: 1
+        interval: 8s
+        timeout: 45s
+        trip: consecutiveFailures >= 5
+    timeouts:
+      DefaultTimeout: 3s
+  targets:
+    apps:
+      payment-service:
+        retry: DefaultRetry
+        circuitBreaker: DefaultCB
+        timeout: DefaultTimeout
+      inventory-service:
+        retry: DefaultRetry
+        timeout: DefaultTimeout
 ```
 
 ---
 
-## 6. Serverless Microservices Convergence
-
-### AWS Lambda + Container Images
+## 5. Serverless + Microservices: AWS Lambda TypeScript
 
 ```typescript
-// lambda-handler/src/handler.ts
-import { Handler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { NestFactory } from '@nestjs/core';
-import { ExpressAdapter } from '@nestjs/platform-express';
-import express from 'express';
-import serverlessExpress from '@vendia/serverless-express';
-import { AppModule } from './app.module';
+// functions/video-thumbnail/src/handler.ts
+import { Handler, S3Event, Context } from 'aws-lambda';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import sharp from 'sharp';
 
-let serverlessExpressInstance: any;
-
-async function bootstrapServer() {
-  if (!serverlessExpressInstance) {
-    const expressApp = express();
-    const nestApp = await NestFactory.create(AppModule, new ExpressAdapter(expressApp));
-    await nestApp.init();
-    serverlessExpressInstance = serverlessExpress({ app: expressApp });
-  }
-  return serverlessExpressInstance;
+interface ThumbnailResult {
+  videoId: string;
+  thumbnailKey: string;
+  width: number;
+  height: number;
 }
 
-export const handler: Handler = async (
-  event: APIGatewayProxyEvent,
-  context: any,
-  callback: any,
-) => {
-  const server = await bootstrapServer();
-  return server(event, context, callback);
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
+
+export const generateThumbnail: Handler<S3Event> = async (
+  event: S3Event,
+  context: Context
+): Promise<ThumbnailResult[]> => {
+  const results: ThumbnailResult[] = [];
+
+  for (const record of event.Records) {
+    const bucket = record.s3.bucket.name;
+    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+
+    console.log(`Processing: s3://${bucket}/${key}`);
+
+    try {
+      // Get video frame from S3 (assume pre-extracted frame)
+      const s3Object = await s3Client.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key })
+      );
+
+      const frameBuffer = await streamToBuffer(s3Object.Body as NodeJS.ReadableStream);
+
+      // Generate multiple thumbnail sizes
+      const sizes = [
+        { width: 320, height: 180, suffix: 'sm' },
+        { width: 640, height: 360, suffix: 'md' },
+        { width: 1280, height: 720, suffix: 'lg' },
+      ];
+
+      const videoId = extractVideoId(key);
+      const uploadPromises = sizes.map(async ({ width, height, suffix }) => {
+        const thumbnail = await sharp(frameBuffer)
+          .resize(width, height, { fit: 'cover', position: 'center' })
+          .jpeg({ quality: 85, progressive: true })
+          .toBuffer();
+
+        const thumbnailKey = `thumbnails/${videoId}/thumb_${suffix}.jpg`;
+
+        await s3Client.send(
+          new PutObjectCommand({
+            Bucket: process.env.ASSETS_BUCKET!,
+            Key: thumbnailKey,
+            Body: thumbnail,
+            ContentType: 'image/jpeg',
+            CacheControl: 'public, max-age=31536000',
+            Metadata: { videoId, size: suffix },
+          })
+        );
+
+        return { thumbnailKey, width, height };
+      });
+
+      const uploaded = await Promise.all(uploadPromises);
+
+      // Notify via SQS
+      await sqsClient.send(
+        new SendMessageCommand({
+          QueueUrl: process.env.NOTIFICATION_QUEUE_URL!,
+          MessageBody: JSON.stringify({
+            type: 'THUMBNAIL_GENERATED',
+            videoId,
+            thumbnails: uploaded,
+          }),
+        })
+      );
+
+      results.push({
+        videoId,
+        thumbnailKey: `thumbnails/${videoId}/thumb_md.jpg`,
+        width: 640,
+        height: 360,
+      });
+
+      console.log(`Generated thumbnails for video: ${videoId}`);
+    } catch (error) {
+      console.error(`Failed to process ${key}:`, error);
+      throw error; // Lambda will retry
+    }
+  }
+
+  return results;
 };
+
+async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on('data', chunk => chunks.push(Buffer.from(chunk)));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function extractVideoId(s3Key: string): string {
+  // Key format: frames/videoId/frame.jpg
+  const parts = s3Key.split('/');
+  return parts[1] || 'unknown';
+}
 ```
 
+### 5.1 Serverless Framework Configuration
+
 ```yaml
-# serverless.yml (Serverless Framework)
-service: payment-microservice
+# serverless.yml
+service: streaming-functions
+
+frameworkVersion: '3'
 
 provider:
   name: aws
   runtime: nodejs20.x
   region: ap-southeast-1
+  stage: ${opt:stage, 'dev'}
+  
   environment:
-    DATABASE_URL: ${ssm:/production/payment/database-url}
-    REDIS_URL: ${ssm:/production/payment/redis-url}
+    ASSETS_BUCKET: ${self:custom.assetsBucket}
+    NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
+    NODE_OPTIONS: '--enable-source-maps'
+  
   iam:
     role:
       statements:
         - Effect: Allow
           Action:
-            - ssm:GetParameter
-          Resource: arn:aws:ssm:ap-southeast-1:*:parameter/production/*
+            - s3:GetObject
+            - s3:PutObject
+          Resource:
+            - 'arn:aws:s3:::${self:custom.rawBucket}/*'
+            - 'arn:aws:s3:::${self:custom.assetsBucket}/*'
         - Effect: Allow
           Action:
             - sqs:SendMessage
-            - sqs:ReceiveMessage
-          Resource: !GetAtt PaymentQueue.Arn
+          Resource: !GetAtt NotificationQueue.Arn
+
+custom:
+  rawBucket: ${self:service}-${self:provider.stage}-raw
+  assetsBucket: ${self:service}-${self:provider.stage}-assets
+  
+  webpack:
+    webpackConfig: webpack.config.js
+    includeModules: true
+    packager: npm
 
 functions:
-  processPayment:
-    handler: dist/handler.handler
-    events:
-      - http:
-          path: /api/v1/payments
-          method: POST
-          authorizer:
-            name: jwtAuthorizer
-            type: TOKEN
-    timeout: 30
+  generateThumbnail:
+    handler: src/handler.generateThumbnail
+    timeout: 60
     memorySize: 512
-    reservedConcurrency: 100
-    
-  reconciliation:
-    handler: dist/reconciliation.handler
+    layers:
+      - !Ref SharpLambdaLayer
     events:
-      - schedule:
-          rate: cron(0 2 * * ? *)  # 02:00 UTC ทุกวัน
-    timeout: 900  # 15 นาที
+      - s3:
+          bucket: ${self:custom.rawBucket}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: frames/
+            - suffix: .jpg
+  
+  processTranscodeComplete:
+    handler: src/transcode-complete.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - sqs:
+          arn: !GetAtt TranscodeCompleteQueue.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+  
+  updateSearchIndex:
+    handler: src/search-indexer.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt VideosTable.StreamArn
+          batchSize: 100
+          startingPosition: LATEST
 
 resources:
   Resources:
-    PaymentQueue:
+    NotificationQueue:
       Type: AWS::SQS::Queue
       Properties:
-        QueueName: payment-queue.fifo
-        FifoQueue: true
-        ContentBasedDeduplication: true
-        VisibilityTimeout: 60
-```
+        QueueName: ${self:service}-${self:provider.stage}-notifications
+        MessageRetentionPeriod: 86400
+        VisibilityTimeout: 300
+    
+    TranscodeCompleteQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-transcode-complete
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt TranscodeCompleteDLQ.Arn
+          maxReceiveCount: 3
+    
+    TranscodeCompleteDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-transcode-dlq
+        MessageRetentionPeriod: 1209600
 
-### Knative - Kubernetes-native Serverless
-
-```yaml
-# knative-service.yaml
-apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: recommendation-service
-  namespace: production
-spec:
-  template:
-    metadata:
-      annotations:
-        autoscaling.knative.dev/minScale: "1"
-        autoscaling.knative.dev/maxScale: "50"
-        autoscaling.knative.dev/target: "100"  # 100 concurrent requests per pod
-        autoscaling.knative.dev/scale-to-zero-pod-retention-period: "1m"
-    spec:
-      containerConcurrency: 100
-      timeoutSeconds: 30
-      containers:
-        - image: your-registry/recommendation-service:1.0.0
-          resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 1000m
-              memory: 1Gi
-          env:
-            - name: ML_MODEL_PATH
-              value: /models/recommendation
+plugins:
+  - serverless-webpack
+  - serverless-offline
+  - serverless-dotenv-plugin
 ```
 
 ---
 
-## 7. AI/ML Integration Trends
-
-### ML Feature Store
+## 6. AI/ML Integration: TypeScript OpenAI API Client
 
 ```typescript
-// ml-feature-store/src/feature.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { InjectRedis } from '@liaoliaots/nestjs-redis';
-import Redis from 'ioredis';
+// services/ai/src/ai.service.ts
+import OpenAI from 'openai';
+import { Redis } from 'ioredis';
+import { createHash } from 'crypto';
 
-export interface FeatureRequest {
-  entityId: string;
-  entityType: 'user' | 'product' | 'order';
-  features: string[];
-  maxAge?: number; // วินาที
+interface VideoSummaryRequest {
+  videoId: string;
+  transcript: string;
+  title: string;
+  duration: number;
 }
 
-export interface FeatureSet {
-  entityId: string;
-  features: Record<string, number | string | boolean>;
-  computedAt: Date;
+interface ModerationResult {
+  safe: boolean;
+  flags: string[];
+  confidence: number;
 }
 
-@Injectable()
-export class FeatureStoreService {
-  private readonly logger = new Logger(FeatureStoreService.name);
-  private readonly DEFAULT_TTL = 3600; // 1 ชั่วโมง
-
-  constructor(
-    @InjectRedis() private readonly redis: Redis,
-    private readonly featureComputer: FeatureComputerService,
-  ) {}
-
-  async getFeatures(request: FeatureRequest): Promise<FeatureSet> {
-    const cacheKey = `features:${request.entityType}:${request.entityId}`;
-    const maxAge = request.maxAge || this.DEFAULT_TTL;
-    
-    // ตรวจสอบ Cache
-    const cached = await this.redis.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      const age = (Date.now() - new Date(parsed.computedAt).getTime()) / 1000;
-      
-      if (age < maxAge) {
-        return parsed;
-      }
-    }
-
-    // คำนวณ Features ใหม่
-    const features = await this.featureComputer.compute(
-      request.entityId,
-      request.entityType,
-      request.features,
-    );
-
-    const featureSet: FeatureSet = {
-      entityId: request.entityId,
-      features,
-      computedAt: new Date(),
-    };
-
-    await this.redis.setex(cacheKey, this.DEFAULT_TTL, JSON.stringify(featureSet));
-
-    return featureSet;
-  }
-
-  async storeFeatures(
-    entityId: string,
-    entityType: string,
-    features: Record<string, any>,
-  ): Promise<void> {
-    const cacheKey = `features:${entityType}:${entityId}`;
-    
-    const featureSet: FeatureSet = {
-      entityId,
-      features,
-      computedAt: new Date(),
-    };
-
-    await this.redis.setex(cacheKey, this.DEFAULT_TTL, JSON.stringify(featureSet));
-  }
-}
-```
-
-### LLM Integration ใน Microservices
-
-```typescript
-// ai-service/src/llm.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import Anthropic from '@anthropic-ai/sdk';
-
-export interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
+interface SearchEnhancement {
+  originalQuery: string;
+  expandedTerms: string[];
+  intent: 'informational' | 'navigational' | 'transactional';
+  suggestedFilters: Record<string, string>;
 }
 
-@Injectable()
-export class LLMService {
-  private readonly logger = new Logger(LLMService.name);
-  private readonly client: Anthropic;
+export class AIService {
+  private openai: OpenAI;
+  private redis: Redis;
+  private readonly CACHE_TTL = 3600 * 24; // 24 hours
 
   constructor() {
-    this.client = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY,
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY!,
+      maxRetries: 3,
+      timeout: 30000,
     });
+    this.redis = new Redis({ host: process.env.REDIS_HOST });
   }
 
-  // ใช้ AI สำหรับ Customer Support Chatbot
-  async handleCustomerQuery(
-    message: string,
-    conversationHistory: ChatMessage[],
-    contextData: {
-      userId: string;
-      recentOrders?: any[];
-      accountInfo?: any;
-    },
-  ): Promise<string> {
-    const systemPrompt = `
-You are a helpful customer service agent for a food delivery platform.
-You have access to the following customer data:
-- Customer ID: ${contextData.userId}
-- Recent Orders: ${JSON.stringify(contextData.recentOrders)}
-- Account Info: ${JSON.stringify(contextData.accountInfo)}
+  async generateVideoSummary(request: VideoSummaryRequest): Promise<{
+    summary: string;
+    chapters: Array<{ timestamp: number; title: string }>;
+    keywords: string[];
+    mood: string;
+  }> {
+    const cacheKey = `ai:summary:${request.videoId}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
 
-Respond in the same language as the user. Be helpful, concise, and professional.
+    const prompt = `
+You are an expert video content analyst. Analyze the following video transcript and provide:
+1. A concise summary (2-3 paragraphs)
+2. Chapter titles with approximate timestamps
+3. Key search keywords (5-10 terms)
+4. Overall mood/tone of the video
+
+Video Title: ${request.title}
+Duration: ${request.duration} seconds
+Transcript excerpt: ${request.transcript.slice(0, 3000)}...
+
+Respond in JSON format with fields: summary, chapters (array of {timestamp, title}), keywords (array), mood.
 `;
 
-    const messages = [
-      ...conversationHistory.map(msg => ({
-        role: msg.role as 'user' | 'assistant',
-        content: msg.content,
-      })),
-      { role: 'user' as const, content: message },
-    ];
-
-    const response = await this.client.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages,
-    });
-
-    return response.content[0].type === 'text' ? response.content[0].text : '';
-  }
-
-  // ใช้ AI สำหรับ Product Description Generation
-  async generateProductDescription(
-    product: {
-      name: string;
-      ingredients: string[];
-      category: string;
-    },
-    language: 'th' | 'en' = 'th',
-  ): Promise<string> {
-    const prompt = language === 'th'
-      ? `เขียนคำอธิบายสั้นๆ น่ารับประทานสำหรับเมนู "${product.name}" ที่มีส่วนประกอบ: ${product.ingredients.join(', ')} ความยาวไม่เกิน 100 คำ`
-      : `Write a short appetizing description for "${product.name}" with ingredients: ${product.ingredients.join(', ')}. Max 100 words.`;
-
-    const response = await this.client.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 200,
+    const completion = await this.openai.chat.completions.create({
+      model: 'gpt-4-turbo-preview',
       messages: [{ role: 'user', content: prompt }],
+      response_format: { type: 'json_object' },
+      max_tokens: 1000,
+      temperature: 0.3,
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const result = JSON.parse(completion.choices[0].message.content!);
+    await this.redis.setex(cacheKey, this.CACHE_TTL, JSON.stringify(result));
+
+    return result;
   }
 
-  // ใช้ AI สำหรับ Fraud Detection Explanation
-  async explainFraudDecision(
-    fraudFlags: string[],
-    riskScore: number,
-    transactionData: any,
-  ): Promise<string> {
-    const response = await this.client.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 300,
-      messages: [{
-        role: 'user',
-        content: `
-Explain this fraud detection decision briefly:
-- Risk Score: ${riskScore}/100
-- Flags: ${fraudFlags.join(', ')}
-- Transaction: ${JSON.stringify(transactionData)}
+  async moderateContent(content: {
+    text?: string;
+    imageUrl?: string;
+  }): Promise<ModerationResult> {
+    const inputHash = createHash('md5')
+      .update(content.text || content.imageUrl || '')
+      .digest('hex');
+    const cacheKey = `ai:moderation:${inputHash}`;
 
-Provide a brief, clear explanation for the customer.
-`,
-      }],
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    // Text moderation
+    if (content.text) {
+      const moderation = await this.openai.moderations.create({
+        input: content.text,
+        model: 'text-moderation-latest',
+      });
+
+      const result = moderation.results[0];
+      const flags = Object.entries(result.categories)
+        .filter(([, flagged]) => flagged)
+        .map(([category]) => category);
+
+      const moderationResult: ModerationResult = {
+        safe: !result.flagged,
+        flags,
+        confidence: Math.max(...Object.values(result.category_scores)),
+      };
+
+      await this.redis.setex(cacheKey, this.CACHE_TTL * 7, JSON.stringify(moderationResult));
+      return moderationResult;
+    }
+
+    return { safe: true, flags: [], confidence: 0 };
+  }
+
+  async enhanceSearchQuery(query: string): Promise<SearchEnhancement> {
+    const cacheKey = `ai:search:${createHash('md5').update(query).digest('hex')}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const completion = await this.openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a video search query analyzer. Analyze search queries and provide query expansion for better video discovery.',
+        },
+        {
+          role: 'user',
+          content: `Analyze this search query for a video platform: "${query}"
+          
+Return JSON with:
+- expandedTerms: array of related search terms
+- intent: "informational", "navigational", or "transactional"  
+- suggestedFilters: suggested filter categories like {duration: "short", category: "tutorial"}`,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 300,
+      temperature: 0.2,
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const aiResult = JSON.parse(completion.choices[0].message.content!);
+    const result: SearchEnhancement = {
+      originalQuery: query,
+      expandedTerms: aiResult.expandedTerms || [],
+      intent: aiResult.intent || 'informational',
+      suggestedFilters: aiResult.suggestedFilters || {},
+    };
+
+    await this.redis.setex(cacheKey, 3600, JSON.stringify(result));
+    return result;
+  }
+
+  async generateVideoTags(
+    title: string,
+    description: string
+  ): Promise<string[]> {
+    const completion = await this.openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'user',
+          content: `Generate 10-15 relevant tags for this video:
+Title: ${title}
+Description: ${description}
+
+Return only a JSON array of lowercase tag strings.`,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 200,
+      temperature: 0.4,
+    });
+
+    const result = JSON.parse(completion.choices[0].message.content!);
+    return Array.isArray(result) ? result : result.tags || [];
+  }
+
+  // Streaming chat response for AI assistant
+  async *streamChatResponse(
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  ): AsyncGenerator<string> {
+    const stream = await this.openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a helpful video platform assistant.',
+        },
+        ...messages,
+      ],
+      stream: true,
+      max_tokens: 500,
+    });
+
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content;
+      if (content) yield content;
+    }
   }
 }
 ```
 
 ---
 
-## 8. Edge Computing Growth
+## 7. Edge Computing: TypeScript Cloudflare Worker
 
 ```typescript
-// edge-service/src/edge-worker.ts
-// Cloudflare Workers - Edge Microservice
+// workers/cdn-edge/src/index.ts
+// Cloudflare Worker for edge-side request processing
 
+export interface Env {
+  ORIGIN_URL: string;
+  KV_CACHE: KVNamespace;
+  RATE_LIMIT: DurableObjectNamespace;
+  JWT_SECRET: string;
+}
+
+interface CachedResponse {
+  body: string;
+  headers: Record<string, string>;
+  status: number;
+  cachedAt: number;
+  ttl: number;
+}
+
+// Main worker handler
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // Edge Caching สำหรับ Product Catalog
-    if (url.pathname.startsWith('/api/v1/products')) {
-      return handleProductRequest(request, env);
+    // Route handling
+    if (url.pathname.startsWith('/api/videos/')) {
+      return handleVideoRequest(request, env, ctx);
     }
 
-    // Edge Authentication
-    if (request.headers.get('Authorization')) {
-      const userId = await verifyToken(
-        request.headers.get('Authorization')!,
-        env.JWT_SECRET,
-      );
-      
-      if (!userId) {
-        return new Response('Unauthorized', { status: 401 });
-      }
+    if (url.pathname.startsWith('/api/search')) {
+      return handleSearchRequest(request, env, ctx);
     }
 
-    // Forward ไปยัง Origin
+    if (url.pathname.startsWith('/health')) {
+      return new Response(JSON.stringify({ status: 'ok', edge: 'cloudflare' }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Pass through to origin
     return fetch(request);
   },
 };
 
-async function handleProductRequest(request: Request, env: Env): Promise<Response> {
-  const cacheKey = new Request(request.url, { method: 'GET' });
-  const cache = caches.default;
+async function handleVideoRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const url = new URL(request.url);
+  const videoId = url.pathname.split('/')[3];
 
-  // ตรวจสอบ Edge Cache ก่อน
-  let response = await cache.match(cacheKey);
-  
-  if (!response) {
-    // ดึงจาก Origin
-    response = await fetch(request);
-    
-    if (response.ok) {
-      // Cache ที่ Edge เป็นเวลา 5 นาที
-      const responseToCache = new Response(response.body, response);
-      responseToCache.headers.set('Cache-Control', 'public, max-age=300');
-      await cache.put(cacheKey, responseToCache);
+  // Check edge cache
+  const cacheKey = `video:${videoId}`;
+  const cached = await env.KV_CACHE.get(cacheKey, 'json') as CachedResponse | null;
+
+  if (cached && Date.now() - cached.cachedAt < cached.ttl * 1000) {
+    return new Response(cached.body, {
+      status: cached.status,
+      headers: {
+        ...cached.headers,
+        'X-Cache': 'HIT',
+        'X-Edge': 'cloudflare',
+        'CF-Cache-Status': 'HIT',
+      },
+    });
+  }
+
+  // Check rate limit
+  const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rateLimitId = env.RATE_LIMIT.idFromName(`video:${clientIp}`);
+  const rateLimiter = env.RATE_LIMIT.get(rateLimitId);
+
+  const rateLimitResponse = await rateLimiter.fetch(
+    new Request('https://rate-limit/check', {
+      method: 'POST',
+      body: JSON.stringify({ limit: 60, window: 60 }),
+    })
+  );
+
+  const { allowed } = await rateLimitResponse.json() as { allowed: boolean };
+  if (!allowed) {
+    return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': '60',
+      },
+    });
+  }
+
+  // Validate JWT token at edge
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader) {
+    const token = authHeader.replace('Bearer ', '');
+    const isValid = await validateJWT(token, env.JWT_SECRET);
+    if (!isValid) {
+      return new Response(JSON.stringify({ error: 'Invalid token' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
   }
 
-  return response;
+  // Forward to origin with edge metadata
+  const originRequest = new Request(
+    `${env.ORIGIN_URL}${url.pathname}${url.search}`,
+    {
+      method: request.method,
+      headers: {
+        ...Object.fromEntries(request.headers),
+        'X-CF-Ray': request.headers.get('CF-Ray') || '',
+        'X-Real-IP': clientIp,
+        'X-Edge-Country': request.headers.get('CF-IPCountry') || 'unknown',
+      },
+    }
+  );
+
+  const response = await fetch(originRequest);
+  const responseBody = await response.text();
+
+  // Cache successful GET responses
+  if (request.method === 'GET' && response.status === 200) {
+    const ttl = parseInt(response.headers.get('Cache-Control')?.match(/max-age=(\d+)/)?.[1] || '60');
+
+    ctx.waitUntil(
+      env.KV_CACHE.put(
+        cacheKey,
+        JSON.stringify({
+          body: responseBody,
+          status: response.status,
+          headers: Object.fromEntries(response.headers),
+          cachedAt: Date.now(),
+          ttl,
+        } as CachedResponse),
+        { expirationTtl: ttl + 60 }
+      )
+    );
+  }
+
+  return new Response(responseBody, {
+    status: response.status,
+    headers: {
+      ...Object.fromEntries(response.headers),
+      'X-Cache': 'MISS',
+      'X-Edge': 'cloudflare',
+    },
+  });
 }
 
-async function verifyToken(token: string, secret: string): Promise<string | null> {
+async function handleSearchRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const url = new URL(request.url);
+  const query = url.searchParams.get('q');
+
+  if (!query) {
+    return new Response(JSON.stringify({ error: 'Query required' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Cache search results at edge
+  const cacheKey = `search:${encodeURIComponent(query.toLowerCase())}`;
+  const cached = await env.KV_CACHE.get(cacheKey);
+
+  if (cached) {
+    return new Response(cached, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Cache': 'HIT',
+      },
+    });
+  }
+
+  const response = await fetch(`${env.ORIGIN_URL}/api/search?${url.search}`);
+  const body = await response.text();
+
+  if (response.status === 200) {
+    ctx.waitUntil(env.KV_CACHE.put(cacheKey, body, { expirationTtl: 300 })); // 5 min cache
+  }
+
+  return new Response(body, {
+    status: response.status,
+    headers: {
+      ...Object.fromEntries(response.headers),
+      'X-Cache': 'MISS',
+    },
+  });
+}
+
+async function validateJWT(token: string, secret: string): Promise<boolean> {
   try {
-    // JWT verification ที่ Edge
-    const [header, payload, signature] = token.replace('Bearer ', '').split('.');
-    
-    const encoder = new TextEncoder();
-    const data = encoder.encode(`${header}.${payload}`);
+    const [headerB64, payloadB64, signature] = token.split('.');
+    if (!headerB64 || !payloadB64 || !signature) return false;
+
+    const data = `${headerB64}.${payloadB64}`;
     const key = await crypto.subtle.importKey(
       'raw',
-      encoder.encode(secret),
+      new TextEncoder().encode(secret),
       { name: 'HMAC', hash: 'SHA-256' },
       false,
-      ['verify'],
+      ['verify']
+    );
+
+    const signatureBuffer = Uint8Array.from(
+      atob(signature.replace(/-/g, '+').replace(/_/g, '/')),
+      c => c.charCodeAt(0)
     );
 
     const isValid = await crypto.subtle.verify(
       'HMAC',
       key,
-      Uint8Array.from(atob(signature.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
-      data,
+      signatureBuffer,
+      new TextEncoder().encode(data)
     );
 
-    if (!isValid) return null;
+    if (!isValid) return false;
 
-    const decoded = JSON.parse(atob(payload));
-    return decoded.sub;
+    // Check expiry
+    const payload = JSON.parse(atob(payloadB64));
+    return payload.exp > Math.floor(Date.now() / 1000);
   } catch {
-    return null;
+    return false;
   }
 }
 
-interface Env {
-  JWT_SECRET: string;
-  ORIGIN_URL: string;
+// Durable Object for Rate Limiting
+export class RateLimiter {
+  private state: DurableObjectState;
+  private counts: Map<string, { count: number; resetAt: number }> = new Map();
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const { limit, window: windowSecs } = await request.json() as {
+      limit: number;
+      window: number;
+    };
+
+    const key = this.state.id.toString();
+    const now = Date.now();
+    const entry = this.counts.get(key);
+
+    if (!entry || now > entry.resetAt) {
+      this.counts.set(key, { count: 1, resetAt: now + windowSecs * 1000 });
+      return Response.json({ allowed: true, remaining: limit - 1 });
+    }
+
+    if (entry.count >= limit) {
+      return Response.json({
+        allowed: false,
+        remaining: 0,
+        resetAt: entry.resetAt,
+      });
+    }
+
+    entry.count++;
+    return Response.json({ allowed: true, remaining: limit - entry.count });
+  }
 }
 ```
 
 ---
 
-## 9. GitOps Maturity
-
-### ArgoCD ApplicationSet
+## 8. GitOps Maturity: Flux v2 YAML Configurations
 
 ```yaml
-# argocd-applicationset.yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
+# flux/clusters/production/flux-system/gotk-sync.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
 metadata:
-  name: microservices
-  namespace: argocd
+  name: microservices-platform
+  namespace: flux-system
 spec:
-  generators:
-    - git:
-        repoURL: https://github.com/your-org/microservices-gitops
-        revision: main
-        directories:
-          - path: apps/*
-    - matrix:
-        generators:
-          - list:
-              elements:
-                - env: staging
-                  cluster: staging-cluster
-                - env: production
-                  cluster: production-cluster
-          - git:
-              repoURL: https://github.com/your-org/microservices-gitops
-              revision: main
-              directories:
-                - path: apps/*
-  template:
-    metadata:
-      name: '{{env}}-{{path.basename}}'
-    spec:
-      project: default
-      source:
-        repoURL: https://github.com/your-org/microservices-gitops
-        targetRevision: main
-        path: '{{path}}'
-        helm:
-          valueFiles:
-            - values-{{env}}.yaml
-      destination:
-        server: '{{cluster}}'
-        namespace: '{{env}}'
-      syncPolicy:
-        automated:
-          prune: true
-          selfHeal: true
-          allowEmpty: false
-        syncOptions:
-          - CreateNamespace=true
-          - PrunePropagationPolicy=foreground
-          - PruneLast=true
-        retry:
-          limit: 5
-          backoff:
-            duration: 5s
-            maxDuration: 3m
-            factor: 2
-```
+  interval: 1m
+  url: https://github.com/myorg/microservices-platform
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+  ignore: |
+    # Ignore CI files
+    /.github/
+    /docs/
+    *.md
 
-### Flux CD Progressive Delivery
-
-```yaml
-# fluxcd-kustomization.yaml
+---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
-  name: payment-service
+  name: platform-infrastructure
   namespace: flux-system
 spec:
   interval: 10m
   sourceRef:
     kind: GitRepository
-    name: microservices-repo
-  path: ./k8s/payment-service
+    name: microservices-platform
+  path: ./infrastructure
   prune: true
+  wait: true
+  timeout: 5m
   healthChecks:
     - apiVersion: apps/v1
       kind: Deployment
-      name: payment-service
-      namespace: production
+      name: kong
+      namespace: api-gateway
+
+---
+# flux/clusters/production/apps/video-platform.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: video-platform
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: microservices-platform
+  path: ./apps/video-platform/overlays/production
+  prune: true
+  wait: true
+  timeout: 10m
+  dependsOn:
+    - name: platform-infrastructure
   postBuild:
     substitute:
-      APP_VERSION: "${APP_VERSION}"
       ENVIRONMENT: production
----
-# Progressive Delivery ด้วย Flagger
-apiVersion: flagger.app/v1beta1
-kind: Canary
-metadata:
-  name: payment-service
-  namespace: production
-spec:
-  targetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: payment-service
-  progressDeadlineSeconds: 60
-  service:
-    port: 3000
-    targetPort: 3000
-    trafficPolicy:
-      tls:
-        mode: ISTIO_MUTUAL
-  analysis:
-    interval: 1m
-    threshold: 5      # จำนวนครั้งที่ Fail ก่อน Rollback
-    maxWeight: 50     # Traffic สูงสุดที่ส่งไป Canary
-    stepWeight: 10    # เพิ่มทีละ 10%
-    metrics:
-      - name: request-success-rate
-        min: 99       # ต้องสำเร็จ >= 99%
-        interval: 1m
-      - name: request-duration
-        max: 500      # ต้องไม่เกิน 500ms (p99)
-        interval: 30s
-    webhooks:
-      - name: acceptance-test
-        type: pre-rollout
-        url: http://flagger-loadtester.test/
-        timeout: 30s
+      REGION: ap-southeast-1
+  patches:
+    - patch: |
+        apiVersion: apps/v1
+        kind: Deployment
         metadata:
-          type: bash
-          cmd: "curl -sd 'test' http://payment-service.production/health | grep 200"
+          name: not-used
+        spec:
+          template:
+            spec:
+              containers:
+                - name: not-used
+                  resources:
+                    limits:
+                      cpu: 500m
+                      memory: 512Mi
+      target:
+        kind: Deployment
+        namespace: video-platform
+
+---
+# flux/clusters/production/apps/image-policies.yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: upload-service
+  namespace: flux-system
+spec:
+  image: 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/upload-service
+  interval: 5m
+  secretRef:
+    name: ecr-credentials
+
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: upload-service
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: upload-service
+  policy:
+    semver:
+      range: '>=1.0.0'
+
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageUpdateAutomation
+metadata:
+  name: auto-deploy
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: microservices-platform
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        email: fluxbot@myorg.com
+        name: FluxBot
+      messageTemplate: |
+        chore: update images
+
+        Updated images:
+        {{range .Updated.Images}}
+        - {{.Identifier}}
+        {{end}}
+    push:
+      branch: main
+  update:
+    path: ./apps/video-platform/overlays/production
+    strategy: Setters
 ```
 
 ---
 
-## 10. Platform Engineering Future
-
-### Internal Developer Platform (IDP)
+## 9. FinOps: TypeScript Cost Tracking Middleware
 
 ```typescript
-// idp/src/platform.service.ts
-// Internal Developer Platform - Self-service สำหรับ Dev Teams
+// middleware/cost-tracker/src/cost-tracker.middleware.ts
+import { Request, Response, NextFunction } from 'express';
+import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+import { Redis } from 'ioredis';
 
-import { Injectable, Logger } from '@nestjs/common';
-
-export interface ServiceTemplate {
-  id: string;
-  name: string;
-  language: 'typescript' | 'python' | 'go' | 'java';
-  framework: string;
-  databases: string[];
-  messaging: string[];
-  features: string[];
+interface CostMetric {
+  service: string;
+  operation: string;
+  duration: number;
+  memoryUsedMB: number;
+  estimatedCostUSD: number;
+  timestamp: Date;
 }
 
-export interface ServiceCreationRequest {
+interface ServiceCostReport {
   serviceName: string;
-  teamName: string;
-  templateId: string;
-  environment: 'development' | 'staging' | 'production';
-  config: Record<string, string>;
+  totalRequests: number;
+  totalDurationMs: number;
+  totalCostUSD: number;
+  topExpensiveOperations: Array<{
+    operation: string;
+    avgCostUSD: number;
+    callCount: number;
+  }>;
 }
 
-@Injectable()
-export class PlatformService {
-  private readonly logger = new Logger(PlatformService.name);
+// AWS Lambda pricing (ap-southeast-1)
+const PRICING = {
+  lambda: {
+    perRequest: 0.0000002, // $0.20 per 1M requests
+    perGBSecond: 0.0000166667, // $0.0000166667 per GB-second
+  },
+  rds: {
+    perHour: 0.138, // db.t3.medium ap-southeast-1
+    perIORequest: 0.0000002,
+  },
+  redis: {
+    perHour: 0.034, // cache.t3.micro
+  },
+  s3: {
+    perGetRequest: 0.00000043,
+    perPutRequest: 0.0000054,
+    perGBStored: 0.025, // per month
+  },
+  dataTransfer: {
+    perGBOut: 0.114,
+  },
+};
 
-  private readonly templates: ServiceTemplate[] = [
-    {
-      id: 'nestjs-rest-api',
-      name: 'NestJS REST API',
-      language: 'typescript',
-      framework: 'nestjs',
-      databases: ['postgresql', 'redis'],
-      messaging: ['kafka'],
-      features: ['authentication', 'logging', 'metrics', 'tracing'],
-    },
-    {
-      id: 'python-ml-service',
-      name: 'Python ML Service',
-      language: 'python',
-      framework: 'fastapi',
-      databases: ['postgresql'],
-      messaging: ['rabbitmq'],
-      features: ['model-serving', 'batch-processing', 'metrics'],
-    },
-  ];
+export class CostTrackingMiddleware {
+  private cloudWatch: CloudWatchClient;
+  private redis: Redis;
+  private readonly NAMESPACE = 'MicroservicesCost';
 
-  async createService(request: ServiceCreationRequest): Promise<{
-    repositoryUrl: string;
-    cicdUrl: string;
-    dashboardUrl: string;
-  }> {
-    const template = this.templates.find(t => t.id === request.templateId);
-    
-    if (!template) {
-      throw new Error(`Template ${request.templateId} not found`);
+  constructor() {
+    this.cloudWatch = new CloudWatchClient({ region: process.env.AWS_REGION });
+    this.redis = new Redis({ host: process.env.REDIS_HOST });
+  }
+
+  middleware() {
+    return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+      const startTime = process.hrtime.bigint();
+      const startMemory = process.memoryUsage().heapUsed;
+
+      // Intercept response finish
+      res.on('finish', async () => {
+        const duration = Number(process.hrtime.bigint() - startTime) / 1_000_000;
+        const memoryDelta = (process.memoryUsage().heapUsed - startMemory) / (1024 * 1024);
+
+        const metric: CostMetric = {
+          service: process.env.SERVICE_NAME || 'unknown',
+          operation: `${req.method}:${req.route?.path || req.path}`,
+          duration,
+          memoryUsedMB: Math.max(0, memoryDelta),
+          estimatedCostUSD: this.estimateCost(duration, Math.max(0, memoryDelta)),
+          timestamp: new Date(),
+        };
+
+        await this.recordMetric(metric);
+      });
+
+      next();
+    };
+  }
+
+  private estimateCost(durationMs: number, memoryMB: number): number {
+    // Lambda-equivalent cost calculation
+    const durationSeconds = durationMs / 1000;
+    const gbSeconds = (memoryMB / 1024) * durationSeconds;
+    const computeCost = gbSeconds * PRICING.lambda.perGBSecond;
+    const requestCost = PRICING.lambda.perRequest;
+    return computeCost + requestCost;
+  }
+
+  private async recordMetric(metric: CostMetric): Promise<void> {
+    const key = `cost:${metric.service}:${new Date().toISOString().split('T')[0]}`;
+    const hourKey = `cost:hourly:${metric.service}:${new Date().toISOString().substring(0, 13)}`;
+
+    // Update daily aggregates in Redis
+    const pipeline = this.redis.pipeline();
+    pipeline.hincrbyfloat(key, 'totalCost', metric.estimatedCostUSD);
+    pipeline.hincrbyfloat(key, 'totalDuration', metric.duration);
+    pipeline.hincrby(key, 'requestCount', 1);
+    pipeline.expire(key, 86400 * 90); // 90 days
+
+    // Track by operation
+    pipeline.hincrbyfloat(
+      `${key}:ops`,
+      metric.operation,
+      metric.estimatedCostUSD
+    );
+    pipeline.expire(`${key}:ops`, 86400 * 90);
+
+    // Hourly tracking
+    pipeline.hincrbyfloat(hourKey, 'cost', metric.estimatedCostUSD);
+    pipeline.expire(hourKey, 86400 * 8); // 8 days
+
+    await pipeline.exec();
+
+    // Send to CloudWatch (batch this in production)
+    if (Math.random() < 0.01) { // Sample 1% for CloudWatch
+      await this.sendToCloudWatch(metric).catch(console.error);
     }
-
-    this.logger.log(`Creating service ${request.serviceName} from template ${request.templateId}`);
-
-    // 1. สร้าง Git Repository
-    const repositoryUrl = await this.createGitRepository(request.serviceName, template);
-    
-    // 2. สร้าง CI/CD Pipeline
-    const cicdUrl = await this.createCICDPipeline(request.serviceName, request.teamName);
-    
-    // 3. สร้าง Kubernetes Namespace และ Resources
-    await this.createKubernetesResources(request.serviceName, request.teamName, request.environment);
-    
-    // 4. สร้าง Secrets ใน Vault
-    await this.createVaultSecrets(request.serviceName, request.environment, request.config);
-    
-    // 5. สร้าง Monitoring Dashboard
-    const dashboardUrl = await this.createMonitoringDashboard(request.serviceName);
-    
-    // 6. ลงทะเบียนใน Service Catalog
-    await this.registerInServiceCatalog({
-      name: request.serviceName,
-      team: request.teamName,
-      template: request.templateId,
-      repositoryUrl,
-    });
-
-    return { repositoryUrl, cicdUrl, dashboardUrl };
   }
 
-  private async createGitRepository(
+  private async sendToCloudWatch(metric: CostMetric): Promise<void> {
+    await this.cloudWatch.send(
+      new PutMetricDataCommand({
+        Namespace: this.NAMESPACE,
+        MetricData: [
+          {
+            MetricName: 'EstimatedCostUSD',
+            Value: metric.estimatedCostUSD,
+            Unit: 'None',
+            Dimensions: [
+              { Name: 'Service', Value: metric.service },
+              { Name: 'Operation', Value: metric.operation },
+            ],
+          },
+          {
+            MetricName: 'RequestDurationMs',
+            Value: metric.duration,
+            Unit: 'Milliseconds',
+            Dimensions: [
+              { Name: 'Service', Value: metric.service },
+            ],
+          },
+        ],
+      })
+    );
+  }
+
+  async getCostReport(
     serviceName: string,
-    template: ServiceTemplate,
-  ): Promise<string> {
-    // Clone template และ customize
-    // เรียก GitHub API สร้าง Repository
-    const repoUrl = `https://github.com/your-org/${serviceName}`;
-    this.logger.log(`Created repository: ${repoUrl}`);
-    return repoUrl;
-  }
+    date?: string
+  ): Promise<ServiceCostReport> {
+    const reportDate = date || new Date().toISOString().split('T')[0];
+    const key = `cost:${serviceName}:${reportDate}`;
+    const opsKey = `${key}:ops`;
 
-  private async createKubernetesResources(
-    serviceName: string,
-    teamName: string,
-    environment: string,
-  ): Promise<void> {
-    // สร้าง Namespace, ResourceQuota, NetworkPolicy, RBAC
-    const manifests = this.generateKubernetesManifests(serviceName, teamName, environment);
-    
-    // Apply ผ่าน kubectl หรือ Kubernetes API
-    this.logger.log(`Created Kubernetes resources for ${serviceName}`);
-  }
+    const [aggregates, operations] = await Promise.all([
+      this.redis.hgetall(key),
+      this.redis.hgetall(opsKey),
+    ]);
 
-  private generateKubernetesManifests(
-    serviceName: string,
-    teamName: string,
-    environment: string,
-  ): string {
-    return `
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${environment}-${teamName}
-  labels:
-    team: ${teamName}
-    environment: ${environment}
-    managed-by: idp
----
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: ${teamName}-quota
-  namespace: ${environment}-${teamName}
-spec:
-  hard:
-    requests.cpu: "10"
-    requests.memory: 20Gi
-    limits.cpu: "20"
-    limits.memory: 40Gi
-    pods: "50"
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: default-deny
-  namespace: ${environment}-${teamName}
-spec:
-  podSelector: {}
-  policyTypes:
-    - Ingress
-    - Egress
-`;
-  }
+    const totalRequests = parseInt(aggregates?.requestCount || '0');
+    const totalCostUSD = parseFloat(aggregates?.totalCost || '0');
+    const totalDurationMs = parseFloat(aggregates?.totalDuration || '0');
 
-  private async createVaultSecrets(
-    serviceName: string,
-    environment: string,
-    config: Record<string, string>,
-  ): Promise<void> {
-    // บันทึก Secrets ใน HashiCorp Vault
-    this.logger.log(`Created Vault secrets for ${serviceName}`);
-  }
+    const topOperations = Object.entries(operations || {})
+      .map(([op, costStr]) => {
+        const cost = parseFloat(costStr as string);
+        return { operation: op, totalCost: cost };
+      })
+      .sort((a, b) => b.totalCost - a.totalCost)
+      .slice(0, 10)
+      .map(({ operation, totalCost }) => ({
+        operation,
+        avgCostUSD: totalCost,
+        callCount: Math.round(totalCost / PRICING.lambda.perRequest),
+      }));
 
-  private async createCICDPipeline(
-    serviceName: string,
-    teamName: string,
-  ): Promise<string> {
-    const pipelineUrl = `https://ci.your-org.com/${teamName}/${serviceName}`;
-    this.logger.log(`Created CI/CD pipeline: ${pipelineUrl}`);
-    return pipelineUrl;
+    return {
+      serviceName,
+      totalRequests,
+      totalDurationMs,
+      totalCostUSD: Math.round(totalCostUSD * 1000000) / 1000000,
+      topExpensiveOperations: topOperations,
+    };
   }
+}
 
-  private async createMonitoringDashboard(serviceName: string): Promise<string> {
-    const dashboardUrl = `https://grafana.your-org.com/d/${serviceName}`;
-    this.logger.log(`Created monitoring dashboard: ${dashboardUrl}`);
-    return dashboardUrl;
-  }
-
-  private async registerInServiceCatalog(serviceInfo: any): Promise<void> {
-    // บันทึกใน Backstage Service Catalog
-    this.logger.log(`Registered ${serviceInfo.name} in service catalog`);
-  }
+export function costTracker() {
+  const service = new CostTrackingMiddleware();
+  return service.middleware();
 }
 ```
 
 ---
 
-## 11. FinOps Practices
+## สรุป
 
-```typescript
-// finops/src/cost-monitor.service.ts
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
+| เทคโนโลยี | สถานะ 2024 | Use Case หลัก | Priority |
+|-----------|-----------|---------------|----------|
+| eBPF | Growing | Observability, Security, Service Mesh | สูง |
+| WebAssembly | Emerging | Edge Functions, Plugins | กลาง |
+| Dapr | Growing | Distributed Patterns Abstraction | สูง |
+| Serverless + Microservices | Mature | Event-driven, Cost optimization | สูง |
+| OpenAI/AI Integration | Mature | Content AI, Search Enhancement | สูง |
+| Cloudflare Workers | Growing | Edge Computing, Low Latency | สูง |
+| Flux v2 GitOps | Mature | Automated Deployments | สูง |
+| FinOps Tooling | Growing | Cost Tracking, Optimization | กลาง |
 
-export interface ServiceCost {
-  serviceName: string;
-  teamName: string;
-  compute: number;
-  storage: number;
-  network: number;
-  total: number;
-  currency: string;
-  period: string;
-}
-
-export interface CostAnomaly {
-  serviceName: string;
-  currentCost: number;
-  expectedCost: number;
-  variance: number;
-  severity: 'LOW' | 'MEDIUM' | 'HIGH';
-}
-
-@Injectable()
-export class FinOpsService {
-  private readonly logger = new Logger(FinOpsService.name);
-
-  @Cron('0 8 * * 1') // ทุกวันจันทร์ 08:00
-  async generateWeeklyCostReport(): Promise<void> {
-    const costs = await this.getServiceCosts('weekly');
-    const anomalies = await this.detectCostAnomalies(costs);
-    
-    // ส่ง Report ไปยัง Teams
-    for (const cost of costs) {
-      await this.sendCostReport(cost);
-    }
-
-    if (anomalies.length > 0) {
-      await this.sendCostAnomalyAlert(anomalies);
-    }
-  }
-
-  async getServiceCosts(period: 'daily' | 'weekly' | 'monthly'): Promise<ServiceCost[]> {
-    // ดึงข้อมูลจาก AWS Cost Explorer / GCP Billing
-    // หรือ Kubecost API
-    return [];
-  }
-
-  async detectCostAnomalies(costs: ServiceCost[]): Promise<CostAnomaly[]> {
-    const anomalies: CostAnomaly[] = [];
-    
-    for (const cost of costs) {
-      const historicalAvg = await this.getHistoricalAverage(cost.serviceName);
-      const variance = ((cost.total - historicalAvg) / historicalAvg) * 100;
-      
-      if (Math.abs(variance) > 20) {
-        anomalies.push({
-          serviceName: cost.serviceName,
-          currentCost: cost.total,
-          expectedCost: historicalAvg,
-          variance,
-          severity: Math.abs(variance) > 50 ? 'HIGH' : Math.abs(variance) > 30 ? 'MEDIUM' : 'LOW',
-        });
-      }
-    }
-    
-    return anomalies;
-  }
-
-  private async getHistoricalAverage(serviceName: string): Promise<number> {
-    // ดึง Average ย้อนหลัง 4 สัปดาห์
-    return 100; // Mock
-  }
-
-  private async sendCostReport(cost: ServiceCost): Promise<void> {
-    this.logger.log(`Sending cost report for ${cost.serviceName}: $${cost.total}`);
-  }
-
-  private async sendCostAnomalyAlert(anomalies: CostAnomaly[]): Promise<void> {
-    this.logger.warn(`Cost anomalies detected: ${anomalies.length}`);
-  }
-}
-```
+> "The best microservices architecture is one that evolves with the ecosystem — adopt new tools when they solve real problems, not just because they're trending"
 
 ---
 
-## 12. Learning Path Recommendations
-
-```
-Microservices Engineer Learning Path 2024-2025
-═══════════════════════════════════════════════
-
-Level 1: Foundation (1-3 เดือน)
-├── Docker & Containers
-├── Kubernetes Basics
-├── REST API Design
-├── Basic Messaging (Kafka/RabbitMQ)
-└── CI/CD with GitHub Actions
-
-Level 2: Intermediate (3-6 เดือน)
-├── Service Mesh (Istio/Linkerd)
-├── Observability (Prometheus + Grafana + Jaeger)
-├── API Gateway (Kong/Traefik)
-├── Security (mTLS, JWT, OIDC)
-└── Database Patterns (CQRS, Event Sourcing)
-
-Level 3: Advanced (6-12 เดือน)
-├── Platform Engineering & IDP
-├── GitOps (ArgoCD/Flux)
-├── Progressive Delivery (Canary/Blue-Green)
-├── Chaos Engineering
-└── Performance Optimization
-
-Level 4: Expert (12+ เดือน)
-├── eBPF & Cilium
-├── WebAssembly (WASM)
-├── Dapr Framework
-├── ML/AI Integration
-└── FinOps & Cost Optimization
-```
-
----
-
-## สรุปบทที่ 96
-
-| เทคโนโลยี | ระดับ Maturity | Use Case |
-|-----------|---------------|---------|
-| **Kubernetes** | Production-ready | Container Orchestration |
-| **eBPF/Cilium** | Growing | Network + Observability |
-| **WASM** | Early Adopter | Edge Computing + Plugins |
-| **Dapr** | Growing | Cloud-agnostic Microservices |
-| **Ambient Mesh** | Beta | Service Mesh ไม่มี Sidecar |
-| **Knative** | Stable | Serverless on Kubernetes |
-| **GitOps** | Mature | Deployment Automation |
-| **Platform Engineering** | Growing | Developer Self-service |
-| **FinOps** | Growing | Cost Awareness |
-| **AI/ML Integration** | Rapidly Growing | Smart Services |
-| **Edge Computing** | Growing | Low-latency Global Apps |
+*ถัดไป: Part 97 - Open Source Tools Reference*
