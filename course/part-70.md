@@ -1,375 +1,471 @@
-# Part 70: Data Consistency Patterns
+# Part 70: Data Consistency Patterns in Microservices
 
 ## บทนำ
 
-ใน distributed systems การ maintain data consistency เป็นเรื่องที่ท้าทาย เพราะเราต้องเลือกระหว่าง consistency, availability, และ partition tolerance (CAP theorem) ใน Part นี้เราจะเรียนรู้ patterns ต่างๆ สำหรับจัดการ data consistency ใน microservices
+ใน Microservices Architecture การจัดการ Data Consistency เป็นความท้าทายหลักที่สำคัญ เพราะแต่ละ service มี database ของตัวเอง การรักษาความสอดคล้องของข้อมูลข้ามหลาย service จึงต้องใช้ pattern และกลยุทธ์ที่เหมาะสม บทนี้จะครอบคลุมทั้ง Eventual Consistency, Strong Consistency, CAP theorem, Vector Clocks, CRDTs และอื่นๆ
 
 ---
 
-## 1. Eventual Consistency Strategies
+## 1. Eventual Consistency Patterns
 
-Eventual consistency หมายความว่าระบบจะ consistent ในที่สุด แต่ไม่ได้ consistent ทันที
+### แนวคิด Eventual Consistency
 
-```typescript
-// eventual-consistency/event-driven-sync.ts
-import { Pool } from "pg";
-import { Redis } from "ioredis";
-
-// State machine สำหรับ order consistency
-type OrderStatus =
-  | "pending"
-  | "inventory_reserved"
-  | "payment_processing"
-  | "payment_completed"
-  | "fulfillment_started"
-  | "shipped"
-  | "delivered"
-  | "failed"
-  | "cancelled";
-
-interface OrderStateTransition {
-  fromStatus: OrderStatus;
-  toStatus: OrderStatus;
-  event: string;
-  compensation?: string;
-}
-
-const orderStateTransitions: OrderStateTransition[] = [
-  { fromStatus: "pending", toStatus: "inventory_reserved", event: "INVENTORY_RESERVED" },
-  { fromStatus: "inventory_reserved", toStatus: "payment_processing", event: "PAYMENT_INITIATED" },
-  { fromStatus: "payment_processing", toStatus: "payment_completed", event: "PAYMENT_COMPLETED" },
-  { fromStatus: "payment_processing", toStatus: "failed", event: "PAYMENT_FAILED", compensation: "RELEASE_INVENTORY" },
-  { fromStatus: "payment_completed", toStatus: "fulfillment_started", event: "FULFILLMENT_STARTED" },
-  { fromStatus: "fulfillment_started", toStatus: "shipped", event: "ORDER_SHIPPED" },
-  { fromStatus: "shipped", toStatus: "delivered", event: "ORDER_DELIVERED" },
-];
-
-class OrderStateMachine {
-  private readonly validTransitions: Map<string, OrderStateTransition>;
-
-  constructor() {
-    this.validTransitions = new Map();
-    for (const transition of orderStateTransitions) {
-      this.validTransitions.set(
-        `${transition.fromStatus}:${transition.event}`,
-        transition
-      );
-    }
-  }
-
-  isValidTransition(currentStatus: OrderStatus, event: string): boolean {
-    return this.validTransitions.has(`${currentStatus}:${event}`);
-  }
-
-  getNextStatus(currentStatus: OrderStatus, event: string): OrderStatus | null {
-    const transition = this.validTransitions.get(`${currentStatus}:${event}`);
-    return transition?.toStatus ?? null;
-  }
-
-  getCompensation(currentStatus: OrderStatus, event: string): string | undefined {
-    const transition = this.validTransitions.get(`${currentStatus}:${event}`);
-    return transition?.compensation;
-  }
-}
-
-// Event store สำหรับ order events
-class OrderEventStore {
-  constructor(private readonly db: Pool) {}
-
-  async appendEvent(
-    orderId: string,
-    event: string,
-    payload: Record<string, unknown>
-  ): Promise<void> {
-    await this.db.query(
-      `INSERT INTO order_events (order_id, event_type, payload, created_at)
-       VALUES ($1, $2, $3, NOW())`,
-      [orderId, event, JSON.stringify(payload)]
-    );
-  }
-
-  async getEvents(orderId: string): Promise<OrderEvent[]> {
-    const result = await this.db.query(
-      `SELECT * FROM order_events WHERE order_id = $1 ORDER BY id ASC`,
-      [orderId]
-    );
-    return result.rows;
-  }
-
-  // Rebuild state from events (Event Sourcing)
-  async rebuildState(orderId: string): Promise<Order> {
-    const events = await this.getEvents(orderId);
-    return events.reduce((order, event) => applyEvent(order, event), createEmptyOrder(orderId));
-  }
-}
-
-// Idempotent event processing
-class IdempotentEventProcessor {
-  constructor(
-    private readonly redis: Redis,
-    private readonly db: Pool
-  ) {}
-
-  async process(
-    eventId: string,
-    handler: () => Promise<void>
-  ): Promise<boolean> {
-    const lockKey = `processed:${eventId}`;
-
-    // Check if already processed
-    const alreadyProcessed = await this.redis.get(lockKey);
-    if (alreadyProcessed) {
-      console.log(`Event ${eventId} already processed, skipping`);
-      return false;
-    }
-
-    // Process the event
-    await handler();
-
-    // Mark as processed (with TTL for cleanup)
-    await this.redis.set(lockKey, "1", "EX", 86400); // 24 hours TTL
-
-    return true;
-  }
-}
-```
-
----
-
-## 2. Conflict Resolution Strategies
-
-### Last Write Wins (LWW)
+Eventual Consistency หมายถึงระบบที่ยอมให้ข้อมูลชั่วคราวไม่สอดคล้องกัน แต่รับประกันว่าในที่สุดข้อมูลจะสอดคล้องกันทั้งหมด เหมาะสำหรับระบบที่ต้องการ High Availability สูง
 
 ```typescript
-// conflict-resolution/lww.ts
+// eventual-consistency-example.ts
+// ตัวอย่าง: ระบบ User Profile ที่ใช้ Eventual Consistency
 
-interface VersionedDocument<T> {
-  data: T;
-  timestamp: number;  // Unix timestamp milliseconds
-  nodeId: string;
+import { EventEmitter } from 'events';
+import Redis from 'ioredis';
+import { Pool } from 'pg';
+
+interface UserProfile {
+  userId: string;
+  name: string;
+  email: string;
+  updatedAt: Date;
+}
+
+interface DomainEvent {
+  eventId: string;
+  eventType: string;
+  aggregateId: string;
+  payload: Record<string, unknown>;
+  occurredAt: Date;
   version: number;
 }
 
-class LWWRegister<T> {
-  private current: VersionedDocument<T> | null = null;
+class UserProfileService {
+  private redis: Redis;
+  private db: Pool;
+  private eventBus: EventEmitter;
 
-  write(value: T, nodeId: string): VersionedDocument<T> {
-    const doc: VersionedDocument<T> = {
-      data: value,
-      timestamp: Date.now(),
-      nodeId,
-      version: (this.current?.version ?? 0) + 1,
+  constructor(redis: Redis, db: Pool) {
+    this.redis = redis;
+    this.db = db;
+    this.eventBus = new EventEmitter();
+    this.setupEventHandlers();
+  }
+
+  private setupEventHandlers(): void {
+    // รับฟัง event จาก service อื่น
+    this.eventBus.on('order.created', async (event: DomainEvent) => {
+      await this.handleOrderCreated(event);
+    });
+
+    this.eventBus.on('payment.processed', async (event: DomainEvent) => {
+      await this.handlePaymentProcessed(event);
+    });
+  }
+
+  async updateProfile(userId: string, updates: Partial<UserProfile>): Promise<void> {
+    // บันทึกลง Primary DB
+    await this.db.query(
+      'UPDATE users SET name=$1, email=$2, updated_at=$3 WHERE id=$4',
+      [updates.name, updates.email, new Date(), userId]
+    );
+
+    // Emit event สำหรับ services อื่น (Eventual Consistency)
+    const event: DomainEvent = {
+      eventId: crypto.randomUUID(),
+      eventType: 'user.profile.updated',
+      aggregateId: userId,
+      payload: updates,
+      occurredAt: new Date(),
+      version: 1,
     };
 
-    // Last write wins: higher timestamp wins
-    if (!this.current || doc.timestamp > this.current.timestamp) {
-      this.current = doc;
-    } else if (
-      doc.timestamp === this.current.timestamp &&
-      doc.nodeId > this.current.nodeId  // Tiebreak by node ID
-    ) {
-      this.current = doc;
-    }
+    // บันทึก event ลง event store
+    await this.publishEvent(event);
 
-    return doc;
+    // Invalidate cache (อาจยัง stale ชั่วคราว)
+    await this.redis.del(`user:profile:${userId}`);
   }
 
-  read(): VersionedDocument<T> | null {
-    return this.current;
+  private async publishEvent(event: DomainEvent): Promise<void> {
+    // บันทึก event ลง Redis Stream
+    await this.redis.xadd(
+      'user-events',
+      '*',
+      'eventId', event.eventId,
+      'eventType', event.eventType,
+      'aggregateId', event.aggregateId,
+      'payload', JSON.stringify(event.payload),
+      'occurredAt', event.occurredAt.toISOString(),
+      'version', String(event.version)
+    );
   }
 
-  merge(remote: VersionedDocument<T>): void {
-    if (!this.current) {
-      this.current = remote;
-      return;
-    }
+  private async handleOrderCreated(event: DomainEvent): Promise<void> {
+    // อัพเดท user stats แบบ async (eventual consistency)
+    const { userId } = event.payload as { userId: string };
+    await this.db.query(
+      'UPDATE user_stats SET order_count = order_count + 1 WHERE user_id = $1',
+      [userId]
+    );
+  }
 
-    if (remote.timestamp > this.current.timestamp) {
-      this.current = remote;
-    } else if (
-      remote.timestamp === this.current.timestamp &&
-      remote.nodeId > this.current.nodeId
-    ) {
-      this.current = remote;
-    }
+  private async handlePaymentProcessed(event: DomainEvent): Promise<void> {
+    const { userId, amount } = event.payload as { userId: string; amount: number };
+    await this.db.query(
+      'UPDATE user_stats SET total_spend = total_spend + $1 WHERE user_id = $2',
+      [amount, userId]
+    );
   }
 }
 
-// ตัวอย่าง: User profile sync across regions
-class UserProfileService {
-  private readonly registers: Map<string, LWWRegister<UserProfile>>;
+// Outbox Pattern สำหรับ Reliable Event Publishing
+class OutboxPattern {
+  private db: Pool;
+  private redis: Redis;
 
-  constructor() {
-    this.registers = new Map();
+  constructor(db: Pool, redis: Redis) {
+    this.db = db;
+    this.redis = redis;
   }
 
-  updateProfile(userId: string, profile: UserProfile, nodeId: string): void {
-    let register = this.registers.get(userId);
-    if (!register) {
-      register = new LWWRegister<UserProfile>();
-      this.registers.set(userId, register);
+  async saveWithOutbox<T>(
+    entity: T,
+    events: DomainEvent[],
+    tableName: string
+  ): Promise<void> {
+    const client = await this.db.connect();
+    
+    try {
+      await client.query('BEGIN');
+
+      // บันทึก entity
+      // (สมมติว่ามี query สำหรับ insert/update)
+
+      // บันทึก events ลง outbox table (ใน transaction เดียวกัน)
+      for (const event of events) {
+        await client.query(
+          `INSERT INTO outbox_events 
+           (event_id, event_type, aggregate_id, payload, occurred_at, processed)
+           VALUES ($1, $2, $3, $4, $5, false)`,
+          [
+            event.eventId,
+            event.eventType,
+            event.aggregateId,
+            JSON.stringify(event.payload),
+            event.occurredAt
+          ]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-    register.write(profile, nodeId);
   }
 
-  getProfile(userId: string): UserProfile | null {
-    return this.registers.get(userId)?.read()?.data ?? null;
-  }
+  // Outbox Processor - รัน background process
+  async processOutbox(): Promise<void> {
+    while (true) {
+      const { rows } = await this.db.query<{
+        event_id: string;
+        event_type: string;
+        aggregate_id: string;
+        payload: string;
+        occurred_at: Date;
+      }>(
+        `SELECT * FROM outbox_events 
+         WHERE processed = false 
+         ORDER BY occurred_at ASC 
+         LIMIT 10
+         FOR UPDATE SKIP LOCKED`
+      );
 
-  // Merge updates from another node/region
-  mergeFromRemote(userId: string, remoteDoc: VersionedDocument<UserProfile>): void {
-    let register = this.registers.get(userId);
-    if (!register) {
-      register = new LWWRegister<UserProfile>();
-      this.registers.set(userId, register);
+      for (const row of rows) {
+        try {
+          // Publish event ไปยัง message broker
+          await this.redis.xadd(
+            `${row.event_type}-stream`,
+            '*',
+            'eventId', row.event_id,
+            'aggregateId', row.aggregate_id,
+            'payload', row.payload
+          );
+
+          // Mark as processed
+          await this.db.query(
+            'UPDATE outbox_events SET processed = true, processed_at = NOW() WHERE event_id = $1',
+            [row.event_id]
+          );
+        } catch (error) {
+          console.error(`Failed to process outbox event ${row.event_id}:`, error);
+        }
+      }
+
+      // รอก่อน process รอบถัดไป
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    register.merge(remoteDoc);
   }
 }
 ```
 
-### Vector Clocks
+### Saga Pattern สำหรับ Distributed Transactions
 
 ```typescript
-// conflict-resolution/vector-clock.ts
+// saga-pattern.ts
+// Choreography-based Saga
 
-type VectorClock = Map<string, number>;
+type SagaStatus = 'PENDING' | 'COMPLETED' | 'FAILED' | 'COMPENSATING';
 
-function incrementClock(clock: VectorClock, nodeId: string): VectorClock {
-  const newClock = new Map(clock);
-  newClock.set(nodeId, (clock.get(nodeId) ?? 0) + 1);
-  return newClock;
+interface SagaStep {
+  stepName: string;
+  execute: () => Promise<void>;
+  compensate: () => Promise<void>;
 }
 
-function mergeClock(a: VectorClock, b: VectorClock): VectorClock {
-  const merged = new Map(a);
-  for (const [nodeId, counter] of b) {
-    merged.set(nodeId, Math.max(merged.get(nodeId) ?? 0, counter));
-  }
-  return merged;
-}
+class OrderSaga {
+  private steps: SagaStep[] = [];
+  private completedSteps: SagaStep[] = [];
+  private status: SagaStatus = 'PENDING';
 
-type ClockComparison = "before" | "after" | "concurrent" | "equal";
-
-function compareClock(a: VectorClock, b: VectorClock): ClockComparison {
-  let aLessB = false;
-  let bLessA = false;
-
-  const allNodes = new Set([...a.keys(), ...b.keys()]);
-
-  for (const node of allNodes) {
-    const aVal = a.get(node) ?? 0;
-    const bVal = b.get(node) ?? 0;
-    if (aVal < bVal) aLessB = true;
-    if (aVal > bVal) bLessA = true;
+  addStep(step: SagaStep): this {
+    this.steps.push(step);
+    return this;
   }
 
-  if (!aLessB && !bLessA) return "equal";
-  if (aLessB && !bLessA) return "before";
-  if (!aLessB && bLessA) return "after";
-  return "concurrent"; // Conflict!
-}
-
-interface VectorClockEntry<T> {
-  value: T;
-  clock: VectorClock;
-  nodeId: string;
-}
-
-class VectorClockStore<T> {
-  private entries: VectorClockEntry<T>[] = [];
-  private localClock: VectorClock = new Map();
-
-  write(value: T, nodeId: string): VectorClockEntry<T> {
-    this.localClock = incrementClock(this.localClock, nodeId);
-
-    const entry: VectorClockEntry<T> = {
-      value,
-      clock: new Map(this.localClock),
-      nodeId,
-    };
-
-    this.entries.push(entry);
-    this.pruneSuperseded();
-    return entry;
-  }
-
-  merge(remoteEntry: VectorClockEntry<T>): "accepted" | "rejected" | "conflict" {
-    for (const existing of this.entries) {
-      const comparison = compareClock(remoteEntry.clock, existing.clock);
-
-      if (comparison === "before" || comparison === "equal") {
-        return "rejected"; // We already have a newer version
+  async execute(): Promise<void> {
+    this.status = 'PENDING';
+    
+    for (const step of this.steps) {
+      try {
+        console.log(`Executing step: ${step.stepName}`);
+        await step.execute();
+        this.completedSteps.push(step);
+      } catch (error) {
+        console.error(`Step ${step.stepName} failed:`, error);
+        this.status = 'COMPENSATING';
+        await this.compensate();
+        this.status = 'FAILED';
+        throw error;
       }
     }
+    
+    this.status = 'COMPLETED';
+  }
 
-    this.entries.push(remoteEntry);
-    this.localClock = mergeClock(this.localClock, remoteEntry.clock);
-    this.pruneSuperseded();
-
-    if (this.entries.length > 1) {
-      return "conflict"; // Multiple concurrent versions
+  private async compensate(): Promise<void> {
+    // ทำ compensation ย้อนหลัง
+    const stepsToCompensate = [...this.completedSteps].reverse();
+    
+    for (const step of stepsToCompensate) {
+      try {
+        console.log(`Compensating step: ${step.stepName}`);
+        await step.compensate();
+      } catch (error) {
+        console.error(`Compensation failed for ${step.stepName}:`, error);
+        // Log และ alert แต่ไม่ throw เพื่อให้ compensate ต่อได้
+      }
     }
-
-    return "accepted";
-  }
-
-  read(): T | T[] {
-    if (this.entries.length === 0) throw new Error("No value");
-    if (this.entries.length === 1) return this.entries[0].value;
-
-    // Return all concurrent versions for application-level resolution
-    return this.entries.map((e) => e.value);
-  }
-
-  hasConflict(): boolean {
-    return this.entries.length > 1;
-  }
-
-  resolve(resolvedValue: T, nodeId: string): void {
-    if (!this.hasConflict()) return;
-
-    // Merge all clocks
-    const mergedClock = this.entries.reduce(
-      (acc, entry) => mergeClock(acc, entry.clock),
-      new Map<string, number>()
-    );
-
-    // Increment local counter
-    const newClock = incrementClock(mergedClock, nodeId);
-
-    this.entries = [{ value: resolvedValue, clock: newClock, nodeId }];
-    this.localClock = newClock;
-  }
-
-  private pruneSuperseded(): void {
-    this.entries = this.entries.filter((entry) => {
-      const isSuperseded = this.entries.some((other) => {
-        if (other === entry) return false;
-        return compareClock(entry.clock, other.clock) === "before";
-      });
-      return !isSuperseded;
-    });
   }
 }
 
-// ตัวอย่างการใช้งาน
-const store = new VectorClockStore<{ name: string; age: number }>();
+// ตัวอย่างการใช้งาน Order Saga
+async function createOrderWithSaga(
+  orderService: any,
+  inventoryService: any,
+  paymentService: any,
+  shippingService: any
+): Promise<void> {
+  const orderId = crypto.randomUUID();
+  const reservationId = crypto.randomUUID();
+  const paymentId = crypto.randomUUID();
 
-// Node A writes
-store.write({ name: "Alice", age: 30 }, "node-a");
+  const saga = new OrderSaga();
 
-// Node B writes concurrently (before seeing A's write)
-const storeB = new VectorClockStore<{ name: string; age: 30 }>();
-storeB.write({ name: "Alice", age: 31 }, "node-b");
+  saga
+    .addStep({
+      stepName: 'CreateOrder',
+      execute: async () => {
+        await orderService.create(orderId, { status: 'PENDING' });
+      },
+      compensate: async () => {
+        await orderService.cancel(orderId);
+      },
+    })
+    .addStep({
+      stepName: 'ReserveInventory',
+      execute: async () => {
+        await inventoryService.reserve(reservationId, orderId);
+      },
+      compensate: async () => {
+        await inventoryService.release(reservationId);
+      },
+    })
+    .addStep({
+      stepName: 'ProcessPayment',
+      execute: async () => {
+        await paymentService.charge(paymentId, orderId, 1000);
+      },
+      compensate: async () => {
+        await paymentService.refund(paymentId);
+      },
+    })
+    .addStep({
+      stepName: 'CreateShipment',
+      execute: async () => {
+        await shippingService.schedule(orderId);
+      },
+      compensate: async () => {
+        await shippingService.cancel(orderId);
+      },
+    });
 
-// When they sync, detect conflict
-const result = store.merge(storeB.read() as any);
-if (result === "conflict") {
-  const versions = store.read() as Array<{ name: string; age: number }>;
-  // Application resolves: use highest age
-  const resolved = versions.reduce((a, b) => a.age > b.age ? a : b);
-  store.resolve(resolved, "node-c");
+  await saga.execute();
+}
+```
+
+---
+
+## 2. Strong Consistency Trade-offs (CAP Theorem Applied)
+
+### CAP Theorem
+
+CAP Theorem ระบุว่าระบบ Distributed สามารถรับประกันได้เพียง 2 ใน 3 ข้อ:
+- **C**onsistency: ทุก node เห็นข้อมูลเดียวกัน
+- **A**vailability: ทุก request ได้รับ response
+- **P**artition tolerance: ระบบยังทำงานได้เมื่อเกิด network partition
+
+```typescript
+// cap-theorem-demo.ts
+// ตัวอย่างการเลือก CP vs AP
+
+// CP System - เลือก Consistency + Partition Tolerance
+class CPDatabaseService {
+  private primaryNode: any;
+  private replicaNodes: any[];
+
+  // Synchronous replication - ทุก write ต้อง confirm จาก majority
+  async write(key: string, value: unknown): Promise<void> {
+    const majorityCount = Math.floor(this.replicaNodes.length / 2) + 1;
+    let confirmedWrites = 0;
+
+    // Write ไปยัง primary ก่อน
+    await this.primaryNode.set(key, value);
+    confirmedWrites++;
+
+    // Synchronously replicate ไปยัง replicas
+    const writePromises = this.replicaNodes.map(async (replica) => {
+      try {
+        await replica.set(key, value);
+        confirmedWrites++;
+      } catch (error) {
+        console.error('Replica write failed:', error);
+      }
+    });
+
+    await Promise.allSettled(writePromises);
+
+    // ถ้าไม่ได้ majority ให้ throw error (เลือก Consistency)
+    if (confirmedWrites < majorityCount) {
+      throw new Error('Write failed: Could not achieve quorum');
+    }
+  }
+
+  // Read จาก majority ก่อนตอบ
+  async read(key: string): Promise<unknown> {
+    const responses = await Promise.allSettled(
+      [this.primaryNode, ...this.replicaNodes].map(node => node.get(key))
+    );
+
+    const values = responses
+      .filter(r => r.status === 'fulfilled')
+      .map(r => (r as PromiseFulfilledResult<unknown>).value);
+
+    if (values.length === 0) {
+      throw new Error('Read failed: No nodes available');
+    }
+
+    // ตรวจสอบ consistency
+    const uniqueValues = new Set(values.map(v => JSON.stringify(v)));
+    if (uniqueValues.size > 1) {
+      throw new Error('Inconsistent reads detected');
+    }
+
+    return values[0];
+  }
+}
+
+// AP System - เลือก Availability + Partition Tolerance
+class APDatabaseService {
+  private nodes: any[];
+
+  // Write ไปยัง node ที่พร้อม (ไม่รอ consistency)
+  async write(key: string, value: unknown): Promise<void> {
+    const writePromises = this.nodes.map(node =>
+      node.set(key, value).catch((err: Error) => {
+        console.warn(`Node write failed (continuing): ${err.message}`);
+      })
+    );
+
+    await Promise.allSettled(writePromises);
+    // ไม่ throw แม้ว่า nodes บางตัวล้มเหลว
+  }
+
+  // Read จาก node แรกที่พร้อม (อาจได้ข้อมูลเก่า)
+  async read(key: string): Promise<unknown> {
+    for (const node of this.nodes) {
+      try {
+        return await node.get(key);
+      } catch {
+        continue; // ลอง node ถัดไป
+      }
+    }
+    throw new Error('All nodes unavailable');
+  }
+}
+
+// PACELC Model - ขยาย CAP
+class PACELCSystem {
+  private config: {
+    partitionBehavior: 'consistency' | 'availability';
+    normalBehavior: 'latency' | 'consistency';
+  };
+
+  constructor(config: {
+    partitionBehavior: 'consistency' | 'availability';
+    normalBehavior: 'latency' | 'consistency';
+  }) {
+    this.config = config;
+  }
+
+  async write(key: string, value: unknown): Promise<{ latency: number }> {
+    const start = Date.now();
+
+    if (this.config.normalBehavior === 'consistency') {
+      // รอให้ทุก replica confirm (สูง latency)
+      await this.synchronousReplication(key, value);
+    } else {
+      // Write ทันที ไม่รอ replica (ต่ำ latency)
+      await this.asyncReplication(key, value);
+    }
+
+    return { latency: Date.now() - start };
+  }
+
+  private async synchronousReplication(_key: string, _value: unknown): Promise<void> {
+    // Simulate synchronous replication delay
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+
+  private async asyncReplication(_key: string, _value: unknown): Promise<void> {
+    // Simulate fast local write
+    await new Promise(resolve => setTimeout(resolve, 5));
+    // Background replication
+    setTimeout(() => this.backgroundReplicate(_key, _value), 0);
+  }
+
+  private async backgroundReplicate(_key: string, _value: unknown): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
 }
 ```
 
@@ -377,366 +473,545 @@ if (result === "conflict") {
 
 ## 3. Read-Your-Writes Consistency
 
+### แนวคิด
+
+Read-Your-Writes Consistency รับประกันว่าหลังจาก user เขียนข้อมูล การอ่านข้อมูลของ user นั้นจะเห็นการเขียนนั้นเสมอ
+
 ```typescript
-// consistency/read-your-writes.ts
-import { Redis } from "ioredis";
-import { Pool } from "pg";
+// read-your-writes.ts
+import Redis from 'ioredis';
+import { Pool } from 'pg';
 
-class ReadYourWritesConsistencyManager {
-  private readonly TOKEN_TTL_SECONDS = 30;
+interface WriteToken {
+  userId: string;
+  timestamp: number;
+  version: number;
+}
 
-  constructor(
-    private readonly redis: Redis,
-    private readonly primary: Pool,
-    private readonly replicas: Pool[]
-  ) {}
+class ReadYourWritesService {
+  private primaryDb: Pool;
+  private replicaDb: Pool;
+  private redis: Redis;
+  private readonly TOKEN_TTL = 60; // seconds
 
-  // After a write, store a consistency token
-  async afterWrite(userId: string, writeTimestamp: number): Promise<string> {
-    const token = `${userId}:${writeTimestamp}`;
-    await this.redis.setex(
-      `consistency_token:${userId}`,
-      this.TOKEN_TTL_SECONDS,
-      writeTimestamp.toString()
+  constructor(primaryDb: Pool, replicaDb: Pool, redis: Redis) {
+    this.primaryDb = primaryDb;
+    this.replicaDb = replicaDb;
+    this.redis = redis;
+  }
+
+  async write(userId: string, data: Record<string, unknown>): Promise<WriteToken> {
+    // Write ลง Primary
+    const result = await this.primaryDb.query<{ version: number }>(
+      'UPDATE user_data SET data=$1, version=version+1, updated_at=NOW() WHERE user_id=$2 RETURNING version',
+      [JSON.stringify(data), userId]
     );
+
+    const version = result.rows[0].version;
+    
+    // สร้าง write token
+    const token: WriteToken = {
+      userId,
+      timestamp: Date.now(),
+      version,
+    };
+
+    // บันทึก token ใน Redis
+    await this.redis.setex(
+      `write-token:${userId}`,
+      this.TOKEN_TTL,
+      JSON.stringify(token)
+    );
+
     return token;
   }
 
-  // When reading, check if we need to read from primary
-  async read<T>(
-    userId: string,
-    query: (db: Pool) => Promise<T>
-  ): Promise<T> {
-    const token = await this.redis.get(`consistency_token:${userId}`);
+  async read(userId: string, clientToken?: WriteToken): Promise<Record<string, unknown> | null> {
+    // ตรวจสอบ token จาก Redis
+    const storedTokenStr = await this.redis.get(`write-token:${userId}`);
+    
+    if (storedTokenStr || clientToken) {
+      const requiredToken = storedTokenStr 
+        ? JSON.parse(storedTokenStr) as WriteToken
+        : clientToken!;
 
-    if (token) {
-      // User just wrote — read from primary to get latest data
-      console.log(`Reading from primary for user ${userId} (consistency token active)`);
-      return query(this.primary);
-    }
+      // ตรวจสอบว่า replica มี version ที่ต้องการ
+      const replicaResult = await this.replicaDb.query<{ version: number }>(
+        'SELECT version FROM user_data WHERE user_id=$1',
+        [userId]
+      );
 
-    // Safe to read from replica
-    const replica = this.getReplica();
-    return query(replica);
-  }
-
-  private getReplica(): Pool {
-    return this.replicas[Math.floor(Math.random() * this.replicas.length)];
-  }
-}
-
-// HTTP middleware สำหรับ read-your-writes
-class ConsistencyMiddleware {
-  constructor(
-    private readonly manager: ReadYourWritesConsistencyManager,
-    private readonly redis: Redis
-  ) {}
-
-  // Middleware หลัง write operations
-  writeMiddleware() {
-    return async (req: Request, res: Response, next: NextFunction) => {
-      await next();
-
-      // After successful write (2xx), set consistency token
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        const userId = (req as any).user?.id;
-        if (userId) {
-          const token = await this.manager.afterWrite(userId, Date.now());
-          res.setHeader("X-Consistency-Token", token);
-        }
-      }
-    };
-  }
-
-  // Middleware สำหรับ read operations
-  readMiddleware() {
-    return async (req: Request, res: Response, next: NextFunction) => {
-      const userId = (req as any).user?.id;
-      const consistencyToken = req.headers["x-consistency-token"] as string;
-
-      // Client can send back the token to ensure read-your-writes
-      if (userId && consistencyToken) {
-        await this.redis.setex(
-          `consistency_token:${userId}`,
-          30,
-          consistencyToken.split(":")[1]
+      if (
+        replicaResult.rows.length === 0 ||
+        replicaResult.rows[0].version < requiredToken.version
+      ) {
+        // Replica ยังไม่ sync - อ่านจาก Primary
+        console.log(`Routing to primary for user ${userId} (replica lag detected)`);
+        const primaryResult = await this.primaryDb.query<{ data: string }>(
+          'SELECT data FROM user_data WHERE user_id=$1',
+          [userId]
         );
+        return primaryResult.rows[0] ? JSON.parse(primaryResult.rows[0].data) : null;
+      }
+    }
+
+    // อ่านจาก Replica ได้เลย
+    const result = await this.replicaDb.query<{ data: string }>(
+      'SELECT data FROM user_data WHERE user_id=$1',
+      [userId]
+    );
+    
+    return result.rows[0] ? JSON.parse(result.rows[0].data) : null;
+  }
+}
+
+// Sticky Session approach สำหรับ Read-Your-Writes
+class StickySessionRouter {
+  private sessions: Map<string, 'primary' | 'replica'> = new Map();
+  private readonly STICKY_DURATION = 30000; // 30 seconds
+  private stickyTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  markAsWriter(sessionId: string): void {
+    this.sessions.set(sessionId, 'primary');
+    
+    // Clear existing timer
+    const existingTimer = this.stickyTimers.get(sessionId);
+    if (existingTimer) clearTimeout(existingTimer);
+    
+    // Auto-reset หลัง 30 วินาที
+    const timer = setTimeout(() => {
+      this.sessions.set(sessionId, 'replica');
+      this.stickyTimers.delete(sessionId);
+    }, this.STICKY_DURATION);
+    
+    this.stickyTimers.set(sessionId, timer);
+  }
+
+  getTarget(sessionId: string): 'primary' | 'replica' {
+    return this.sessions.get(sessionId) || 'replica';
+  }
+}
+```
+
+---
+
+## 4. Monotonic Read Consistency
+
+### แนวคิด
+
+Monotonic Read Consistency รับประกันว่าถ้า process อ่านค่า X แล้ว การอ่านครั้งต่อไปจะไม่ได้ค่าที่เก่ากว่า X (จะไม่มีข้อมูลย้อนกลับ)
+
+```typescript
+// monotonic-reads.ts
+
+interface VersionedData<T> {
+  data: T;
+  version: number;
+  timestamp: number;
+}
+
+class MonotonicReadCache {
+  private lastReadVersions: Map<string, number> = new Map();
+  private redis: Redis;
+  private db: Pool;
+
+  constructor(redis: Redis, db: Pool) {
+    this.redis = redis;
+    this.db = db;
+  }
+
+  async read<T>(
+    clientId: string,
+    resourceId: string
+  ): Promise<VersionedData<T>> {
+    const lastVersion = this.lastReadVersions.get(`${clientId}:${resourceId}`) || 0;
+
+    // ลอง read จาก cache ก่อน
+    const cached = await this.redis.get(`resource:${resourceId}`);
+    
+    if (cached) {
+      const parsed = JSON.parse(cached) as VersionedData<T>;
+      
+      // ตรวจสอบ monotonic property
+      if (parsed.version >= lastVersion) {
+        this.lastReadVersions.set(`${clientId}:${resourceId}`, parsed.version);
+        return parsed;
+      }
+      
+      // Cache มีข้อมูลเก่ากว่า - ไปอ่าน DB
+      console.warn(`Cache version ${parsed.version} < last seen ${lastVersion}, reading from DB`);
+    }
+
+    // Read จาก DB พร้อม version check
+    const result = await this.db.query<{ data: T; version: number; updated_at: Date }>(
+      'SELECT data, version, updated_at FROM resources WHERE id=$1 AND version >= $2',
+      [resourceId, lastVersion]
+    );
+
+    if (result.rows.length === 0) {
+      // ต้องอ่านจาก primary
+      const primaryResult = await this.db.query<{ data: T; version: number; updated_at: Date }>(
+        'SELECT data, version, updated_at FROM resources WHERE id=$1',
+        [resourceId]
+      );
+      
+      if (primaryResult.rows.length === 0) {
+        throw new Error(`Resource ${resourceId} not found`);
       }
 
-      await next();
+      const row = primaryResult.rows[0];
+      const versionedData: VersionedData<T> = {
+        data: row.data,
+        version: row.version,
+        timestamp: row.updated_at.getTime(),
+      };
+
+      this.lastReadVersions.set(`${clientId}:${resourceId}`, versionedData.version);
+      return versionedData;
+    }
+
+    const row = result.rows[0];
+    const versionedData: VersionedData<T> = {
+      data: row.data,
+      version: row.version,
+      timestamp: row.updated_at.getTime(),
+    };
+
+    this.lastReadVersions.set(`${clientId}:${resourceId}`, versionedData.version);
+    return versionedData;
+  }
+}
+```
+
+---
+
+## 5. Consistent Prefix Reads
+
+### แนวคิด
+
+Consistent Prefix Reads รับประกันว่าถ้า operation A เกิดก่อน B ผู้อ่านจะเห็น A ก่อน B เสมอ ไม่มีการข้ามลำดับ
+
+```typescript
+// consistent-prefix-reads.ts
+
+interface OrderedEvent {
+  sequenceNumber: number;
+  partitionKey: string;
+  data: Record<string, unknown>;
+  timestamp: number;
+}
+
+class ConsistentPrefixReader {
+  private db: Pool;
+  private lastReadSequence: Map<string, number> = new Map();
+
+  constructor(db: Pool) {
+    this.db = db;
+  }
+
+  async readEvents(
+    partitionKey: string,
+    afterSequence?: number
+  ): Promise<OrderedEvent[]> {
+    const startSeq = afterSequence ?? this.lastReadSequence.get(partitionKey) ?? 0;
+
+    const result = await this.db.query<{
+      sequence_number: number;
+      partition_key: string;
+      data: string;
+      created_at: Date;
+    }>(
+      `SELECT sequence_number, partition_key, data, created_at
+       FROM event_log
+       WHERE partition_key = $1 AND sequence_number > $2
+       ORDER BY sequence_number ASC`,
+      [partitionKey, startSeq]
+    );
+
+    // ตรวจสอบว่า sequence ต่อเนื่อง (no gaps)
+    const events: OrderedEvent[] = [];
+    let expectedSeq = startSeq + 1;
+
+    for (const row of result.rows) {
+      if (row.sequence_number !== expectedSeq) {
+        // พบ gap - หยุดและ return เท่าที่มี (consistent prefix)
+        console.warn(
+          `Gap detected: expected ${expectedSeq}, got ${row.sequence_number}. Returning prefix.`
+        );
+        break;
+      }
+
+      events.push({
+        sequenceNumber: row.sequence_number,
+        partitionKey: row.partition_key,
+        data: JSON.parse(row.data),
+        timestamp: row.created_at.getTime(),
+      });
+
+      expectedSeq++;
+    }
+
+    if (events.length > 0) {
+      this.lastReadSequence.set(
+        partitionKey,
+        events[events.length - 1].sequenceNumber
+      );
+    }
+
+    return events;
+  }
+
+  async writeEvent(
+    partitionKey: string,
+    data: Record<string, unknown>
+  ): Promise<number> {
+    // ใช้ sequence ที่รับประกันว่าต่อเนื่อง
+    const result = await this.db.query<{ sequence_number: number }>(
+      `INSERT INTO event_log (partition_key, data, created_at)
+       VALUES ($1, $2, NOW())
+       RETURNING sequence_number`,
+      [partitionKey, JSON.stringify(data)]
+    );
+
+    return result.rows[0].sequence_number;
+  }
+}
+```
+
+---
+
+## 6. Vector Clocks and Conflict Resolution
+
+### Vector Clocks
+
+Vector Clocks ใช้ติดตามลำดับของ events ใน distributed system เพื่อระบุว่า event ไหนเกิดก่อน/หลัง หรือเกิดพร้อมกัน (concurrent)
+
+```typescript
+// vector-clocks.ts
+
+type VectorClock = Map<string, number>;
+
+class VectorClockManager {
+  private nodeId: string;
+  private clock: VectorClock;
+
+  constructor(nodeId: string) {
+    this.nodeId = nodeId;
+    this.clock = new Map();
+    this.clock.set(nodeId, 0);
+  }
+
+  // เพิ่ม counter สำหรับ node ปัจจุบัน
+  tick(): VectorClock {
+    const current = this.clock.get(this.nodeId) || 0;
+    this.clock.set(this.nodeId, current + 1);
+    return new Map(this.clock);
+  }
+
+  // Merge clock จาก event ที่รับมา
+  receive(receivedClock: VectorClock): void {
+    // อัพเดท clock ตาม maximum
+    for (const [nodeId, time] of receivedClock) {
+      const current = this.clock.get(nodeId) || 0;
+      this.clock.set(nodeId, Math.max(current, time));
+    }
+    // Increment ของตัวเอง
+    const selfTime = this.clock.get(this.nodeId) || 0;
+    this.clock.set(this.nodeId, selfTime + 1);
+  }
+
+  // เปรียบเทียบ vector clocks
+  compare(a: VectorClock, b: VectorClock): 'before' | 'after' | 'concurrent' | 'equal' {
+    let aBeforeB = false;
+    let bBeforeA = false;
+
+    const allNodes = new Set([...a.keys(), ...b.keys()]);
+
+    for (const node of allNodes) {
+      const aTime = a.get(node) || 0;
+      const bTime = b.get(node) || 0;
+
+      if (aTime < bTime) aBeforeB = true;
+      if (aTime > bTime) bBeforeA = true;
+    }
+
+    if (!aBeforeB && !bBeforeA) return 'equal';
+    if (aBeforeB && !bBeforeA) return 'before';
+    if (!aBeforeB && bBeforeA) return 'after';
+    return 'concurrent'; // Conflict!
+  }
+
+  getClock(): VectorClock {
+    return new Map(this.clock);
+  }
+}
+
+// Conflict Resolution Strategies
+interface VersionedValue<T> {
+  value: T;
+  vectorClock: VectorClock;
+  nodeId: string;
+  timestamp: number;
+}
+
+class ConflictResolver<T> {
+  private clockManager: VectorClockManager;
+
+  constructor(nodeId: string) {
+    this.clockManager = new VectorClockManager(nodeId);
+  }
+
+  // Last-Write-Wins (LWW) Strategy
+  resolveWithLWW(versions: VersionedValue<T>[]): VersionedValue<T> {
+    return versions.reduce((latest, current) =>
+      current.timestamp > latest.timestamp ? current : latest
+    );
+  }
+
+  // Application-specific merge
+  resolveWithMerge(
+    versions: VersionedValue<T>[],
+    mergeFn: (a: T, b: T) => T
+  ): VersionedValue<T> {
+    if (versions.length === 1) return versions[0];
+
+    const merged = versions.reduce((acc, current) => ({
+      ...acc,
+      value: mergeFn(acc.value, current.value),
+    }));
+
+    return {
+      ...merged,
+      vectorClock: this.mergeClock(versions.map(v => v.vectorClock)),
+      timestamp: Date.now(),
     };
   }
-}
-```
 
----
-
-## 4. Monotonic Reads
-
-```typescript
-// consistency/monotonic-reads.ts
-
-// Monotonic reads: เห็น version ที่ >= ที่เคยเห็น
-class MonotonicReadStore<T> {
-  private readonly seenVersions: Map<string, number> = new Map();
-
-  constructor(
-    private readonly redis: Redis,
-    private readonly primary: Pool,
-    private readonly replicas: Pool[]
-  ) {}
-
-  async read(
-    sessionId: string,
-    resourceId: string,
-    query: (db: Pool) => Promise<{ data: T; version: number }>
-  ): Promise<T> {
-    const lastSeenVersion = await this.getLastSeenVersion(sessionId, resourceId);
-
-    // Try replicas first
-    for (const replica of this.replicas) {
-      try {
-        const result = await query(replica);
-
-        if (result.version >= lastSeenVersion) {
-          // This replica is up-to-date enough
-          await this.updateLastSeenVersion(sessionId, resourceId, result.version);
-          return result.data;
-        }
-      } catch (error) {
-        console.warn("Replica read failed, trying next...");
+  private mergeClock(clocks: VectorClock[]): VectorClock {
+    const merged: VectorClock = new Map();
+    for (const clock of clocks) {
+      for (const [node, time] of clock) {
+        merged.set(node, Math.max(merged.get(node) || 0, time));
       }
     }
-
-    // Fall back to primary
-    const result = await query(this.primary);
-    await this.updateLastSeenVersion(sessionId, resourceId, result.version);
-    return result.data;
-  }
-
-  private async getLastSeenVersion(
-    sessionId: string,
-    resourceId: string
-  ): Promise<number> {
-    const key = `monotonic:${sessionId}:${resourceId}`;
-    const value = await this.redis.get(key);
-    return value ? parseInt(value) : 0;
-  }
-
-  private async updateLastSeenVersion(
-    sessionId: string,
-    resourceId: string,
-    version: number
-  ): Promise<void> {
-    const key = `monotonic:${sessionId}:${resourceId}`;
-    const current = await this.getLastSeenVersion(sessionId, resourceId);
-
-    if (version > current) {
-      await this.redis.setex(key, 3600, version.toString()); // 1 hour TTL
-    }
-  }
-}
-```
-
----
-
-## 5. CRDTs (Conflict-free Replicated Data Types)
-
-CRDTs คือ data structures ที่ merge ได้โดยอัตโนมัติโดยไม่เกิด conflicts
-
-```typescript
-// crdts/grow-only-set.ts (G-Set)
-// G-Set: add-only set ที่ merge ได้โดยการ union
-
-class GrowOnlySet<T> {
-  private readonly elements: Set<T>;
-
-  constructor(elements?: T[]) {
-    this.elements = new Set(elements ?? []);
-  }
-
-  add(element: T): GrowOnlySet<T> {
-    const newSet = new GrowOnlySet<T>([...this.elements]);
-    newSet.elements.add(element);
-    return newSet;
-  }
-
-  contains(element: T): boolean {
-    return this.elements.has(element);
-  }
-
-  merge(other: GrowOnlySet<T>): GrowOnlySet<T> {
-    // Union of both sets — always safe, no conflicts
-    return new GrowOnlySet<T>([...this.elements, ...other.elements]);
-  }
-
-  toArray(): T[] {
-    return [...this.elements];
-  }
-
-  size(): number {
-    return this.elements.size;
-  }
-}
-
-// 2P-Set (Two-Phase Set): supports removes
-class TwoPhaseSet<T> {
-  private readonly addSet: GrowOnlySet<T>;
-  private readonly removeSet: GrowOnlySet<T>;
-
-  constructor(
-    addElements?: T[],
-    removeElements?: T[]
-  ) {
-    this.addSet = new GrowOnlySet(addElements);
-    this.removeSet = new GrowOnlySet(removeElements);
-  }
-
-  add(element: T): TwoPhaseSet<T> {
-    return new TwoPhaseSet(
-      [...this.addSet.toArray(), element],
-      this.removeSet.toArray()
-    );
-  }
-
-  remove(element: T): TwoPhaseSet<T> {
-    if (!this.addSet.contains(element)) {
-      throw new Error("Cannot remove element not in add set");
-    }
-    return new TwoPhaseSet(
-      this.addSet.toArray(),
-      [...this.removeSet.toArray(), element]
-    );
-  }
-
-  contains(element: T): boolean {
-    // Present if in add set but NOT in remove set
-    return this.addSet.contains(element) && !this.removeSet.contains(element);
-  }
-
-  merge(other: TwoPhaseSet<T>): TwoPhaseSet<T> {
-    return new TwoPhaseSet(
-      this.addSet.merge(other.addSet).toArray(),
-      this.removeSet.merge(other.removeSet).toArray()
-    );
-  }
-}
-
-// OR-Set (Observed-Remove Set): better semantics for adds and removes
-class ORSet<T> {
-  // Map from element to set of unique tags
-  private readonly entries: Map<T, Set<string>>;
-  private readonly tombstones: Map<T, Set<string>>;
-
-  constructor() {
-    this.entries = new Map();
-    this.tombstones = new Map();
-  }
-
-  add(element: T): ORSet<T> {
-    const newSet = this.clone();
-    const tag = crypto.randomUUID();
-    if (!newSet.entries.has(element)) {
-      newSet.entries.set(element, new Set());
-    }
-    newSet.entries.get(element)!.add(tag);
-    return newSet;
-  }
-
-  remove(element: T): ORSet<T> {
-    if (!this.contains(element)) return this;
-
-    const newSet = this.clone();
-    const tags = this.entries.get(element) ?? new Set();
-
-    // Tombstone all current tags for this element
-    if (!newSet.tombstones.has(element)) {
-      newSet.tombstones.set(element, new Set());
-    }
-    for (const tag of tags) {
-      newSet.tombstones.get(element)!.add(tag);
-    }
-
-    return newSet;
-  }
-
-  contains(element: T): boolean {
-    const tags = this.entries.get(element);
-    const tombstoned = this.tombstones.get(element) ?? new Set();
-
-    if (!tags || tags.size === 0) return false;
-
-    // Contains if any tag is NOT tombstoned
-    return [...tags].some((tag) => !tombstoned.has(tag));
-  }
-
-  merge(other: ORSet<T>): ORSet<T> {
-    const merged = new ORSet<T>();
-
-    // Merge entries
-    for (const [elem, tags] of this.entries) {
-      merged.entries.set(elem, new Set(tags));
-    }
-    for (const [elem, tags] of other.entries) {
-      if (!merged.entries.has(elem)) {
-        merged.entries.set(elem, new Set());
-      }
-      for (const tag of tags) {
-        merged.entries.get(elem)!.add(tag);
-      }
-    }
-
-    // Merge tombstones
-    for (const [elem, tags] of this.tombstones) {
-      merged.tombstones.set(elem, new Set(tags));
-    }
-    for (const [elem, tags] of other.tombstones) {
-      if (!merged.tombstones.has(elem)) {
-        merged.tombstones.set(elem, new Set());
-      }
-      for (const tag of tags) {
-        merged.tombstones.get(elem)!.add(tag);
-      }
-    }
-
     return merged;
   }
 
-  toArray(): T[] {
-    return [...this.entries.keys()].filter((e) => this.contains(e));
-  }
+  // Multi-value register (เก็บทุก concurrent version)
+  detectConflicts(
+    existing: VersionedValue<T>[],
+    incoming: VersionedValue<T>
+  ): VersionedValue<T>[] {
+    const manager = this.clockManager;
+    const dominated: VersionedValue<T>[] = [];
+    const conflicts: VersionedValue<T>[] = [incoming];
 
-  private clone(): ORSet<T> {
-    const newSet = new ORSet<T>();
-    for (const [k, v] of this.entries) {
-      newSet.entries.set(k, new Set(v));
+    for (const version of existing) {
+      const rel = manager.compare(incoming.vectorClock, version.vectorClock);
+      
+      if (rel === 'after') {
+        // incoming ใหม่กว่า - ไม่เก็บ existing
+        dominated.push(version);
+      } else if (rel === 'before') {
+        // existing ใหม่กว่า - ไม่เก็บ incoming
+        return existing;
+      } else {
+        // Concurrent - เก็บทั้งคู่
+        conflicts.push(version);
+      }
     }
-    for (const [k, v] of this.tombstones) {
-      newSet.tombstones.set(k, new Set(v));
-    }
-    return newSet;
+
+    // Return versions ที่ไม่ถูก dominate
+    return conflicts.filter(v => !dominated.includes(v));
   }
 }
 
-// G-Counter CRDT: distributed counter
-class GCounter {
-  private readonly counts: Map<string, number>;
+// ตัวอย่าง: Shopping Cart ที่ใช้ Vector Clocks
+interface CartItem {
+  productId: string;
+  quantity: number;
+}
 
-  constructor(private readonly nodeId: string) {
-    this.counts = new Map();
-    this.counts.set(nodeId, 0);
+interface Cart {
+  userId: string;
+  items: CartItem[];
+}
+
+class DistributedCart {
+  private resolver: ConflictResolver<Cart>;
+  private versions: Map<string, VersionedValue<Cart>[]> = new Map();
+  private nodeId: string;
+
+  constructor(nodeId: string) {
+    this.nodeId = nodeId;
+    this.resolver = new ConflictResolver<Cart>(nodeId);
   }
 
-  increment(amount: number = 1): GCounter {
-    const newCounter = new GCounter(this.nodeId);
-    for (const [k, v] of this.counts) {
-      newCounter.counts.set(k, v);
+  addItem(userId: string, item: CartItem): void {
+    const existing = this.versions.get(userId) || [];
+    
+    // Merge items จาก existing versions
+    const existingItems = existing.length > 0 
+      ? existing[0].value.items 
+      : [];
+
+    const updatedItems = [...existingItems];
+    const existingItem = updatedItems.find(i => i.productId === item.productId);
+    
+    if (existingItem) {
+      existingItem.quantity += item.quantity;
+    } else {
+      updatedItems.push(item);
     }
-    newCounter.counts.set(
-      this.nodeId,
-      (this.counts.get(this.nodeId) ?? 0) + amount
-    );
-    return newCounter;
+
+    const newVersion: VersionedValue<Cart> = {
+      value: { userId, items: updatedItems },
+      vectorClock: new Map([[this.nodeId, Date.now()]]),
+      nodeId: this.nodeId,
+      timestamp: Date.now(),
+    };
+
+    const resolved = this.resolver.detectConflicts(existing, newVersion);
+    this.versions.set(userId, resolved);
+  }
+
+  getCart(userId: string): Cart[] {
+    const versions = this.versions.get(userId) || [];
+    
+    if (versions.length === 1) {
+      return [versions[0].value];
+    }
+    
+    // Return multiple versions ถ้ามี conflict
+    return versions.map(v => v.value);
+  }
+}
+```
+
+---
+
+## 7. CRDTs (Conflict-free Replicated Data Types)
+
+### แนวคิด CRDTs
+
+CRDTs คือ data structures ที่ออกแบบมาเพื่อให้ merge ได้โดยไม่เกิด conflict ระบบสามารถ replicate ข้อมูลแบบ asynchronous และ merge โดยอัตโนมัติ
+
+```typescript
+// crdts.ts
+
+// G-Counter (Grow-only Counter)
+class GCounter {
+  private counts: Map<string, number>;
+  private nodeId: string;
+
+  constructor(nodeId: string) {
+    this.nodeId = nodeId;
+    this.counts = new Map([[nodeId, 0]]);
+  }
+
+  increment(amount: number = 1): void {
+    const current = this.counts.get(this.nodeId) || 0;
+    this.counts.set(this.nodeId, current + amount);
   }
 
   value(): number {
@@ -747,447 +1022,893 @@ class GCounter {
     return total;
   }
 
+  // Merge สองก Counter (commutative, associative, idempotent)
   merge(other: GCounter): GCounter {
     const merged = new GCounter(this.nodeId);
     const allNodes = new Set([...this.counts.keys(), ...other.counts.keys()]);
-
-    for (const nodeId of allNodes) {
-      merged.counts.set(
-        nodeId,
-        Math.max(
-          this.counts.get(nodeId) ?? 0,
-          other.counts.get(nodeId) ?? 0
-        )
-      );
+    
+    for (const node of allNodes) {
+      const a = this.counts.get(node) || 0;
+      const b = other.counts.get(node) || 0;
+      merged.counts.set(node, Math.max(a, b));
     }
-
+    
     return merged;
+  }
+
+  serialize(): Record<string, number> {
+    return Object.fromEntries(this.counts);
+  }
+
+  static deserialize(data: Record<string, number>, nodeId: string): GCounter {
+    const counter = new GCounter(nodeId);
+    counter.counts = new Map(Object.entries(data));
+    return counter;
   }
 }
 
-// PN-Counter: increment and decrement
+// PN-Counter (Positive-Negative Counter)
 class PNCounter {
-  private pCounter: GCounter;
-  private nCounter: GCounter;
+  private positive: GCounter;
+  private negative: GCounter;
 
-  constructor(private readonly nodeId: string) {
-    this.pCounter = new GCounter(nodeId);
-    this.nCounter = new GCounter(nodeId);
+  constructor(nodeId: string) {
+    this.positive = new GCounter(nodeId);
+    this.negative = new GCounter(nodeId);
   }
 
-  increment(amount: number = 1): PNCounter {
-    const newCounter = new PNCounter(this.nodeId);
-    newCounter.pCounter = this.pCounter.increment(amount);
-    newCounter.nCounter = this.nCounter;
-    return newCounter;
+  increment(amount: number = 1): void {
+    this.positive.increment(amount);
   }
 
-  decrement(amount: number = 1): PNCounter {
-    const newCounter = new PNCounter(this.nodeId);
-    newCounter.pCounter = this.pCounter;
-    newCounter.nCounter = this.nCounter.increment(amount);
-    return newCounter;
+  decrement(amount: number = 1): void {
+    this.negative.increment(amount);
   }
 
   value(): number {
-    return this.pCounter.value() - this.nCounter.value();
+    return this.positive.value() - this.negative.value();
   }
 
   merge(other: PNCounter): PNCounter {
-    const merged = new PNCounter(this.nodeId);
-    merged.pCounter = this.pCounter.merge(other.pCounter);
-    merged.nCounter = this.nCounter.merge(other.nCounter);
+    const merged = new PNCounter('merged');
+    merged.positive = this.positive.merge(other.positive);
+    merged.negative = this.negative.merge(other.negative);
     return merged;
   }
 }
 
-// LWW-Element-Set: CRDT set with LWW semantics
-interface LWWElement<T> {
-  value: T;
-  timestamp: number;
-}
+// OR-Set (Observed-Remove Set)
+class ORSet<T> {
+  private elements: Map<string, Set<string>>; // value -> set of unique tags
+  private tombstones: Set<string>; // removed tags
+  private nodeId: string;
 
-class LWWElementSet<T> {
-  private readonly addTimestamps: Map<string, LWWElement<T>>;
-  private readonly removeTimestamps: Map<string, number>;
-
-  constructor() {
-    this.addTimestamps = new Map();
-    this.removeTimestamps = new Map();
-  }
-
-  add(key: string, value: T, timestamp: number = Date.now()): void {
-    const existing = this.addTimestamps.get(key);
-    if (!existing || timestamp > existing.timestamp) {
-      this.addTimestamps.set(key, { value, timestamp });
-    }
-  }
-
-  remove(key: string, timestamp: number = Date.now()): void {
-    const existing = this.removeTimestamps.get(key);
-    if (!existing || timestamp > existing) {
-      this.removeTimestamps.set(key, timestamp);
-    }
-  }
-
-  contains(key: string): boolean {
-    const addEntry = this.addTimestamps.get(key);
-    const removeTimestamp = this.removeTimestamps.get(key);
-
-    if (!addEntry) return false;
-    if (!removeTimestamp) return true;
-
-    // Add wins on tie (or use remove-wins variant)
-    return addEntry.timestamp >= removeTimestamp;
-  }
-
-  get(key: string): T | undefined {
-    if (!this.contains(key)) return undefined;
-    return this.addTimestamps.get(key)?.value;
-  }
-
-  merge(other: LWWElementSet<T>): LWWElementSet<T> {
-    const merged = new LWWElementSet<T>();
-
-    // Merge add timestamps
-    for (const [key, entry] of this.addTimestamps) {
-      merged.add(key, entry.value, entry.timestamp);
-    }
-    for (const [key, entry] of other.addTimestamps) {
-      merged.add(key, entry.value, entry.timestamp);
-    }
-
-    // Merge remove timestamps
-    for (const [key, ts] of this.removeTimestamps) {
-      merged.remove(key, ts);
-    }
-    for (const [key, ts] of other.removeTimestamps) {
-      merged.remove(key, ts);
-    }
-
-    return merged;
-  }
-}
-```
-
----
-
-## 6. Gossip Protocol
-
-```typescript
-// gossip/gossip-protocol.ts
-interface NodeState {
-  nodeId: string;
-  data: Record<string, unknown>;
-  version: number;
-  timestamp: number;
-}
-
-interface GossipMessage {
-  fromNode: string;
-  states: NodeState[];
-  timestamp: number;
-}
-
-class GossipNode {
-  private readonly nodeId: string;
-  private readonly knownNodes: Set<string>;
-  private readonly states: Map<string, NodeState>;
-  private gossipInterval?: NodeJS.Timer;
-
-  constructor(nodeId: string, initialNodes: string[] = []) {
+  constructor(nodeId: string) {
     this.nodeId = nodeId;
-    this.knownNodes = new Set(initialNodes);
-    this.states = new Map();
-
-    // Initialize own state
-    this.states.set(nodeId, {
-      nodeId,
-      data: {},
-      version: 0,
-      timestamp: Date.now(),
-    });
+    this.elements = new Map();
+    this.tombstones = new Set();
   }
 
-  updateLocalState(key: string, value: unknown): void {
-    const currentState = this.states.get(this.nodeId)!;
-    this.states.set(this.nodeId, {
-      ...currentState,
-      data: { ...currentState.data, [key]: value },
-      version: currentState.version + 1,
-      timestamp: Date.now(),
-    });
-  }
-
-  // Fan-out gossip: send to random subset of nodes
-  createGossipMessage(): GossipMessage {
-    return {
-      fromNode: this.nodeId,
-      states: [...this.states.values()],
-      timestamp: Date.now(),
-    };
-  }
-
-  // Process incoming gossip
-  receiveGossip(message: GossipMessage): void {
-    let updated = false;
-
-    for (const remoteState of message.states) {
-      const localState = this.states.get(remoteState.nodeId);
-
-      if (!localState || remoteState.version > localState.version) {
-        this.states.set(remoteState.nodeId, remoteState);
-        this.knownNodes.add(remoteState.nodeId);
-        updated = true;
-      }
+  add(element: T): void {
+    const key = JSON.stringify(element);
+    const tag = `${this.nodeId}-${Date.now()}-${Math.random()}`;
+    
+    if (!this.elements.has(key)) {
+      this.elements.set(key, new Set());
     }
-
-    if (updated) {
-      this.notifyStateChange();
-    }
+    this.elements.get(key)!.add(tag);
   }
 
-  getClusterState(): Map<string, NodeState> {
-    return new Map(this.states);
-  }
-
-  // Get nodes that haven't updated recently (possible failures)
-  getStaleNodes(maxAgeMs: number = 30000): string[] {
-    const now = Date.now();
-    return [...this.states.values()]
-      .filter((s) => s.nodeId !== this.nodeId && now - s.timestamp > maxAgeMs)
-      .map((s) => s.nodeId);
-  }
-
-  startGossiping(intervalMs: number = 1000): void {
-    this.gossipInterval = setInterval(async () => {
-      await this.gossipToRandomNodes();
-    }, intervalMs);
-  }
-
-  stopGossiping(): void {
-    if (this.gossipInterval) {
-      clearInterval(this.gossipInterval);
-    }
-  }
-
-  private async gossipToRandomNodes(fanout: number = 3): Promise<void> {
-    const nodes = [...this.knownNodes].filter((n) => n !== this.nodeId);
-    const selected = this.selectRandom(nodes, fanout);
-
-    const message = this.createGossipMessage();
-
-    for (const nodeId of selected) {
-      try {
-        await this.sendGossip(nodeId, message);
-      } catch (error) {
-        console.warn(`Failed to gossip to ${nodeId}:`, error);
+  remove(element: T): void {
+    const key = JSON.stringify(element);
+    const tags = this.elements.get(key);
+    
+    if (tags) {
+      // Add all current tags to tombstones
+      for (const tag of tags) {
+        this.tombstones.add(tag);
       }
     }
   }
 
-  private selectRandom<T>(items: T[], count: number): T[] {
-    const shuffled = [...items].sort(() => Math.random() - 0.5);
-    return shuffled.slice(0, count);
+  has(element: T): boolean {
+    const key = JSON.stringify(element);
+    const tags = this.elements.get(key);
+    
+    if (!tags) return false;
+    
+    // Element exists if any tag is NOT in tombstones
+    for (const tag of tags) {
+      if (!this.tombstones.has(tag)) {
+        return true;
+      }
+    }
+    
+    return false;
   }
 
-  private async sendGossip(
-    targetNodeId: string,
-    message: GossipMessage
-  ): Promise<void> {
-    // In a real system, this would use HTTP, gRPC, or message queue
-    console.log(`${this.nodeId} gossiping to ${targetNodeId}`, message);
+  values(): T[] {
+    const result: T[] = [];
+    
+    for (const [key, tags] of this.elements) {
+      const hasLiveTags = [...tags].some(tag => !this.tombstones.has(tag));
+      if (hasLiveTags) {
+        result.push(JSON.parse(key) as T);
+      }
+    }
+    
+    return result;
   }
 
-  private notifyStateChange(): void {
-    console.log(`${this.nodeId}: cluster state updated`);
+  merge(other: ORSet<T>): ORSet<T> {
+    const merged = new ORSet<T>(this.nodeId);
+    
+    // Merge elements
+    for (const [key, tags] of this.elements) {
+      merged.elements.set(key, new Set(tags));
+    }
+    
+    for (const [key, tags] of other.elements) {
+      if (!merged.elements.has(key)) {
+        merged.elements.set(key, new Set());
+      }
+      for (const tag of tags) {
+        merged.elements.get(key)!.add(tag);
+      }
+    }
+    
+    // Merge tombstones
+    merged.tombstones = new Set([...this.tombstones, ...other.tombstones]);
+    
+    return merged;
   }
 }
 
-// ตัวอย่าง: Service Discovery ด้วย Gossip
-class ServiceRegistry {
-  private readonly gossipNode: GossipNode;
+// LWW-Register (Last-Write-Wins Register)
+class LWWRegister<T> {
+  private value: T | undefined;
+  private timestamp: number = 0;
+  private nodeId: string;
 
-  constructor(nodeId: string, peers: string[]) {
-    this.gossipNode = new GossipNode(nodeId, peers);
-    this.gossipNode.startGossiping(2000); // gossip every 2 seconds
+  constructor(nodeId: string) {
+    this.nodeId = nodeId;
   }
 
-  registerService(serviceName: string, endpoint: string, port: number): void {
-    this.gossipNode.updateLocalState(`service:${serviceName}`, {
-      endpoint,
-      port,
-      registeredAt: Date.now(),
-      healthy: true,
+  set(value: T, timestamp?: number): void {
+    const ts = timestamp ?? Date.now();
+    if (ts > this.timestamp) {
+      this.value = value;
+      this.timestamp = ts;
+    }
+  }
+
+  get(): T | undefined {
+    return this.value;
+  }
+
+  merge(other: LWWRegister<T>): LWWRegister<T> {
+    const merged = new LWWRegister<T>(this.nodeId);
+    
+    if (this.timestamp >= other.timestamp) {
+      merged.value = this.value;
+      merged.timestamp = this.timestamp;
+    } else {
+      merged.value = other.value;
+      merged.timestamp = other.timestamp;
+    }
+    
+    return merged;
+  }
+}
+
+// Practical CRDT: Collaborative Document Editing
+class CRDTDocument {
+  private content: Map<string, { char: string; timestamp: number; nodeId: string }>;
+  private deletions: Set<string>;
+  private nodeId: string;
+
+  constructor(nodeId: string) {
+    this.nodeId = nodeId;
+    this.content = new Map();
+    this.deletions = new Set();
+  }
+
+  insert(position: number, char: string): string {
+    const id = `${this.nodeId}-${Date.now()}-${Math.random()}`;
+    this.content.set(id, {
+      char,
+      timestamp: Date.now(),
+      nodeId: this.nodeId,
     });
+    return id;
   }
 
-  discoverService(serviceName: string): ServiceEndpoint[] {
-    const clusterState = this.gossipNode.getClusterState();
-    const endpoints: ServiceEndpoint[] = [];
+  delete(id: string): void {
+    this.deletions.add(id);
+  }
 
-    for (const [, nodeState] of clusterState) {
-      const serviceData = nodeState.data[`service:${serviceName}`] as any;
-      if (serviceData?.healthy) {
-        endpoints.push({
-          endpoint: serviceData.endpoint,
-          port: serviceData.port,
-          nodeId: nodeState.nodeId,
-        });
+  getText(): string {
+    return [...this.content.entries()]
+      .filter(([id]) => !this.deletions.has(id))
+      .sort(([, a], [, b]) => a.timestamp - b.timestamp)
+      .map(([, { char }]) => char)
+      .join('');
+  }
+
+  merge(other: CRDTDocument): void {
+    // Merge content
+    for (const [id, data] of other.content) {
+      if (!this.content.has(id)) {
+        this.content.set(id, data);
       }
     }
-
-    return endpoints;
-  }
-
-  markUnhealthy(serviceName: string): void {
-    this.gossipNode.updateLocalState(`service:${serviceName}`, {
-      healthy: false,
-      markedAt: Date.now(),
-    });
+    
+    // Merge deletions
+    for (const id of other.deletions) {
+      this.deletions.add(id);
+    }
   }
 }
 ```
 
 ---
 
-## 7. Change Data Capture (CDC)
+## 8. Multi-master Replication
 
 ```typescript
-// cdc/debezium-consumer.ts
-import { Kafka } from "kafkajs";
+// multi-master-replication.ts
 
-interface DebeziumEvent {
-  before: Record<string, unknown> | null;
-  after: Record<string, unknown> | null;
-  source: {
-    version: string;
-    connector: string;
-    name: string;
-    ts_ms: number;
-    db: string;
-    table: string;
-    txId: number;
-    lsn: number;
-  };
-  op: "c" | "u" | "d" | "r";  // create, update, delete, read (snapshot)
-  ts_ms: number;
+interface ReplicationNode {
+  nodeId: string;
+  endpoint: string;
+  priority: number;
 }
 
-class CDCConsumer {
-  private readonly kafka: Kafka;
+interface ReplicationConflict {
+  key: string;
+  versions: Array<{
+    value: unknown;
+    nodeId: string;
+    timestamp: number;
+  }>;
+}
 
-  constructor(brokers: string[]) {
-    this.kafka = new Kafka({
-      clientId: "cdc-consumer",
-      brokers,
-    });
+class MultiMasterReplication {
+  private nodes: ReplicationNode[];
+  private localNodeId: string;
+  private db: Pool;
+  private conflictLog: ReplicationConflict[] = [];
+
+  constructor(localNodeId: string, nodes: ReplicationNode[], db: Pool) {
+    this.localNodeId = localNodeId;
+    this.nodes = nodes;
+    this.db = db;
   }
 
-  async consume(
-    tables: string[],
-    handlers: {
-      onCreate?: (data: Record<string, unknown>, source: DebeziumEvent["source"]) => Promise<void>;
-      onUpdate?: (before: Record<string, unknown>, after: Record<string, unknown>, source: DebeziumEvent["source"]) => Promise<void>;
-      onDelete?: (data: Record<string, unknown>, source: DebeziumEvent["source"]) => Promise<void>;
-    }
+  async write(key: string, value: unknown): Promise<void> {
+    const timestamp = Date.now();
+    
+    // Write locally ก่อน
+    await this.localWrite(key, value, timestamp);
+    
+    // Async replicate ไปยัง nodes อื่น
+    this.replicateToOtherNodes(key, value, timestamp);
+  }
+
+  private async localWrite(
+    key: string,
+    value: unknown,
+    timestamp: number
   ): Promise<void> {
-    const consumer = this.kafka.consumer({ groupId: "cdc-processor" });
-    await consumer.connect();
+    await this.db.query(
+      `INSERT INTO replicated_data (key, value, node_id, timestamp)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (key) DO UPDATE
+       SET value = CASE 
+         WHEN excluded.timestamp > replicated_data.timestamp THEN excluded.value
+         ELSE replicated_data.value
+       END,
+       timestamp = GREATEST(excluded.timestamp, replicated_data.timestamp),
+       updated_at = NOW()`,
+      [key, JSON.stringify(value), this.localNodeId, timestamp]
+    );
+  }
 
-    const topics = tables.map((t) => `dbserver.public.${t}`);
-    await consumer.subscribe({ topics, fromBeginning: false });
+  private replicateToOtherNodes(
+    key: string,
+    value: unknown,
+    timestamp: number
+  ): void {
+    // Fire and forget - async replication
+    for (const node of this.nodes) {
+      if (node.nodeId === this.localNodeId) continue;
+      
+      this.replicateToNode(node, key, value, timestamp).catch(err => {
+        console.error(`Replication to ${node.nodeId} failed:`, err);
+        this.queueForRetry(node.nodeId, key, value, timestamp);
+      });
+    }
+  }
 
-    await consumer.run({
-      eachMessage: async ({ message }) => {
-        if (!message.value) return;
+  private async replicateToNode(
+    node: ReplicationNode,
+    key: string,
+    value: unknown,
+    timestamp: number
+  ): Promise<void> {
+    const response = await fetch(`${node.endpoint}/replicate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key,
+        value,
+        timestamp,
+        sourceNodeId: this.localNodeId,
+      }),
+    });
 
-        const event: DebeziumEvent = JSON.parse(message.value.toString());
+    if (!response.ok) {
+      throw new Error(`Replication failed: ${response.status}`);
+    }
+  }
 
-        try {
-          switch (event.op) {
-            case "c":
-              if (handlers.onCreate && event.after) {
-                await handlers.onCreate(event.after, event.source);
-              }
-              break;
-            case "u":
-              if (handlers.onUpdate && event.before && event.after) {
-                await handlers.onUpdate(event.before, event.after, event.source);
-              }
-              break;
-            case "d":
-              if (handlers.onDelete && event.before) {
-                await handlers.onDelete(event.before, event.source);
-              }
-              break;
-          }
-        } catch (error) {
-          console.error("Failed to process CDC event:", error);
-          // DLQ handling
-          await this.sendToDLQ(message, error as Error);
+  async receiveReplication(
+    key: string,
+    value: unknown,
+    timestamp: number,
+    sourceNodeId: string
+  ): Promise<void> {
+    // ตรวจสอบว่ามี conflict ไหม
+    const existing = await this.db.query<{
+      value: string;
+      node_id: string;
+      timestamp: number;
+    }>(
+      'SELECT value, node_id, timestamp FROM replicated_data WHERE key=$1',
+      [key]
+    );
+
+    if (existing.rows.length > 0) {
+      const currentTimestamp = existing.rows[0].timestamp;
+      
+      if (timestamp === currentTimestamp && sourceNodeId !== existing.rows[0].node_id) {
+        // Conflict! เวลาเท่ากันแต่ node ต่างกัน
+        this.conflictLog.push({
+          key,
+          versions: [
+            {
+              value: JSON.parse(existing.rows[0].value),
+              nodeId: existing.rows[0].node_id,
+              timestamp: currentTimestamp,
+            },
+            { value, nodeId: sourceNodeId, timestamp },
+          ],
+        });
+        
+        // Resolve ด้วย node ID (deterministic)
+        if (sourceNodeId > existing.rows[0].node_id) {
+          await this.localWrite(key, value, timestamp);
         }
-      },
+        return;
+      }
+    }
+
+    await this.localWrite(key, value, timestamp);
+  }
+
+  private async queueForRetry(
+    nodeId: string,
+    key: string,
+    value: unknown,
+    timestamp: number
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO replication_queue (target_node_id, key, value, timestamp, retry_count)
+       VALUES ($1, $2, $3, $4, 0)`,
+      [nodeId, key, JSON.stringify(value), timestamp]
+    );
+  }
+
+  getConflicts(): ReplicationConflict[] {
+    return [...this.conflictLog];
+  }
+}
+```
+
+---
+
+## 9. Synchronous vs Asynchronous Replication
+
+```typescript
+// replication-strategies.ts
+
+interface ReplicationConfig {
+  strategy: 'sync' | 'async' | 'semi-sync';
+  quorumSize?: number;
+  timeout?: number;
+  maxLag?: number; // milliseconds
+}
+
+class ReplicationManager {
+  private config: ReplicationConfig;
+  private replicas: string[];
+  private lagMonitor: Map<string, number> = new Map();
+
+  constructor(config: ReplicationConfig, replicas: string[]) {
+    this.config = config;
+    this.replicas = replicas;
+    this.startLagMonitoring();
+  }
+
+  async write(data: unknown): Promise<{ success: boolean; latency: number }> {
+    const start = Date.now();
+
+    switch (this.config.strategy) {
+      case 'sync':
+        await this.synchronousWrite(data);
+        break;
+      case 'async':
+        await this.asynchronousWrite(data);
+        break;
+      case 'semi-sync':
+        await this.semiSynchronousWrite(data);
+        break;
+    }
+
+    return { success: true, latency: Date.now() - start };
+  }
+
+  // Synchronous: รอ ack จากทุก replica
+  private async synchronousWrite(data: unknown): Promise<void> {
+    const promises = this.replicas.map(replica =>
+      this.writeToReplica(replica, data)
+    );
+
+    await Promise.all(promises);
+  }
+
+  // Asynchronous: ไม่รอ replica
+  private async asynchronousWrite(data: unknown): Promise<void> {
+    // Write ที่ primary แล้วส่ง async
+    for (const replica of this.replicas) {
+      this.writeToReplica(replica, data).catch(err =>
+        console.error(`Async write to ${replica} failed:`, err)
+      );
+    }
+  }
+
+  // Semi-synchronous: รอ quorum
+  private async semiSynchronousWrite(data: unknown): Promise<void> {
+    const quorum = this.config.quorumSize || Math.floor(this.replicas.length / 2) + 1;
+    let confirmed = 1; // count primary
+
+    const promises = this.replicas.map(replica =>
+      this.writeToReplica(replica, data)
+        .then(() => { confirmed++; })
+        .catch(err => console.error(`Replica write failed:`, err))
+    );
+
+    // รอจนถึง quorum
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (confirmed >= quorum) {
+          resolve();
+        } else {
+          reject(new Error(`Quorum not reached: ${confirmed}/${quorum}`));
+        }
+      }, this.config.timeout || 5000);
+
+      Promise.allSettled(promises).then(() => {
+        clearTimeout(timeout);
+        if (confirmed >= quorum) {
+          resolve();
+        } else {
+          reject(new Error(`Quorum not reached: ${confirmed}/${quorum}`));
+        }
+      });
+    });
+
+    // ส่ง ack ไปยัง replicas ที่เหลือแบบ async
+  }
+
+  private async writeToReplica(replica: string, data: unknown): Promise<void> {
+    const start = Date.now();
+    
+    await fetch(`${replica}/replicate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+
+    this.lagMonitor.set(replica, Date.now() - start);
+  }
+
+  private startLagMonitoring(): void {
+    setInterval(() => {
+      for (const [replica, lag] of this.lagMonitor) {
+        if (this.config.maxLag && lag > this.config.maxLag) {
+          console.warn(`Replica ${replica} is lagging: ${lag}ms`);
+        }
+      }
+    }, 5000);
+  }
+
+  getReplicationLag(): Map<string, number> {
+    return new Map(this.lagMonitor);
+  }
+}
+```
+
+---
+
+## 10. Data Consistency Testing Strategies
+
+```typescript
+// consistency-testing.ts
+// การทดสอบ Data Consistency ใน Distributed System
+
+import { describe, test, expect, beforeEach, afterEach } from '@jest/globals';
+
+// Linearizability Checker
+class LinearizabilityChecker {
+  private operations: Array<{
+    type: 'read' | 'write';
+    key: string;
+    value?: unknown;
+    result?: unknown;
+    startTime: number;
+    endTime: number;
+    processId: string;
+  }> = [];
+
+  recordWrite(
+    key: string,
+    value: unknown,
+    startTime: number,
+    endTime: number,
+    processId: string
+  ): void {
+    this.operations.push({
+      type: 'write', key, value, startTime, endTime, processId
     });
   }
 
-  private async sendToDLQ(message: any, error: Error): Promise<void> {
-    const producer = this.kafka.producer();
-    await producer.connect();
-    await producer.send({
-      topic: "cdc-dlq",
-      messages: [
-        {
-          value: JSON.stringify({
-            originalMessage: message,
-            error: error.message,
-            timestamp: Date.now(),
-          }),
-        },
-      ],
+  recordRead(
+    key: string,
+    result: unknown,
+    startTime: number,
+    endTime: number,
+    processId: string
+  ): void {
+    this.operations.push({
+      type: 'read', key, result, startTime, endTime, processId
     });
-    await producer.disconnect();
+  }
+
+  // ตรวจสอบว่า history เป็น linearizable ไหม
+  isLinearizable(): boolean {
+    // Simplified check: reads should see the latest completed write
+    const writes = this.operations.filter(op => op.type === 'write');
+    const reads = this.operations.filter(op => op.type === 'read');
+
+    for (const read of reads) {
+      // หา writes ที่เสร็จก่อน read เริ่ม
+      const completedWrites = writes.filter(
+        w => w.key === read.key && w.endTime <= read.startTime
+      );
+
+      if (completedWrites.length === 0) continue;
+
+      // Read ควรเห็น write ล่าสุด
+      const latestWrite = completedWrites.reduce((latest, current) =>
+        current.endTime > latest.endTime ? current : latest
+      );
+
+      if (JSON.stringify(read.result) !== JSON.stringify(latestWrite.value)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 }
 
-// Sync inventory service สำหรับ search index
-const cdcConsumer = new CDCConsumer(["kafka:9092"]);
+// Jepsen-inspired consistency test
+describe('Data Consistency Tests', () => {
+  let checker: LinearizabilityChecker;
 
-await cdcConsumer.consume(["products", "inventory"], {
-  onCreate: async (data) => {
-    await searchIndex.index("products", data.id as string, {
-      name: data.name,
-      description: data.description,
-      price: data.price,
-      inStock: (data.stock_quantity as number) > 0,
-    });
-  },
-  onUpdate: async (_before, after) => {
-    await searchIndex.update("products", after.id as string, {
-      name: after.name,
-      price: after.price,
-      inStock: (after.stock_quantity as number) > 0,
-    });
-  },
-  onDelete: async (before) => {
-    await searchIndex.delete("products", before.id as string);
-  },
+  beforeEach(() => {
+    checker = new LinearizabilityChecker();
+  });
+
+  test('Read-Your-Writes: should see own writes', async () => {
+    const userId = 'test-user-1';
+    // สมมติ service
+    const service = {
+      write: async (key: string, value: unknown) => {
+        const start = Date.now();
+        // simulate write
+        await new Promise(r => setTimeout(r, 10));
+        const end = Date.now();
+        checker.recordWrite(key, value, start, end, userId);
+      },
+      read: async (key: string): Promise<unknown> => {
+        const start = Date.now();
+        // simulate read
+        await new Promise(r => setTimeout(r, 5));
+        const result = { name: 'test' }; // simulated result
+        const end = Date.now();
+        checker.recordRead(key, result, start, end, userId);
+        return result;
+      },
+    };
+
+    await service.write('user:1', { name: 'test' });
+    const result = await service.read('user:1');
+    
+    expect(result).toEqual({ name: 'test' });
+  });
+
+  test('Monotonic Reads: should not see older data after newer', async () => {
+    const versions: number[] = [];
+    
+    // Simulate multiple reads
+    for (let i = 0; i < 5; i++) {
+      const version = Math.floor(Math.random() * 10) + 1;
+      versions.push(version);
+    }
+
+    // Check monotonic property
+    let maxSeen = 0;
+    for (const version of versions) {
+      // In a monotonic read system, this should always increase
+      maxSeen = Math.max(maxSeen, version);
+    }
+    
+    // Verify no regression (simplified test)
+    expect(maxSeen).toBeGreaterThanOrEqual(versions[0]);
+  });
+
+  test('Eventual Consistency: all replicas should converge', async () => {
+    const replicas = [
+      new Map<string, unknown>(),
+      new Map<string, unknown>(),
+      new Map<string, unknown>(),
+    ];
+
+    // Simulate writes to different replicas
+    replicas[0].set('key1', 'value1');
+    replicas[1].set('key2', 'value2');
+    replicas[2].set('key3', 'value3');
+
+    // Simulate sync (eventual consistency)
+    const mergeReplicas = () => {
+      const merged = new Map<string, unknown>();
+      for (const replica of replicas) {
+        for (const [k, v] of replica) {
+          merged.set(k, v);
+        }
+      }
+      replicas.forEach(r => {
+        for (const [k, v] of merged) {
+          r.set(k, v);
+        }
+      });
+    };
+
+    // After convergence
+    await new Promise(resolve => setTimeout(resolve, 100));
+    mergeReplicas();
+
+    // All replicas should have same data
+    const data0 = Object.fromEntries(replicas[0]);
+    const data1 = Object.fromEntries(replicas[1]);
+    const data2 = Object.fromEntries(replicas[2]);
+
+    expect(data0).toEqual(data1);
+    expect(data1).toEqual(data2);
+  });
 });
+
+// Consistency Testing with Chaos
+class ConsistencyTestWithChaos {
+  async testWithNetworkPartition(
+    writeNode: () => Promise<void>,
+    readNodes: Array<() => Promise<unknown>>,
+    healPartition: () => Promise<void>
+  ): Promise<{
+    writeDuringPartition: boolean;
+    readsBeforeHeal: unknown[];
+    readsAfterConvergence: unknown[];
+  }> {
+    let writeDuringPartition = false;
+
+    try {
+      await writeNode();
+      writeDuringPartition = true;
+    } catch {
+      writeDuringPartition = false;
+    }
+
+    // อ่านระหว่าง partition
+    const readsBeforeHeal = await Promise.all(
+      readNodes.map(read => read().catch(() => null))
+    );
+
+    // Heal partition
+    await healPartition();
+    
+    // รอให้ converge
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // อ่านหลัง convergence
+    const readsAfterConvergence = await Promise.all(
+      readNodes.map(read => read().catch(() => null))
+    );
+
+    return { writeDuringPartition, readsBeforeHeal, readsAfterConvergence };
+  }
+}
 ```
+
+---
+
+## Kubernetes Deployment สำหรับ Consistency Services
+
+```yaml
+# consistency-service-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consistency-service
+  namespace: microservices
+  labels:
+    app: consistency-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: consistency-service
+  template:
+    metadata:
+      labels:
+        app: consistency-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+    spec:
+      containers:
+        - name: consistency-service
+          image: consistency-service:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REPLICA_NODES
+              value: "node-1:3000,node-2:3000,node-3:3000"
+            - name: CONSISTENCY_LEVEL
+              value: "quorum"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+# PostgreSQL Primary-Replica Setup
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: microservices
+data:
+  postgresql.conf: |
+    wal_level = replica
+    max_wal_senders = 10
+    wal_keep_size = 1GB
+    synchronous_commit = on
+    synchronous_standby_names = 'FIRST 1 (replica1, replica2)'
+  
+  pg_hba.conf: |
+    host replication replicator 10.0.0.0/8 md5
+    host all all 0.0.0.0/0 md5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: microservices
+spec:
+  selector:
+    app: postgres
+    role: primary
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica
+  namespace: microservices
+spec:
+  selector:
+    app: postgres
+    role: replica
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# PodDisruptionBudget เพื่อรับประกัน availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: consistency-service-pdb
+  namespace: microservices
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: consistency-service
+```
+
+---
+
+## สรุปตารางเปรียบเทียบ Data Consistency Patterns
+
+| Pattern | Consistency Level | Performance | Use Case | Trade-off |
+|---------|------------------|-------------|----------|-----------|
+| Strong Consistency | สูงมาก | ต่ำ (latency สูง) | Financial, Inventory | Availability ลดลง |
+| Eventual Consistency | อ่อน | สูง (latency ต่ำ) | Social Media, Analytics | ข้อมูลอาจ stale ชั่วคราว |
+| Read-Your-Writes | ปานกลาง | ปานกลาง | User Profile, Settings | Session-based routing |
+| Monotonic Reads | ปานกลาง | ปานกลาง | Feed, Timeline | Version tracking |
+| Consistent Prefix | ปานกลาง | ปานกลาง | Event Sourcing | Sequence gaps |
+| Causal Consistency | ปานกลาง-สูง | ปานกลาง | Collaboration Tools | Vector clock overhead |
+| Linearizability | สูงสุด | ต่ำมาก | Critical Transactions | Quorum latency |
+
+| CRDT Type | Operations | Conflict-free | Use Case |
+|-----------|-----------|---------------|----------|
+| G-Counter | Increment only | ใช่ | View counts, Likes |
+| PN-Counter | Inc/Dec | ใช่ | Stock levels |
+| OR-Set | Add/Remove | ใช่ | Shopping cart |
+| LWW-Register | Set (LWW) | ใช่ | User settings |
+| RGA | Insert/Delete | ใช่ | Collaborative text |
+
+| Replication Strategy | Consistency | Latency | Failure Tolerance |
+|---------------------|-------------|---------|-------------------|
+| Synchronous | สูงสุด | สูง | ต่ำ (รอทุก replica) |
+| Asynchronous | ต่ำ (eventual) | ต่ำ | สูง |
+| Semi-synchronous | ปานกลาง | ปานกลาง | ปานกลาง |
+| Quorum | ปรับได้ | ปรับได้ | ปรับได้ |
 
 ---
 
 ## สรุป
 
-ใน Part นี้เราได้เรียนรู้ Data Consistency Patterns ที่สำคัญ:
+Data Consistency เป็นหัวใจสำคัญของ Microservices Architecture:
 
-1. **Eventual Consistency** — ยอมรับ temporary inconsistency แลกกับ availability และ performance สูงขึ้น
-2. **Last Write Wins (LWW)** — conflict resolution แบบง่าย เหมาะกับ profile updates
-3. **Vector Clocks** — ตรวจจับ concurrent writes และระบุ conflicts อย่างแม่นยำ
-4. **Read-Your-Writes** — รับประกันว่า user เห็น writes ของตัวเองทันที
-5. **Monotonic Reads** — รับประกันว่า version ไม่ถอยหลัง
-6. **CRDTs** — data structures ที่ merge ได้อัตโนมัติ: G-Set, 2P-Set, OR-Set, G-Counter, PN-Counter
-7. **Gossip Protocol** — distributed state sharing แบบ decentralized
-8. **Change Data Capture (CDC)** — sync data changes ข้าม services ผ่าน event stream
-
-Key insight: ไม่มี consistency model ที่ดีที่สุดสำหรับทุก use case — ต้องเลือกตาม requirements ของ business logic และยอมรับ trade-offs ที่เหมาะสม
+1. **Eventual Consistency** เหมาะกับระบบ high-traffic ที่ยอมให้มีความล่าช้าเล็กน้อย
+2. **Strong Consistency** จำเป็นสำหรับ financial transactions แต่แลกมาด้วย latency
+3. **CAP Theorem** บังคับให้เลือกระหว่าง Consistency กับ Availability เมื่อเกิด Partition
+4. **Vector Clocks** ช่วยติดตามลำดับ events และตรวจจับ conflicts
+5. **CRDTs** ให้ merge ข้อมูลแบบ conflict-free โดยไม่ต้องประสานงาน
+6. **Outbox Pattern** รับประกัน at-least-once delivery ของ events
+7. **Saga Pattern** จัดการ distributed transactions แบบ eventually consistent
