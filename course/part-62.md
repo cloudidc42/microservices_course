@@ -1,1257 +1,1127 @@
-# Part 62: Distributed Lock Patterns
+# Part 62: Distributed Lock
 
 ## บทนำ
 
-ใน Microservices Architecture ที่มีหลาย Instance ทำงานพร้อมกัน การจัดการ Concurrent Access ต่อ Shared Resources เป็นปัญหาสำคัญ Distributed Lock ช่วยให้มั่นใจได้ว่า Operation ที่ต้องการ Mutual Exclusion จะทำงานได้ถูกต้อง บทนี้ครอบคลุม Redis SETNX, Redlock Algorithm, Database Advisory Locks, Fencing Tokens, Leader Election และการป้องกัน Deadlock
+Distributed Lock เป็น Mechanism สำหรับการ synchronize การทำงานของ Process หลายๆ ตัว
+ที่รันบน Node ต่างๆ ใน Distributed System เพื่อป้องกัน Race Condition และ Concurrent Access
+ปัญหาหลักคือต้องมั่นใจว่า Lock จะ release เสมอ แม้ว่า Process จะ crash
 
-## 1. Redis SETNX-based Lock
+---
 
-### 1.1 Simple Redis Lock
+## 1. Redis-Based Distributed Lock (Redlock Algorithm)
+
+### หลักการทำงานของ Redlock
+
+```
+Redlock Algorithm (ใช้กับ Redis Cluster หลาย nodes):
+1. Get current timestamp T1
+2. Attempt to acquire lock on N/2+1 nodes
+3. If acquired on quorum with total time < TTL: lock acquired
+4. Otherwise: release all locks and retry
+```
+
+### Implementation ด้วย ioredis
 
 ```typescript
-// src/locks/redis-lock.ts
+// src/distributed-lock/redis-lock.service.ts
+import { Injectable, Logger } from '@nestjs/common';
 import Redis from 'ioredis';
-import { logger } from '../utils/logger';
-import crypto from 'crypto';
+import * as crypto from 'crypto';
 
-interface LockOptions {
-  ttlMs: number;           // Time-to-live ของ Lock
-  retryCount?: number;     // จำนวนครั้งที่ลองใหม่
-  retryDelayMs?: number;   // ช่วงเวลารอระหว่างการลอง
-  retryJitter?: number;    // Random jitter สำหรับป้องกัน Thundering Herd
+export interface LockOptions {
+  ttlMs: number;           // Time-to-live ของ lock
+  retryCount?: number;     // จำนวน retry
+  retryDelayMs?: number;   // Delay ระหว่าง retry
+  retryJitter?: number;    // Random jitter สำหรับ retry
 }
 
-interface AcquiredLock {
+export interface LockHandle {
   key: string;
-  token: string;
-  expiresAt: number;
-  release: () => Promise<boolean>;
-  extend: (additionalMs: number) => Promise<boolean>;
+  value: string;  // Unique value สำหรับระบุ owner
+  expiresAt: Date;
 }
 
-export class RedisLock {
-  private unlockScript: string;
-  private extendScript: string;
+@Injectable()
+export class RedisDistributedLockService {
+  private readonly logger = new Logger(RedisDistributedLockService.name);
 
-  constructor(private redis: Redis) {
-    // Lua Script สำหรับ Atomic Unlock (ตรวจสอบ token ก่อน unlock)
-    this.unlockScript = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      else
-        return 0
-      end
-    `;
+  // Lua script สำหรับ atomic SET NX PX
+  private readonly SET_LOCK_SCRIPT = `
+    if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+      return 1
+    else
+      return 0
+    end
+  `;
 
-    // Lua Script สำหรับ Atomic Extend
-    this.extendScript = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("pexpire", KEYS[1], ARGV[2])
-      else
-        return 0
-      end
-    `;
-  }
+  // Lua script สำหรับ atomic release (ตรวจสอบ owner ก่อน delete)
+  private readonly RELEASE_LOCK_SCRIPT = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    else
+      return 0
+    end
+  `;
 
-  async acquire(
-    resource: string,
-    options: LockOptions
-  ): Promise<AcquiredLock | null> {
-    const key = `lock:${resource}`;
-    const token = crypto.randomBytes(16).toString('hex');
-    const retryCount = options.retryCount ?? 0;
-    const retryDelay = options.retryDelayMs ?? 100;
-    const jitter = options.retryJitter ?? 50;
+  // Lua script สำหรับ extend lock TTL
+  private readonly EXTEND_LOCK_SCRIPT = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+    else
+      return 0
+    end
+  `;
+
+  constructor(private readonly redis: Redis) {}
+
+  async acquire(key: string, options: LockOptions): Promise<LockHandle | null> {
+    const lockKey = `lock:${key}`;
+    const lockValue = crypto.randomUUID();
+    const { ttlMs, retryCount = 0, retryDelayMs = 100, retryJitter = 50 } = options;
 
     for (let attempt = 0; attempt <= retryCount; attempt++) {
-      if (attempt > 0) {
-        const delay = retryDelay + Math.random() * jitter;
-        await this.sleep(delay);
-      }
+      try {
+        const result = await this.redis.eval(
+          this.SET_LOCK_SCRIPT,
+          1,
+          lockKey,
+          lockValue,
+          ttlMs.toString()
+        );
 
-      // NX = Only set if Not Exists, PX = Expire in milliseconds
-      const result = await this.redis.set(
-        key,
-        token,
-        'NX',
-        'PX',
-        options.ttlMs
-      );
+        if (result === 1) {
+          const handle: LockHandle = {
+            key: lockKey,
+            value: lockValue,
+            expiresAt: new Date(Date.now() + ttlMs),
+          };
 
-      if (result === 'OK') {
-        logger.debug('Lock acquired', { resource, token: token.substring(0, 8) });
-        
-        const expiresAt = Date.now() + options.ttlMs;
-        
-        return {
-          key,
-          token,
-          expiresAt,
-          release: () => this.release(key, token),
-          extend: (additionalMs: number) => this.extend(key, token, additionalMs),
-        };
+          this.logger.debug(`Lock acquired: ${key} (expires at ${handle.expiresAt.toISOString()})`);
+          return handle;
+        }
+
+        if (attempt < retryCount) {
+          const jitter = Math.random() * retryJitter;
+          const delay = retryDelayMs + jitter;
+          this.logger.debug(`Lock ${key} busy, retrying in ${delay}ms (attempt ${attempt + 1}/${retryCount})`);
+          await this.sleep(delay);
+        }
+      } catch (error) {
+        this.logger.error(`Error acquiring lock ${key}:`, error);
+        if (attempt === retryCount) throw error;
       }
     }
 
-    logger.warn('Failed to acquire lock', { resource, attempts: retryCount + 1 });
+    this.logger.warn(`Failed to acquire lock: ${key} after ${retryCount + 1} attempts`);
     return null;
   }
 
-  private async release(key: string, token: string): Promise<boolean> {
-    const result = await this.redis.eval(
-      this.unlockScript,
-      1,
-      key,
-      token
-    ) as number;
+  async release(handle: LockHandle): Promise<boolean> {
+    try {
+      const result = await this.redis.eval(
+        this.RELEASE_LOCK_SCRIPT,
+        1,
+        handle.key,
+        handle.value
+      );
 
-    const released = result === 1;
-    
-    if (released) {
-      logger.debug('Lock released', { key, token: token.substring(0, 8) });
-    } else {
-      logger.warn('Failed to release lock (expired or stolen)', { key });
+      const released = result === 1;
+      if (released) {
+        this.logger.debug(`Lock released: ${handle.key}`);
+      } else {
+        this.logger.warn(`Lock ${handle.key} was already released or expired`);
+      }
+
+      return released;
+    } catch (error) {
+      this.logger.error(`Error releasing lock ${handle.key}:`, error);
+      return false;
     }
-    
-    return released;
   }
 
-  private async extend(
-    key: string,
-    token: string,
-    additionalMs: number
-  ): Promise<boolean> {
-    const result = await this.redis.eval(
-      this.extendScript,
-      1,
-      key,
-      token,
-      additionalMs.toString()
-    ) as number;
+  async extend(handle: LockHandle, additionalTtlMs: number): Promise<boolean> {
+    try {
+      const result = await this.redis.eval(
+        this.EXTEND_LOCK_SCRIPT,
+        1,
+        handle.key,
+        handle.value,
+        additionalTtlMs.toString()
+      );
 
-    return result === 1;
+      if (result === 1) {
+        handle.expiresAt = new Date(Date.now() + additionalTtlMs);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.error(`Error extending lock ${handle.key}:`, error);
+      return false;
+    }
   }
 
-  // Helper สำหรับใช้งานแบบ with-lock pattern
+  // Convenience method: ทำงานกับ lock อัตโนมัติ
   async withLock<T>(
-    resource: string,
+    key: string,
     options: LockOptions,
-    fn: () => Promise<T>
+    fn: (handle: LockHandle) => Promise<T>
   ): Promise<T> {
-    const lock = await this.acquire(resource, options);
-    
-    if (!lock) {
-      throw new Error(`Could not acquire lock for resource: ${resource}`);
+    const handle = await this.acquire(key, options);
+
+    if (!handle) {
+      throw new Error(`Unable to acquire lock: ${key}`);
     }
 
     try {
-      const result = await fn();
-      return result;
+      return await fn(handle);
     } finally {
-      await lock.release();
+      await this.release(handle);
     }
+  }
+
+  async isLocked(key: string): Promise<boolean> {
+    const exists = await this.redis.exists(`lock:${key}`);
+    return exists === 1;
+  }
+
+  async getLockInfo(key: string): Promise<{ owner: string; ttl: number } | null> {
+    const lockKey = `lock:${key}`;
+    const [value, ttl] = await Promise.all([
+      this.redis.get(lockKey),
+      this.redis.pttl(lockKey),
+    ]);
+
+    if (!value || ttl < 0) return null;
+
+    return { owner: value, ttl };
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
-
-// ตัวอย่างการใช้งาน: ป้องกัน Double Spending ในระบบ Payment ไทย
-class PaymentProcessor {
-  constructor(
-    private redisLock: RedisLock,
-    private db: any
-  ) {}
-
-  async processPayment(userId: string, amount: number, orderId: string) {
-    // Lock บน User เพื่อป้องกัน Concurrent Payment
-    return this.redisLock.withLock(
-      `payment:user:${userId}`,
-      {
-        ttlMs: 30000,       // Lock 30 วินาที
-        retryCount: 3,      // ลองใหม่ 3 ครั้ง
-        retryDelayMs: 200,  // รอ 200ms
-        retryJitter: 100,   // Random jitter 0-100ms
-      },
-      async () => {
-        // ตรวจสอบ Balance
-        const balance = await this.db.getUserBalance(userId);
-        
-        if (balance < amount) {
-          throw new Error('Insufficient balance');
-        }
-        
-        // ตรวจสอบว่า Order ยังไม่ถูกชำระ
-        const existingPayment = await this.db.findPaymentByOrderId(orderId);
-        if (existingPayment) {
-          throw new Error('Order already paid');
-        }
-        
-        // ดำเนินการชำระเงิน
-        await this.db.deductBalance(userId, amount);
-        const payment = await this.db.createPayment({ userId, amount, orderId });
-        
-        return payment;
-      }
-    );
-  }
-}
 ```
 
-## 2. Redlock Algorithm
-
-Redlock เป็น Algorithm ที่ Redis เองแนะนำสำหรับ Distributed Lock ที่ใช้ Redis Nodes หลาย Node
-
-### 2.1 Redlock Implementation
+### Redlock Multi-Node Implementation
 
 ```typescript
-// src/locks/redlock.ts
+// src/distributed-lock/redlock.service.ts
 import Redis from 'ioredis';
-import crypto from 'crypto';
-import { logger } from '../utils/logger';
+import * as crypto from 'crypto';
 
-interface RedlockConfig {
-  retryCount: number;
-  retryDelay: number;
-  retryJitter: number;
-  driftFactor: number;  // Clock drift factor (default 0.01 = 1%)
+interface RedlockOptions {
+  driftFactor?: number;  // Clock drift factor
+  retryCount?: number;
+  retryDelay?: number;
+  retryJitter?: number;
 }
 
-interface RedlockInstance {
-  resource: string;
-  value: string;
-  validityTime: number;  // เวลาที่ Lock ยังใช้ได้ (ms)
-  release: () => Promise<void>;
-}
+export class RedlockService {
+  private readonly driftFactor: number;
+  private readonly retryCount: number;
+  private readonly retryDelay: number;
+  private readonly retryJitter: number;
+  private readonly quorum: number;
 
-export class Redlock {
-  private clients: Redis[];
-  private quorum: number;
-  private config: RedlockConfig;
-  
-  private unlockScript = `
-    if redis.call("get", KEYS[1]) == ARGV[1] then
-      return redis.call("del", KEYS[1])
+  private readonly RELEASE_SCRIPT = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
     else
       return 0
     end
   `;
 
-  constructor(clients: Redis[], config?: Partial<RedlockConfig>) {
-    if (clients.length < 3) {
-      throw new Error('Redlock requires at least 3 Redis instances for safety');
-    }
-    
-    this.clients = clients;
+  constructor(
+    private readonly clients: Redis[],  // หลาย Redis nodes
+    options: RedlockOptions = {}
+  ) {
+    this.driftFactor = options.driftFactor ?? 0.01;
+    this.retryCount = options.retryCount ?? 3;
+    this.retryDelay = options.retryDelay ?? 200;
+    this.retryJitter = options.retryJitter ?? 100;
     this.quorum = Math.floor(clients.length / 2) + 1;
-    this.config = {
-      retryCount: config?.retryCount ?? 3,
-      retryDelay: config?.retryDelay ?? 200,
-      retryJitter: config?.retryJitter ?? 100,
-      driftFactor: config?.driftFactor ?? 0.01,
-    };
   }
 
-  async acquire(resource: string, ttlMs: number): Promise<RedlockInstance> {
+  async acquire(resource: string, ttlMs: number): Promise<string | null> {
     const value = crypto.randomBytes(20).toString('hex');
-    
-    for (let attempt = 0; attempt < this.config.retryCount; attempt++) {
-      if (attempt > 0) {
-        const delay = this.config.retryDelay + 
-          Math.random() * this.config.retryJitter;
-        await this.sleep(delay);
-      }
 
+    for (let attempt = 0; attempt < this.retryCount; attempt++) {
       const startTime = Date.now();
-      let successCount = 0;
+      let locksAcquired = 0;
 
-      // ลองล็อคใน Redis ทุก Node พร้อมกัน
-      const lockPromises = this.clients.map(client =>
-        this.lockInstance(client, resource, value, ttlMs)
+      // Try to acquire lock on each node
+      const results = await Promise.allSettled(
+        this.clients.map(client =>
+          this.acquireOnNode(client, resource, value, ttlMs)
+        )
       );
 
-      const results = await Promise.allSettled(lockPromises);
-      
       for (const result of results) {
         if (result.status === 'fulfilled' && result.value) {
-          successCount++;
+          locksAcquired++;
         }
       }
 
       const elapsedTime = Date.now() - startTime;
-      const drift = Math.ceil(this.config.driftFactor * ttlMs) + 2;
+      const drift = Math.floor(ttlMs * this.driftFactor) + 2;
       const validityTime = ttlMs - elapsedTime - drift;
 
-      // ต้องได้ Quorum (majority) และ Lock ยังไม่หมดอายุ
-      if (successCount >= this.quorum && validityTime > 0) {
-        logger.debug('Redlock acquired', {
-          resource,
-          successCount,
-          quorum: this.quorum,
-          validityTime,
-        });
-
-        return {
-          resource,
-          value,
-          validityTime,
-          release: () => this.release(resource, value),
-        };
+      if (locksAcquired >= this.quorum && validityTime > 0) {
+        return value;
       }
 
-      // ไม่ได้ Quorum - ปล่อย Lock ทั้งหมดที่ได้มา
-      await this.releaseAll(resource, value);
-      
-      logger.debug('Redlock acquisition failed', {
-        resource,
-        attempt: attempt + 1,
-        successCount,
-        quorum: this.quorum,
-      });
+      // ไม่ได้ quorum - release ทุก lock ที่ acquire ได้
+      await this.releaseOnAllNodes(resource, value);
+
+      if (attempt < this.retryCount - 1) {
+        const delay = this.retryDelay + Math.random() * this.retryJitter;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
     }
 
-    throw new Error(`Unable to acquire Redlock for resource: ${resource}`);
+    return null;
   }
 
-  private async lockInstance(
+  async release(resource: string, value: string): Promise<void> {
+    await this.releaseOnAllNodes(resource, value);
+  }
+
+  private async acquireOnNode(
     client: Redis,
     resource: string,
     value: string,
     ttlMs: number
   ): Promise<boolean> {
     try {
-      const result = await Promise.race([
-        client.set(resource, value, 'NX', 'PX', ttlMs),
-        this.sleep(ttlMs / 3).then(() => null), // Timeout
-      ]);
-      
+      const result = await client.set(resource, value, 'NX', 'PX', ttlMs);
       return result === 'OK';
-    } catch (error) {
+    } catch {
       return false;
     }
   }
 
-  private async release(resource: string, value: string): Promise<void> {
-    await this.releaseAll(resource, value);
+  private async releaseOnAllNodes(resource: string, value: string): Promise<void> {
+    await Promise.allSettled(
+      this.clients.map(client =>
+        client.eval(this.RELEASE_SCRIPT, 1, resource, value)
+      )
+    );
+  }
+}
+```
+
+---
+
+## 2. PostgreSQL Advisory Locks
+
+```typescript
+// src/distributed-lock/postgres-advisory-lock.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource, EntityManager } from 'typeorm';
+import * as crypto from 'crypto';
+
+@Injectable()
+export class PostgresAdvisoryLockService {
+  private readonly logger = new Logger(PostgresAdvisoryLockService.name);
+
+  constructor(private readonly dataSource: DataSource) {}
+
+  // แปลง string key เป็น bigint สำหรับ advisory lock
+  private keyToBigInt(key: string): bigint {
+    const hash = crypto.createHash('sha256').update(key).digest('hex');
+    // ใช้แค่ 8 bytes แรก
+    return BigInt('0x' + hash.substring(0, 16));
   }
 
-  private async releaseAll(resource: string, value: string): Promise<void> {
-    const releasePromises = this.clients.map(client =>
-      client.eval(this.unlockScript, 1, resource, value).catch(() => 0)
+  // Session-level lock (ต้อง release เอง)
+  async acquireSessionLock(key: string): Promise<boolean> {
+    const lockId = this.keyToBigInt(key);
+    
+    const result = await this.dataSource.query(
+      'SELECT pg_try_advisory_lock($1) as acquired',
+      [lockId.toString()]
     );
     
-    await Promise.allSettled(releasePromises);
+    const acquired = result[0].acquired as boolean;
+    if (acquired) {
+      this.logger.debug(`Session lock acquired: ${key}`);
+    }
+    
+    return acquired;
   }
 
-  async withLock<T>(
-    resource: string,
-    ttlMs: number,
-    fn: (lock: RedlockInstance) => Promise<T>
-  ): Promise<T> {
-    const lock = await this.acquire(resource, ttlMs);
+  async releaseSessionLock(key: string): Promise<void> {
+    const lockId = this.keyToBigInt(key);
     
+    await this.dataSource.query(
+      'SELECT pg_advisory_unlock($1)',
+      [lockId.toString()]
+    );
+    
+    this.logger.debug(`Session lock released: ${key}`);
+  }
+
+  // Transaction-level lock (auto-release เมื่อ transaction สิ้นสุด)
+  async acquireTransactionLock(
+    manager: EntityManager,
+    key: string
+  ): Promise<void> {
+    const lockId = this.keyToBigInt(key);
+    
+    await manager.query(
+      'SELECT pg_advisory_xact_lock($1)',
+      [lockId.toString()]
+    );
+    
+    this.logger.debug(`Transaction lock acquired: ${key}`);
+  }
+
+  async tryAcquireTransactionLock(
+    manager: EntityManager,
+    key: string
+  ): Promise<boolean> {
+    const lockId = this.keyToBigInt(key);
+    
+    const result = await manager.query(
+      'SELECT pg_try_advisory_xact_lock($1) as acquired',
+      [lockId.toString()]
+    );
+    
+    return result[0].acquired as boolean;
+  }
+
+  // Helper: ทำงานกับ session lock
+  async withSessionLock<T>(
+    key: string,
+    fn: () => Promise<T>,
+    timeoutMs = 10000
+  ): Promise<T> {
+    const acquired = await this.acquireSessionLock(key);
+    
+    if (!acquired) {
+      throw new Error(`Unable to acquire advisory lock: ${key}`);
+    }
+
     try {
-      return await fn(lock);
+      // Set statement timeout
+      await this.dataSource.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+      return await fn();
+    } finally {
+      await this.releaseSessionLock(key);
+    }
+  }
+
+  // Helper: ทำงานกับ transaction lock
+  async withTransactionLock<T>(
+    key: string,
+    fn: (manager: EntityManager) => Promise<T>
+  ): Promise<T> {
+    return this.dataSource.transaction(async (manager) => {
+      await this.acquireTransactionLock(manager, key);
+      return fn(manager);
+    });
+  }
+}
+```
+
+---
+
+## 3. Fencing Token
+
+```typescript
+// src/distributed-lock/fencing-token.ts
+
+// Fencing Token แก้ปัญหา "stale lock" ที่ GC pause หรือ network partition
+// ทุก lock จะได้รับ monotonically increasing token
+// Resource ต้องตรวจสอบว่า token ใหม่กว่า token ที่เคยเห็น
+
+export class FencingTokenService {
+  private readonly TOKEN_KEY = 'fencing:token:counter';
+
+  constructor(private readonly redis: Redis) {}
+
+  async acquireLockWithToken(key: string, ttlMs: number): Promise<{
+    lockHandle: LockHandle;
+    token: bigint;
+  } | null> {
+    const lockKey = `lock:${key}`;
+    const lockValue = crypto.randomUUID();
+
+    // Lua script สำหรับ atomic lock acquire + token increment
+    const ACQUIRE_WITH_TOKEN_SCRIPT = `
+      local acquired = redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2])
+      if acquired then
+        local token = redis.call("INCR", KEYS[2])
+        return {1, token}
+      else
+        return {0, 0}
+      end
+    `;
+
+    const result = await this.redis.eval(
+      ACQUIRE_WITH_TOKEN_SCRIPT,
+      2,
+      lockKey,
+      this.TOKEN_KEY,
+      lockValue,
+      ttlMs.toString()
+    ) as [number, number];
+
+    if (result[0] === 1) {
+      return {
+        lockHandle: {
+          key: lockKey,
+          value: lockValue,
+          expiresAt: new Date(Date.now() + ttlMs),
+        },
+        token: BigInt(result[1]),
+      };
+    }
+
+    return null;
+  }
+}
+
+// Storage Resource ที่ใช้ Fencing Token
+export class FencedStorage {
+  private lastSeenToken: bigint = 0n;
+
+  async write(
+    key: string,
+    value: unknown,
+    fencingToken: bigint
+  ): Promise<{ success: boolean; reason?: string }> {
+    // ตรวจสอบว่า token ใหม่กว่า
+    if (fencingToken <= this.lastSeenToken) {
+      return {
+        success: false,
+        reason: `Stale lock: token ${fencingToken} <= last seen ${this.lastSeenToken}`,
+      };
+    }
+
+    this.lastSeenToken = fencingToken;
+    // Write to storage...
+    return { success: true };
+  }
+}
+```
+
+---
+
+## 4. TypeScript DistributedLock Class พร้อม Auto-Extend
+
+```typescript
+// src/distributed-lock/distributed-lock.class.ts
+import { Logger } from '@nestjs/common';
+
+export interface DistributedLockConfig {
+  key: string;
+  ttlMs: number;
+  autoExtend?: boolean;
+  extendIntervalMs?: number;
+  maxDurationMs?: number;
+}
+
+export class DistributedLock {
+  private readonly logger = new Logger(DistributedLock.name);
+  private lockHandle: LockHandle | null = null;
+  private extendTimer?: NodeJS.Timeout;
+  private readonly startTime: number;
+
+  constructor(
+    private readonly lockService: RedisDistributedLockService,
+    private readonly config: DistributedLockConfig
+  ) {
+    this.startTime = Date.now();
+  }
+
+  async acquire(): Promise<boolean> {
+    this.lockHandle = await this.lockService.acquire(this.config.key, {
+      ttlMs: this.config.ttlMs,
+      retryCount: 3,
+      retryDelayMs: 200,
+    });
+
+    if (this.lockHandle && this.config.autoExtend) {
+      this.startAutoExtend();
+    }
+
+    return this.lockHandle !== null;
+  }
+
+  private startAutoExtend(): void {
+    const interval = this.config.extendIntervalMs || Math.floor(this.config.ttlMs * 0.7);
+
+    this.extendTimer = setInterval(async () => {
+      if (!this.lockHandle) {
+        clearInterval(this.extendTimer);
+        return;
+      }
+
+      // ตรวจสอบว่าถึง maxDuration หรือยัง
+      if (this.config.maxDurationMs) {
+        const elapsed = Date.now() - this.startTime;
+        if (elapsed >= this.config.maxDurationMs) {
+          this.logger.warn(`Lock ${this.config.key} reached max duration, releasing`);
+          await this.release();
+          return;
+        }
+      }
+
+      const extended = await this.lockService.extend(
+        this.lockHandle,
+        this.config.ttlMs
+      );
+
+      if (extended) {
+        this.logger.debug(`Lock ${this.config.key} extended`);
+      } else {
+        this.logger.error(`Failed to extend lock ${this.config.key} - lock may have expired`);
+        clearInterval(this.extendTimer);
+        this.lockHandle = null;
+      }
+    }, interval);
+  }
+
+  async release(): Promise<void> {
+    if (this.extendTimer) {
+      clearInterval(this.extendTimer);
+      this.extendTimer = undefined;
+    }
+
+    if (this.lockHandle) {
+      await this.lockService.release(this.lockHandle);
+      this.lockHandle = null;
+    }
+  }
+
+  isHeld(): boolean {
+    return this.lockHandle !== null;
+  }
+
+  // Static factory method
+  static async execute<T>(
+    lockService: RedisDistributedLockService,
+    config: DistributedLockConfig,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const lock = new DistributedLock(lockService, config);
+    const acquired = await lock.acquire();
+
+    if (!acquired) {
+      throw new Error(`Cannot acquire distributed lock: ${config.key}`);
+    }
+
+    try {
+      return await fn();
     } finally {
       await lock.release();
     }
   }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
-
-// ตัวอย่างการใช้งาน Redlock ใน E-commerce ไทย
-class InventoryService {
-  constructor(
-    private redlock: Redlock,
-    private db: any
-  ) {}
-
-  async reserveStock(productId: string, quantity: number, orderId: string) {
-    // ใช้ Redlock เพื่อป้องกัน Race Condition ใน Stock Reservation
-    return this.redlock.withLock(
-      `inventory:product:${productId}`,
-      10000, // TTL 10 วินาที
-      async (lock) => {
-        logger.info('Lock acquired for inventory reservation', {
-          productId,
-          validityTime: lock.validityTime,
-        });
-
-        const stock = await this.db.getStock(productId);
-        
-        if (stock.available < quantity) {
-          throw new Error(`Insufficient stock. Available: ${stock.available}, Requested: ${quantity}`);
-        }
-        
-        // จอง Stock
-        await this.db.updateStock(productId, {
-          available: stock.available - quantity,
-          reserved: stock.reserved + quantity,
-        });
-        
-        // สร้าง Reservation Record
-        const reservation = await this.db.createReservation({
-          productId,
-          quantity,
-          orderId,
-          expiresAt: new Date(Date.now() + 900000), // หมดอายุใน 15 นาที
-        });
-        
-        return reservation;
-      }
-    );
-  }
 }
 ```
 
-## 3. Database Advisory Locks
+---
 
-PostgreSQL Advisory Locks เป็น Lock ที่เบากว่า Row Lock และใช้งานง่าย
-
-### 3.1 PostgreSQL Advisory Lock Implementation
+## 5. Leader Election Pattern
 
 ```typescript
-// src/locks/pg-advisory-lock.ts
-import { Pool, PoolClient } from 'pg';
-import { logger } from '../utils/logger';
-
-export class PostgresAdvisoryLock {
-  constructor(private pool: Pool) {}
-
-  // Session-level Lock (คงอยู่ตลอด Connection)
-  async acquireSessionLock(lockId: number): Promise<PoolClient> {
-    const client = await this.pool.connect();
-    
-    try {
-      await client.query('SELECT pg_advisory_lock($1)', [lockId]);
-      logger.debug('Session advisory lock acquired', { lockId });
-      return client;
-    } catch (error) {
-      client.release();
-      throw error;
-    }
-  }
-
-  async releaseSessionLock(client: PoolClient, lockId: number): Promise<void> {
-    try {
-      await client.query('SELECT pg_advisory_unlock($1)', [lockId]);
-      logger.debug('Session advisory lock released', { lockId });
-    } finally {
-      client.release();
-    }
-  }
-
-  // Transaction-level Lock (ปล่อยอัตโนมัติเมื่อ Transaction จบ)
-  async withTransactionLock<T>(
-    lockId: number,
-    fn: (client: PoolClient) => Promise<T>
-  ): Promise<T> {
-    const client = await this.pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      // pg_advisory_xact_lock จะปล่อยเมื่อ Transaction จบ
-      await client.query('SELECT pg_advisory_xact_lock($1)', [lockId]);
-      logger.debug('Transaction advisory lock acquired', { lockId });
-      
-      const result = await fn(client);
-      
-      await client.query('COMMIT');
-      return result;
-      
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  // Try Lock (ไม่ Block - Return false ทันทีถ้าได้ไม่ได้ Lock)
-  async tryAcquireLock(lockId: number): Promise<boolean> {
-    const result = await this.pool.query(
-      'SELECT pg_try_advisory_lock($1) as acquired',
-      [lockId]
-    );
-    
-    return result.rows[0].acquired;
-  }
-
-  // Shared Lock (หลาย Reader, หนึ่ง Writer)
-  async acquireSharedLock(lockId: number): Promise<void> {
-    await this.pool.query('SELECT pg_advisory_lock_shared($1)', [lockId]);
-  }
-
-  // สร้าง Lock ID จาก String (ต้องการ bigint)
-  static hashToLockId(str: string): number {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return Math.abs(hash);
-  }
-}
-
-// ตัวอย่างการใช้งาน: ป้องกัน Duplicate Payment Processing
-class TransactionProcessor {
-  constructor(
-    private pgLock: PostgresAdvisoryLock,
-    private db: Pool
-  ) {}
-
-  async processWithdrawal(
-    accountId: string,
-    amount: number,
-    transactionRef: string
-  ) {
-    const lockId = PostgresAdvisoryLock.hashToLockId(`withdrawal:${accountId}`);
-    
-    return this.pgLock.withTransactionLock(lockId, async (client) => {
-      // ตรวจสอบ Duplicate Transaction
-      const existing = await client.query(
-        'SELECT id FROM transactions WHERE reference = $1 FOR UPDATE',
-        [transactionRef]
-      );
-      
-      if (existing.rows.length > 0) {
-        throw new Error(`Duplicate transaction: ${transactionRef}`);
-      }
-      
-      // ตรวจสอบ Balance ด้วย SELECT FOR UPDATE เพื่อ Lock Row
-      const accountResult = await client.query(
-        'SELECT balance FROM accounts WHERE id = $1 FOR UPDATE',
-        [accountId]
-      );
-      
-      if (accountResult.rows.length === 0) {
-        throw new Error(`Account not found: ${accountId}`);
-      }
-      
-      const currentBalance = parseFloat(accountResult.rows[0].balance);
-      
-      if (currentBalance < amount) {
-        throw new Error(`Insufficient funds. Balance: ${currentBalance}, Required: ${amount}`);
-      }
-      
-      // หักยอดเงิน
-      await client.query(
-        'UPDATE accounts SET balance = balance - $1 WHERE id = $2',
-        [amount, accountId]
-      );
-      
-      // บันทึก Transaction
-      const result = await client.query(
-        `INSERT INTO transactions (account_id, amount, type, reference, created_at)
-         VALUES ($1, $2, 'withdrawal', $3, NOW())
-         RETURNING *`,
-        [accountId, amount, transactionRef]
-      );
-      
-      return result.rows[0];
-    });
-  }
-}
-```
-
-## 4. Fencing Tokens
-
-Fencing Token ป้องกัน Zombie Lock ที่เกิดจาก Process ที่ช้าเกินไปมาแก้ไขข้อมูลหลัง Lock หมดอายุ
-
-### 4.1 Fencing Token Implementation
-
-```typescript
-// src/locks/fencing-token-lock.ts
-import Redis from 'ioredis';
-import { logger } from '../utils/logger';
-
-interface FencedLock {
-  token: number;       // Monotonically increasing token
-  resource: string;
-  expiresAt: number;
-  release: () => Promise<void>;
-}
-
-export class FencingTokenLock {
-  constructor(private redis: Redis) {}
-
-  async acquire(resource: string, ttlMs: number): Promise<FencedLock | null> {
-    const lockKey = `fenced_lock:${resource}`;
-    const counterKey = `fenced_lock:counter:${resource}`;
-    
-    const script = `
-      local lockKey = KEYS[1]
-      local counterKey = KEYS[2]
-      local ttlMs = tonumber(ARGV[1])
-      local now = tonumber(ARGV[2])
-      
-      -- ตรวจสอบว่า Lock ว่างหรือไม่
-      if redis.call('EXISTS', lockKey) == 1 then
-        return nil
-      end
-      
-      -- เพิ่ม Counter เพื่อสร้าง Fencing Token
-      local token = redis.call('INCR', counterKey)
-      
-      -- ตั้งค่า Lock พร้อม Token
-      redis.call('HMSET', lockKey, 'token', token, 'acquired_at', now)
-      redis.call('PEXPIRE', lockKey, ttlMs)
-      
-      return token
-    `;
-    
-    const result = await this.redis.eval(
-      script,
-      2,
-      lockKey,
-      counterKey,
-      ttlMs.toString(),
-      Date.now().toString()
-    ) as number | null;
-    
-    if (result === null) {
-      return null;
-    }
-    
-    return {
-      token: result,
-      resource,
-      expiresAt: Date.now() + ttlMs,
-      release: async () => {
-        await this.redis.del(lockKey);
-      },
-    };
-  }
-
-  async validateToken(resource: string, token: number): Promise<boolean> {
-    const lockKey = `fenced_lock:${resource}`;
-    const lockToken = await this.redis.hget(lockKey, 'token');
-    
-    if (lockToken === null) {
-      logger.warn('Lock expired when validating fencing token', { resource, token });
-      return false;
-    }
-    
-    const currentToken = parseInt(lockToken);
-    
-    if (token !== currentToken) {
-      logger.warn('Invalid fencing token (stale lock)', {
-        resource,
-        providedToken: token,
-        currentToken,
-      });
-      return false;
-    }
-    
-    return true;
-  }
-}
-
-// Storage Service ที่ใช้ Fencing Token
-class StorageService {
-  constructor(
-    private fencingLock: FencingTokenLock,
-    private storage: any
-  ) {}
-
-  async updateWithFencing(
-    resource: string,
-    data: any,
-    fencingToken: number
-  ): Promise<void> {
-    // ตรวจสอบ Fencing Token ก่อนเขียนข้อมูล
-    const isValid = await this.fencingLock.validateToken(resource, fencingToken);
-    
-    if (!isValid) {
-      throw new Error(
-        `Fencing token validation failed. Token ${fencingToken} is stale or invalid.`
-      );
-    }
-    
-    // เขียนข้อมูลพร้อม Token เพื่อตรวจสอบในฝั่ง Storage
-    await this.storage.write(resource, {
-      ...data,
-      _fencingToken: fencingToken,
-    });
-  }
-}
-```
-
-## 5. Leader Election
-
-Leader Election ใช้สำหรับเลือก Primary Node ในระบบ Distributed
-
-### 5.1 Leader Election Service
-
-```typescript
-// src/locks/leader-election.ts
-import Redis from 'ioredis';
+// src/distributed-lock/leader-election.service.ts
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { EventEmitter } from 'events';
-import { logger } from '../utils/logger';
-import os from 'os';
+import Redis from 'ioredis';
 
-interface LeaderElectionConfig {
-  electionKey: string;
-  ttlMs: number;
-  renewalIntervalMs: number;
-  nodeId?: string;
-}
-
-type LeaderElectionEvent = 'elected' | 'deposed' | 'error';
-
-export class LeaderElection extends EventEmitter {
+@Injectable()
+export class LeaderElectionService extends EventEmitter implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(LeaderElectionService.name);
   private isLeader = false;
-  private renewalTimer: NodeJS.Timeout | null = null;
-  private nodeId: string;
-  private renewalScript: string;
+  private electionTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
+  private readonly instanceId: string;
 
-  constructor(
-    private redis: Redis,
-    private config: LeaderElectionConfig
-  ) {
+  private readonly LEADER_KEY = 'leader:election';
+  private readonly LEADER_TTL_MS = 10000;  // 10 seconds
+  private readonly ELECTION_INTERVAL_MS = 5000;  // Try every 5 seconds
+  private readonly HEARTBEAT_INTERVAL_MS = 3000;  // Heartbeat every 3 seconds
+
+  constructor(private readonly redis: Redis) {
     super();
-    this.nodeId = config.nodeId ?? `${os.hostname()}-${process.pid}-${Date.now()}`;
-    
-    this.renewalScript = `
-      if redis.call('get', KEYS[1]) == ARGV[1] then
-        return redis.call('pexpire', KEYS[1], ARGV[2])
-      else
-        return 0
-      end
-    `;
+    this.instanceId = `${process.env.POD_NAME || 'instance'}-${Date.now()}`;
   }
 
-  async start(): Promise<void> {
-    logger.info('Starting leader election', {
-      nodeId: this.nodeId,
-      key: this.config.electionKey,
-    });
-    
-    await this.elect();
+  async onModuleInit(): Promise<void> {
+    await this.startElection();
   }
 
-  async stop(): Promise<void> {
-    if (this.renewalTimer) {
-      clearInterval(this.renewalTimer);
-      this.renewalTimer = null;
-    }
-    
-    if (this.isLeader) {
-      await this.resign();
-    }
-    
-    logger.info('Leader election stopped', { nodeId: this.nodeId });
+  async onModuleDestroy(): Promise<void> {
+    await this.stepDown();
   }
 
-  private async elect(): Promise<void> {
+  private async startElection(): Promise<void> {
+    await this.tryBecomeLeader();
+
+    this.electionTimer = setInterval(
+      () => this.tryBecomeLeader(),
+      this.ELECTION_INTERVAL_MS
+    );
+  }
+
+  private async tryBecomeLeader(): Promise<void> {
     try {
+      if (this.isLeader) return;
+
       const result = await this.redis.set(
-        this.config.electionKey,
-        this.nodeId,
+        this.LEADER_KEY,
+        this.instanceId,
         'NX',
         'PX',
-        this.config.ttlMs
+        this.LEADER_TTL_MS
       );
 
       if (result === 'OK') {
-        this.becomeLeader();
-      } else {
-        this.isLeader = false;
-        
-        // ดูว่าใครเป็น Leader อยู่
-        const currentLeader = await this.redis.get(this.config.electionKey);
-        logger.info('Not elected as leader', {
-          nodeId: this.nodeId,
-          currentLeader,
-        });
-        
-        // ลองใหม่หลังจาก TTL หมด
-        const ttl = await this.redis.pttl(this.config.electionKey);
-        setTimeout(() => this.elect(), Math.max(ttl, 1000));
+        await this.onBecomeLeader();
       }
     } catch (error) {
-      logger.error('Leader election error', { error });
-      this.emit('error', error);
-      setTimeout(() => this.elect(), 5000);
+      this.logger.error('Error during leader election:', error);
     }
   }
 
-  private becomeLeader(): void {
+  private async onBecomeLeader(): Promise<void> {
     this.isLeader = true;
-    logger.info('Elected as leader', { nodeId: this.nodeId });
-    this.emit('elected', this.nodeId);
-    
-    // เริ่ม Renewal Loop
-    this.renewalTimer = setInterval(
-      () => this.renewLeadership(),
-      this.config.renewalIntervalMs
+    this.logger.log(`Instance ${this.instanceId} became leader`);
+    this.emit('leader:gained');
+
+    // Start heartbeat
+    this.heartbeatTimer = setInterval(
+      () => this.sendHeartbeat(),
+      this.HEARTBEAT_INTERVAL_MS
     );
   }
 
-  private async renewLeadership(): Promise<void> {
-    if (!this.isLeader) return;
-    
+  private async sendHeartbeat(): Promise<void> {
     try {
-      const result = await this.redis.eval(
-        this.renewalScript,
-        1,
-        this.config.electionKey,
-        this.nodeId,
-        this.config.ttlMs.toString()
-      ) as number;
+      const HEARTBEAT_SCRIPT = `
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+          return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+        else
+          return 0
+        end
+      `;
 
-      if (result !== 1) {
-        // ล้มเหลวในการ Renew - สูญเสีย Leadership
-        this.isLeader = false;
-        
-        if (this.renewalTimer) {
-          clearInterval(this.renewalTimer);
-          this.renewalTimer = null;
-        }
-        
-        logger.warn('Lost leadership', { nodeId: this.nodeId });
-        this.emit('deposed', this.nodeId);
-        
-        // ลอง Elect ใหม่
-        setTimeout(() => this.elect(), 1000);
+      const result = await this.redis.eval(
+        HEARTBEAT_SCRIPT,
+        1,
+        this.LEADER_KEY,
+        this.instanceId,
+        this.LEADER_TTL_MS.toString()
+      );
+
+      if (result === 0) {
+        await this.onLostLeadership();
       }
     } catch (error) {
-      logger.error('Leadership renewal error', { error });
+      this.logger.error('Heartbeat failed:', error);
+      await this.onLostLeadership();
     }
   }
 
-  private async resign(): Promise<void> {
-    const script = `
-      if redis.call('get', KEYS[1]) == ARGV[1] then
-        return redis.call('del', KEYS[1])
+  private async onLostLeadership(): Promise<void> {
+    if (!this.isLeader) return;
+
+    this.isLeader = false;
+    this.logger.warn(`Instance ${this.instanceId} lost leadership`);
+    this.emit('leader:lost');
+
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+  }
+
+  async stepDown(): Promise<void> {
+    if (!this.isLeader) return;
+
+    const STEP_DOWN_SCRIPT = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
       else
         return 0
       end
     `;
-    
-    await this.redis.eval(script, 1, this.config.electionKey, this.nodeId);
-    this.isLeader = false;
-    logger.info('Resigned from leadership', { nodeId: this.nodeId });
-    this.emit('deposed', this.nodeId);
+
+    await this.redis.eval(
+      STEP_DOWN_SCRIPT,
+      1,
+      this.LEADER_KEY,
+      this.instanceId
+    );
+
+    await this.onLostLeadership();
   }
 
   getIsLeader(): boolean {
     return this.isLeader;
   }
 
-  getNodeId(): string {
-    return this.nodeId;
+  getInstanceId(): string {
+    return this.instanceId;
   }
 
   async getCurrentLeader(): Promise<string | null> {
-    return this.redis.get(this.config.electionKey);
-  }
-}
-
-// ตัวอย่าง: Scheduled Job ที่ต้องทำงานบน Leader เท่านั้น
-class ScheduledJobRunner {
-  private leaderElection: LeaderElection;
-
-  constructor(redis: Redis) {
-    this.leaderElection = new LeaderElection(redis, {
-      electionKey: 'leader:scheduled-jobs',
-      ttlMs: 30000,
-      renewalIntervalMs: 10000,
-    });
-    
-    this.leaderElection.on('elected', async (nodeId: string) => {
-      logger.info(`Node ${nodeId} became leader, starting scheduled jobs`);
-      await this.startJobs();
-    });
-    
-    this.leaderElection.on('deposed', async (nodeId: string) => {
-      logger.info(`Node ${nodeId} lost leadership, stopping scheduled jobs`);
-      await this.stopJobs();
-    });
+    return this.redis.get(this.LEADER_KEY);
   }
 
-  async start(): Promise<void> {
-    await this.leaderElection.start();
-  }
+  // Decorator สำหรับ leader-only methods
+  leaderOnly() {
+    return (target: unknown, propertyKey: string, descriptor: PropertyDescriptor) => {
+      const originalMethod = descriptor.value;
 
-  private async startJobs(): Promise<void> {
-    // เริ่ม Scheduled Jobs เช่น Daily Report, Cleanup, etc.
-    setInterval(() => this.runDailyReport(), 86400000);
-    setInterval(() => this.cleanupExpiredSessions(), 3600000);
-  }
+      descriptor.value = async function (...args: unknown[]) {
+        if (!this.leaderElectionService?.isLeader) {
+          this.logger.debug(`Skipping ${propertyKey}: not the leader`);
+          return;
+        }
+        return originalMethod.apply(this, args);
+      };
 
-  private async stopJobs(): Promise<void> {
-    // หยุด Scheduled Jobs
-    logger.info('Stopping scheduled jobs (lost leadership)');
-  }
-
-  private async runDailyReport(): Promise<void> {
-    if (!this.leaderElection.getIsLeader()) return;
-    logger.info('Running daily report (leader only)');
-    // Generate daily sales report
-  }
-
-  private async cleanupExpiredSessions(): Promise<void> {
-    if (!this.leaderElection.getIsLeader()) return;
-    logger.info('Cleaning up expired sessions (leader only)');
-    // Cleanup logic
+      return descriptor;
+    };
   }
 }
 ```
 
-## 6. Mutex Pattern
+---
 
-### 6.1 Async Mutex สำหรับ In-Process Locking
+## 6. Mutex vs Semaphore
 
 ```typescript
-// src/locks/async-mutex.ts
+// src/distributed-lock/semaphore.service.ts
+import Redis from 'ioredis';
 
-interface QueueItem<T> {
-  resolve: (value: T) => void;
-  reject: (error: Error) => void;
-  fn: () => Promise<T>;
-  timeoutMs?: number;
-}
+// Semaphore: อนุญาตให้ N processes ทำงานพร้อมกัน
+export class DistributedSemaphore {
+  private readonly logger = console;
 
-export class AsyncMutex {
-  private locked = false;
-  private queue: Array<QueueItem<any>> = [];
+  constructor(
+    private readonly redis: Redis,
+    private readonly key: string,
+    private readonly maxPermits: number,
+    private readonly ttlMs: number
+  ) {}
 
-  async withLock<T>(fn: () => Promise<T>, timeoutMs?: number): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const item: QueueItem<T> = { resolve, reject, fn, timeoutMs };
-      this.queue.push(item);
+  async acquire(permitId: string): Promise<boolean> {
+    const ACQUIRE_SCRIPT = `
+      local key = KEYS[1]
+      local id = ARGV[1]
+      local max = tonumber(ARGV[2])
+      local ttl = tonumber(ARGV[3])
+      local now = tonumber(ARGV[4])
       
-      if (!this.locked) {
-        this.processQueue();
-      }
-    });
+      -- ลบ expired permits
+      redis.call("ZREMRANGEBYSCORE", key, "-inf", now)
+      
+      local count = redis.call("ZCARD", key)
+      if count < max then
+        redis.call("ZADD", key, now + ttl, id)
+        redis.call("PEXPIRE", key, ttl)
+        return 1
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(
+      ACQUIRE_SCRIPT,
+      1,
+      this.key,
+      permitId,
+      this.maxPermits.toString(),
+      this.ttlMs.toString(),
+      Date.now().toString()
+    );
+
+    return result === 1;
   }
 
-  private async processQueue(): Promise<void> {
-    if (this.queue.length === 0) {
-      this.locked = false;
-      return;
+  async release(permitId: string): Promise<void> {
+    await this.redis.zrem(this.key, permitId);
+  }
+
+  async getAvailablePermits(): Promise<number> {
+    await this.redis.zremrangebyscore(this.key, '-inf', Date.now());
+    const used = await this.redis.zcard(this.key);
+    return Math.max(0, this.maxPermits - used);
+  }
+
+  async withPermit<T>(fn: () => Promise<T>): Promise<T> {
+    const permitId = crypto.randomUUID();
+    const acquired = await this.acquire(permitId);
+
+    if (!acquired) {
+      throw new Error(`Semaphore ${this.key} is exhausted`);
     }
 
-    this.locked = true;
-    const item = this.queue.shift()!;
-    
-    let timeoutHandle: NodeJS.Timeout | undefined;
-    
-    try {
-      let result: any;
-      
-      if (item.timeoutMs) {
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error(`Mutex operation timed out after ${item.timeoutMs}ms`));
-          }, item.timeoutMs);
-        });
-        
-        result = await Promise.race([item.fn(), timeoutPromise]);
-      } else {
-        result = await item.fn();
-      }
-      
-      item.resolve(result);
-    } catch (error) {
-      item.reject(error as Error);
-    } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-      
-      // Process next item in queue
-      setImmediate(() => this.processQueue());
-    }
-  }
-
-  get isLocked(): boolean {
-    return this.locked;
-  }
-
-  get queueLength(): number {
-    return this.queue.length;
-  }
-}
-
-// Semaphore สำหรับจำกัดจำนวน Concurrent Operations
-export class Semaphore {
-  private current = 0;
-  private queue: Array<() => void> = [];
-
-  constructor(private maxConcurrent: number) {}
-
-  async acquire(): Promise<void> {
-    if (this.current < this.maxConcurrent) {
-      this.current++;
-      return;
-    }
-
-    return new Promise(resolve => {
-      this.queue.push(resolve);
-    });
-  }
-
-  release(): void {
-    this.current--;
-    
-    if (this.queue.length > 0 && this.current < this.maxConcurrent) {
-      this.current++;
-      const next = this.queue.shift()!;
-      next();
-    }
-  }
-
-  async withSemaphore<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    
     try {
       return await fn();
     } finally {
-      this.release();
+      await this.release(permitId);
     }
   }
 }
 
-// ตัวอย่าง: จำกัด Concurrent External API Calls
-class ThaiPaymentGatewayClient {
-  // จำกัด 5 Concurrent requests ไป Payment Gateway
-  private semaphore = new Semaphore(5);
-  
-  async chargeCard(cardToken: string, amount: number): Promise<any> {
-    return this.semaphore.withSemaphore(async () => {
-      const response = await fetch('https://payment-gateway.th/v1/charge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cardToken, amount }),
-      });
-      return response.json();
-    });
+// Mutex: อนุญาตแค่ 1 process เท่านั้น (เหมือน Semaphore ที่ max=1)
+export class DistributedMutex extends DistributedSemaphore {
+  constructor(redis: Redis, key: string, ttlMs: number) {
+    super(redis, key, 1, ttlMs);
   }
 }
 ```
 
-## 7. Deadlock Prevention
+---
 
-### 7.1 Deadlock Detection และ Prevention
+## 7. Lock Metrics and Monitoring
 
 ```typescript
-// src/locks/deadlock-prevention.ts
-import { logger } from '../utils/logger';
+// src/distributed-lock/lock-metrics.service.ts
+import { Injectable } from '@nestjs/common';
+import { Counter, Histogram, Gauge, register } from 'prom-client';
 
-interface LockRequest {
-  requestId: string;
-  resourceId: string;
-  requestedAt: number;
-  timeoutMs: number;
-}
+@Injectable()
+export class LockMetricsService {
+  private readonly lockAcquireAttempts: Counter;
+  private readonly lockAcquireSuccess: Counter;
+  private readonly lockAcquireFailed: Counter;
+  private readonly lockHoldDuration: Histogram;
+  private readonly lockWaitTime: Histogram;
+  private readonly activeLocks: Gauge;
 
-interface WaitForGraph {
-  [holderId: string]: string[]; // holder -> [waiter1, waiter2, ...]
-}
+  constructor() {
+    this.lockAcquireAttempts = new Counter({
+      name: 'distributed_lock_acquire_attempts_total',
+      help: 'Total number of lock acquire attempts',
+      labelNames: ['lock_key', 'service'],
+    });
 
-export class DeadlockPrevention {
-  // Lock Ordering: กำหนดลำดับในการขอ Lock เพื่อป้องกัน Deadlock
-  private lockOrder = new Map<string, number>();
-  private resourceLockOrder = 0;
+    this.lockAcquireSuccess = new Counter({
+      name: 'distributed_lock_acquire_success_total',
+      help: 'Total number of successful lock acquisitions',
+      labelNames: ['lock_key', 'service'],
+    });
 
-  registerResource(resourceId: string, priority?: number): void {
-    if (!this.lockOrder.has(resourceId)) {
-      this.lockOrder.set(resourceId, priority ?? this.resourceLockOrder++);
-    }
+    this.lockAcquireFailed = new Counter({
+      name: 'distributed_lock_acquire_failed_total',
+      help: 'Total number of failed lock acquisitions',
+      labelNames: ['lock_key', 'service', 'reason'],
+    });
+
+    this.lockHoldDuration = new Histogram({
+      name: 'distributed_lock_hold_duration_seconds',
+      help: 'Duration of lock being held',
+      labelNames: ['lock_key', 'service'],
+      buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60],
+    });
+
+    this.lockWaitTime = new Histogram({
+      name: 'distributed_lock_wait_seconds',
+      help: 'Time waiting to acquire lock',
+      labelNames: ['lock_key', 'service'],
+      buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+    });
+
+    this.activeLocks = new Gauge({
+      name: 'distributed_lock_active',
+      help: 'Number of currently held locks',
+      labelNames: ['lock_key', 'service'],
+    });
   }
 
-  // ตรวจสอบว่าการขอ Lock ตามลำดับที่กำหนดหรือไม่
-  validateLockOrder(
-    currentHeldLocks: string[],
-    requestedResource: string
-  ): void {
-    const requestedOrder = this.lockOrder.get(requestedResource);
-    
-    if (requestedOrder === undefined) {
-      logger.warn(`Resource ${requestedResource} not registered for lock ordering`);
-      return;
-    }
-    
-    for (const heldResource of currentHeldLocks) {
-      const heldOrder = this.lockOrder.get(heldResource);
-      
-      if (heldOrder !== undefined && heldOrder > requestedOrder) {
-        throw new Error(
-          `Lock ordering violation: Cannot acquire ${requestedResource} (order: ${requestedOrder}) ` +
-          `while holding ${heldResource} (order: ${heldOrder}). ` +
-          `Always acquire locks in ascending order to prevent deadlocks.`
-        );
+  recordAcquireAttempt(key: string, service: string): void {
+    this.lockAcquireAttempts.inc({ lock_key: key, service });
+  }
+
+  recordAcquireSuccess(key: string, service: string, waitTimeMs: number): void {
+    this.lockAcquireSuccess.inc({ lock_key: key, service });
+    this.lockWaitTime.observe({ lock_key: key, service }, waitTimeMs / 1000);
+    this.activeLocks.inc({ lock_key: key, service });
+  }
+
+  recordAcquireFailed(key: string, service: string, reason: string): void {
+    this.lockAcquireFailed.inc({ lock_key: key, service, reason });
+  }
+
+  recordRelease(key: string, service: string, holdDurationMs: number): void {
+    this.lockHoldDuration.observe({ lock_key: key, service }, holdDurationMs / 1000);
+    this.activeLocks.dec({ lock_key: key, service });
+  }
+}
+```
+
+---
+
+## 8. Kubernetes Leader Election ผ่าน API
+
+```yaml
+# kubernetes-leader-election.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: leader-election-sa
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leader-election-role
+  namespace: production
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leader-election-binding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: leader-election-sa
+roleRef:
+  kind: Role
+  name: leader-election-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+```typescript
+// src/distributed-lock/k8s-leader-election.ts
+import * as k8s from '@kubernetes/client-node';
+
+export class KubernetesLeaderElection {
+  private readonly logger = console;
+  private isLeader = false;
+  private electionInterval?: NodeJS.Timeout;
+
+  constructor(
+    private readonly k8sClient: k8s.CoordinationV1Api,
+    private readonly namespace: string,
+    private readonly leaseName: string,
+    private readonly identity: string,
+    private readonly leaseDurationSeconds = 15,
+    private readonly renewDeadlineSeconds = 10,
+    private readonly retryPeriodSeconds = 2
+  ) {}
+
+  async start(
+    onStartedLeading: () => Promise<void>,
+    onStoppedLeading: () => void
+  ): Promise<void> {
+    this.electionInterval = setInterval(async () => {
+      const wasLeader = this.isLeader;
+      const nowLeader = await this.tryAcquireLease();
+
+      if (!wasLeader && nowLeader) {
+        this.isLeader = true;
+        this.logger.log(`${this.identity} became leader`);
+        await onStartedLeading();
+      } else if (wasLeader && !nowLeader) {
+        this.isLeader = false;
+        this.logger.warn(`${this.identity} lost leadership`);
+        onStoppedLeading();
       }
-    }
+    }, this.retryPeriodSeconds * 1000);
   }
-}
 
-// Timeout-based Deadlock Detection
-export class LockManager {
-  private activeLocks = new Map<string, LockRequest>();
-  private waitingRequests = new Map<string, LockRequest[]>();
-  
-  async acquireWithDeadlockDetection(
-    requestId: string,
-    resourceId: string,
-    timeoutMs: number,
-    acquireFn: () => Promise<boolean>
-  ): Promise<boolean> {
-    const request: LockRequest = {
-      requestId,
-      resourceId,
-      requestedAt: Date.now(),
-      timeoutMs,
-    };
-    
-    // ตรวจสอบ Circular Wait
-    if (this.detectDeadlock(requestId, resourceId)) {
-      throw new Error(
-        `Potential deadlock detected: ${requestId} waiting for ${resourceId}`
-      );
-    }
-    
-    // เพิ่มเข้า Waiting Queue
-    const waiting = this.waitingRequests.get(resourceId) ?? [];
-    waiting.push(request);
-    this.waitingRequests.set(resourceId, waiting);
-    
+  private async tryAcquireLease(): Promise<boolean> {
+    const now = new Date();
+    const renewTime = now.toISOString();
+    const acquireTime = renewTime;
+
     try {
-      const acquired = await Promise.race([
-        acquireFn(),
-        this.createTimeout(timeoutMs, resourceId),
-      ]);
-      
-      if (acquired) {
-        this.activeLocks.set(resourceId, request);
+      // Try to get existing lease
+      const existing = await this.k8sClient.readNamespacedLease(
+        this.leaseName,
+        this.namespace
+      );
+
+      const lease = existing.body;
+      const spec = lease.spec!;
+      const currentHolder = spec.holderIdentity;
+      const renewTimeDate = spec.renewTime ? new Date(spec.renewTime as string) : null;
+      const leaseDurationMs = (spec.leaseDurationSeconds || this.leaseDurationSeconds) * 1000;
+      const isExpired = !renewTimeDate || 
+        (Date.now() - renewTimeDate.getTime()) > leaseDurationMs;
+
+      if (currentHolder === this.identity || isExpired) {
+        // Update lease
+        await this.k8sClient.replaceNamespacedLease(this.leaseName, this.namespace, {
+          metadata: lease.metadata,
+          spec: {
+            holderIdentity: this.identity,
+            leaseDurationSeconds: this.leaseDurationSeconds,
+            acquireTime: currentHolder !== this.identity ? acquireTime as unknown as k8s.V1MicroTime : spec.acquireTime,
+            renewTime: renewTime as unknown as k8s.V1MicroTime,
+            leaseTransitions: currentHolder !== this.identity 
+              ? (spec.leaseTransitions || 0) + 1 
+              : spec.leaseTransitions,
+          },
+        });
+
+        return true;
       }
-      
-      return acquired;
-    } finally {
-      // ลบออกจาก Waiting Queue
-      const remaining = (this.waitingRequests.get(resourceId) ?? [])
-        .filter(r => r.requestId !== requestId);
-      
-      if (remaining.length === 0) {
-        this.waitingRequests.delete(resourceId);
-      } else {
-        this.waitingRequests.set(resourceId, remaining);
-      }
-    }
-  }
-  
-  private detectDeadlock(requestId: string, resourceId: string): boolean {
-    // สร้าง Wait-for Graph และตรวจหา Cycle
-    const visited = new Set<string>();
-    const path = new Set<string>();
-    
-    const hasCycle = (node: string): boolean => {
-      if (path.has(node)) return true;
-      if (visited.has(node)) return false;
-      
-      visited.add(node);
-      path.add(node);
-      
-      const waiting = this.waitingRequests.get(node) ?? [];
-      for (const req of waiting) {
-        const heldBy = this.activeLocks.get(req.resourceId);
-        if (heldBy && hasCycle(heldBy.requestId)) {
+
+      return false;
+    } catch (error: unknown) {
+      const k8sError = error as { response?: { statusCode?: number } };
+      if (k8sError?.response?.statusCode === 404) {
+        // Create new lease
+        try {
+          await this.k8sClient.createNamespacedLease(this.namespace, {
+            metadata: {
+              name: this.leaseName,
+              namespace: this.namespace,
+            },
+            spec: {
+              holderIdentity: this.identity,
+              leaseDurationSeconds: this.leaseDurationSeconds,
+              acquireTime: acquireTime as unknown as k8s.V1MicroTime,
+              renewTime: renewTime as unknown as k8s.V1MicroTime,
+              leaseTransitions: 0,
+            },
+          });
+
           return true;
+        } catch {
+          return false;
         }
       }
-      
-      path.delete(node);
+
       return false;
-    };
-    
-    return hasCycle(requestId);
-  }
-
-  releaseLock(resourceId: string): void {
-    this.activeLocks.delete(resourceId);
-  }
-
-  private createTimeout(ms: number, resourceId: string): Promise<never> {
-    return new Promise((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Lock acquisition timeout for resource: ${resourceId}`)),
-        ms
-      )
-    );
-  }
-}
-
-// ตัวอย่าง: ป้องกัน Deadlock ในการโอนเงินระหว่าง Accounts
-class SafeTransferService {
-  private deadlockPrevention = new DeadlockPrevention();
-  
-  constructor(private redisLock: any, private db: any) {
-    // กำหนด Lock Order สำหรับ Accounts
-    // จะ Lock Account ที่มี ID น้อยกว่าก่อนเสมอ
-  }
-
-  async transfer(
-    fromAccountId: string,
-    toAccountId: string,
-    amount: number
-  ): Promise<void> {
-    // กำหนดลำดับ Lock: Lock Account ID ที่น้อยกว่าก่อนเสมอ
-    // เพื่อป้องกัน Deadlock ที่เกิดจากการ Lock สลับกัน
-    const [firstId, secondId] = fromAccountId < toAccountId
-      ? [fromAccountId, toAccountId]
-      : [toAccountId, fromAccountId];
-    
-    const firstLock = await this.redisLock.acquire(
-      `account:${firstId}`,
-      { ttlMs: 10000, retryCount: 3 }
-    );
-    
-    if (!firstLock) {
-      throw new Error(`Cannot acquire lock for account: ${firstId}`);
     }
-    
-    try {
-      const secondLock = await this.redisLock.acquire(
-        `account:${secondId}`,
-        { ttlMs: 10000, retryCount: 3 }
-      );
-      
-      if (!secondLock) {
-        throw new Error(`Cannot acquire lock for account: ${secondId}`);
-      }
-      
-      try {
-        // ดำเนินการโอนเงิน
-        await this.db.transfer(fromAccountId, toAccountId, amount);
-      } finally {
-        await secondLock.release();
-      }
-    } finally {
-      await firstLock.release();
+  }
+
+  stop(): void {
+    if (this.electionInterval) {
+      clearInterval(this.electionInterval);
     }
   }
 }
 ```
+
+---
 
 ## สรุป
 
-| Pattern | Use Case | ข้อดี | ข้อเสีย | เหมาะกับ |
-|---------|----------|-------|---------|---------|
-| Redis SETNX | Single Redis Node | ง่าย, เร็ว | Single Point of Failure | Development, Low-criticality |
-| Redlock | Multiple Redis Nodes | High Availability | ซับซ้อนขึ้น, ต้องมี 3+ Nodes | Production Payment Systems |
-| PG Advisory Lock | Database-centric | Integrate กับ Transaction | ต้อง Connect DB | Financial Transactions |
-| Fencing Token | Prevent Stale Writes | ป้องกัน Zombie Processes | ต้องมี Storage Support | Storage Systems |
-| Leader Election | Singleton Operations | ป้องกัน Duplicate Jobs | Failover ต้องรอ TTL | Scheduled Jobs |
-| Mutex (In-process) | Single Process | ไม่ต้อง External Dependency | ใช้ได้แค่ใน Process เดียว | In-memory Operations |
-| Deadlock Prevention | Complex Lock Graphs | ป้องกัน Circular Wait | ต้องออกแบบ Lock Order | Multi-resource Transactions |
-
-การเลือก Lock Pattern ที่ถูกต้องสำคัญมากสำหรับระบบ Financial ไทย ควรใช้ Redlock สำหรับ Critical Operations อย่างการชำระเงินและการโอนเงิน และใช้ PostgreSQL Advisory Lock เมื่อต้องการ Integration กับ Database Transaction เพื่อความ Atomic สูงสุด
+| Mechanism | Library/Tool | เหมาะกับ | ข้อดี | ข้อเสีย |
+|-----------|-------------|---------|-------|---------|
+| Redis Single-node | ioredis | Development, Simple setups | เร็ว, ง่าย | Single point of failure |
+| Redlock | redlock npm | Production clusters | HA, กระจาย | Complex, Network overhead |
+| PostgreSQL Advisory | TypeORM | เมื่อมี PostgreSQL อยู่แล้ว | ACID, No extra service | Slower than Redis |
+| Zookeeper | zookeeper npm | Enterprise | Proven, Strong consistency | Complex setup |
+| K8s Lease API | @kubernetes/client-node | K8s deployments | Native K8s | K8s only |
+| Fencing Token | Custom | Critical resources | ป้องกัน stale locks | Requires resource cooperation |
+| Semaphore | Custom Redis | Rate limiting | Flexible concurrency | More complex than Mutex |
+| Leader Election | Redis/K8s | Singleton jobs | HA without downtime | Election latency |
