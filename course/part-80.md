@@ -1,2831 +1,1793 @@
-# Part 80: Kubernetes Advanced Patterns
+# Part 80: Kubernetes Patterns
 
 ## บทนำ
 
-Kubernetes Advanced Patterns ครอบคลุม Custom Resource Definitions (CRDs), Operators, Admission Webhooks, Multi-tenancy, GitOps และ Event-driven Automation บทนี้จะช่วยให้เข้าใจการขยาย Kubernetes API และการสร้าง platform features บน Kubernetes
+Kubernetes มี patterns หลากหลายที่ช่วยจัดการ workloads ที่ซับซ้อน บทนี้ครอบคลุม StatefulSet, DaemonSet, Jobs, CRDs, Operators, Controllers, Admission Webhooks, API Aggregation, Multi-tenancy และ GitOps กับ ArgoCD
 
 ---
 
-## 80.1 Custom Resource Definition (CRD)
+## 1. StatefulSet vs Deployment Patterns
 
-### CRD YAML สำหรับ MicroserviceDeployment
+```typescript
+// statefulset-concepts.ts
+// เข้าใจความต่างระหว่าง StatefulSet และ Deployment
+
+interface WorkloadCharacteristic {
+  feature: string;
+  deployment: string;
+  statefulSet: string;
+  recommendation: string;
+}
+
+const workloadComparison: WorkloadCharacteristic[] = [
+  {
+    feature: 'Pod Identity',
+    deployment: 'Random (pod-xyz123)',
+    statefulSet: 'Stable (pod-0, pod-1, pod-2)',
+    recommendation: 'Use StatefulSet when pods need stable identity',
+  },
+  {
+    feature: 'Storage',
+    deployment: 'Ephemeral or shared volume',
+    statefulSet: 'Dedicated PVC per pod',
+    recommendation: 'Use StatefulSet for databases',
+  },
+  {
+    feature: 'Network',
+    deployment: 'ClusterIP (load balanced)',
+    statefulSet: 'Headless service (individual DNS)',
+    recommendation: 'StatefulSet for clustered apps needing peer discovery',
+  },
+  {
+    feature: 'Scaling',
+    deployment: 'Parallel (all at once)',
+    statefulSet: 'Sequential (0,1,2...)',
+    recommendation: 'StatefulSet for ordered startup/shutdown',
+  },
+  {
+    feature: 'Updates',
+    deployment: 'Rolling update (any order)',
+    statefulSet: 'Ordered rolling update (N-1, N-2...)',
+    recommendation: 'StatefulSet for strict update ordering',
+  },
+];
+```
 
 ```yaml
-# microservice-deployment-crd.yaml
+# statefulset-postgres.yaml
+# PostgreSQL ด้วย StatefulSet
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: database
+  labels:
+    app: postgresql
+spec:
+  serviceName: postgresql-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0  # Update ทุก pod
+  
+  selector:
+    matchLabels:
+      app: postgresql
+  
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      terminationGracePeriodSeconds: 60
+      
+      initContainers:
+        # Setup replication based on ordinal
+        - name: init-replication
+          image: postgres:15
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              if [ "$ORDINAL" = "0" ]; then
+                echo "primary" > /data/role
+              else
+                echo "replica" > /data/role
+                # Wait for primary
+                until pg_isready -h postgresql-0.postgresql-headless; do sleep 2; done
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      
+      containers:
+        - name: postgresql
+          image: postgres:15
+          env:
+            - name: POSTGRES_DB
+              value: orderdb
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          
+          ports:
+            - containerPort: 5432
+          
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+          
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+---
+# Headless Service สำหรับ Pod DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-headless
+  namespace: database
+spec:
+  clusterIP: None  # Headless
+  selector:
+    app: postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# Regular Service สำหรับ Read/Write
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-primary
+  namespace: database
+spec:
+  selector:
+    app: postgresql
+    role: primary
+  ports:
+    - port: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-replica
+  namespace: database
+spec:
+  selector:
+    app: postgresql
+    role: replica
+  ports:
+    - port: 5432
+```
+
+---
+
+## 2. DaemonSet for Infrastructure
+
+```yaml
+# daemonset-patterns.yaml
+# DaemonSet สำหรับ infrastructure workloads
+
+# Node log collector
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-collector
+  namespace: kube-system
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd
+      tolerations:
+        # รัน บน master nodes ด้วย
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        # รัน บน nodes ที่มี special taint
+        - key: node-type
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
+      
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.16
+          
+          env:
+            - name: FLUENT_ELASTICSEARCH_HOST
+              value: elasticsearch.logging.svc.cluster.local
+            - name: FLUENT_ELASTICSEARCH_PORT
+              value: "9200"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          
+          resources:
+            requests:
+              memory: "200Mi"
+              cpu: "100m"
+            limits:
+              memory: "500Mi"
+              cpu: "500m"
+          
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: config
+              mountPath: /fluentd/etc
+      
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: config
+          configMap:
+            name: fluentd-config
+      
+      terminationGracePeriodSeconds: 30
+---
+# Node exporter สำหรับ Prometheus metrics
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:latest
+          args:
+            - '--path.sysfs=/host/sys'
+            - '--path.procfs=/host/proc'
+            - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+)($|/)'
+          ports:
+            - name: metrics
+              containerPort: 9100
+              hostPort: 9100
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+          resources:
+            requests:
+              memory: "30Mi"
+              cpu: "50m"
+            limits:
+              memory: "100Mi"
+              cpu: "200m"
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+```
+
+---
+
+## 3. Job and CronJob Patterns
+
+```yaml
+# job-patterns.yaml
+
+# Batch processing Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-migration-v2
+  namespace: production
+  labels:
+    app: data-migration
+    version: v2
+spec:
+  # Retry ถ้า job ล้มเหลว
+  backoffLimit: 3
+  # ลบ job pod หลัง complete
+  ttlSecondsAfterFinished: 3600
+  # Timeout
+  activeDeadlineSeconds: 3600
+  
+  # Parallel processing
+  parallelism: 5
+  completions: 100
+  completionMode: Indexed  # Each pod gets unique index
+  
+  template:
+    metadata:
+      labels:
+        app: data-migration
+    spec:
+      restartPolicy: OnFailure
+      
+      containers:
+        - name: migrator
+          image: data-migrator:v2
+          command: ["/app/migrate"]
+          args:
+            - "--batch-index=$(JOB_COMPLETION_INDEX)"
+            - "--total-batches=100"
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: url
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+# CronJob สำหรับ scheduled tasks
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: order-report-generator
+  namespace: production
+spec:
+  # รันทุกวัน 2am Bangkok time
+  schedule: "0 19 * * *"  # UTC (Bangkok = UTC+7)
+  timeZone: "Asia/Bangkok"
+  
+  concurrencyPolicy: Forbid  # ไม่รัน concurrent
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 300  # ถ้าช้ากว่า 5 นาที ให้ skip
+  
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: report-generator-sa
+          
+          containers:
+            - name: report-generator
+              image: report-generator:latest
+              command: ["node", "dist/generate-report.js"]
+              env:
+                - name: REPORT_DATE
+                  value: "yesterday"
+                - name: EMAIL_RECIPIENTS
+                  value: "management@company.com"
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "500m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1000m"
+```
+
+```typescript
+// job-controller.ts
+// TypeScript controller สำหรับ managing Jobs
+
+import { BatchV1Api, CoreV1Api } from '@kubernetes/client-node';
+
+interface JobConfig {
+  name: string;
+  namespace: string;
+  image: string;
+  command: string[];
+  env?: Record<string, string>;
+  parallelism?: number;
+  completions?: number;
+  backoffLimit?: number;
+  ttlSeconds?: number;
+}
+
+class JobManager {
+  private batchApi: BatchV1Api;
+  private coreApi: CoreV1Api;
+
+  constructor(batchApi: BatchV1Api, coreApi: CoreV1Api) {
+    this.batchApi = batchApi;
+    this.coreApi = coreApi;
+  }
+
+  async createJob(config: JobConfig): Promise<void> {
+    await this.batchApi.createNamespacedJob(config.namespace, {
+      apiVersion: 'batch/v1',
+      kind: 'Job',
+      metadata: {
+        name: config.name,
+        namespace: config.namespace,
+      },
+      spec: {
+        parallelism: config.parallelism || 1,
+        completions: config.completions || 1,
+        backoffLimit: config.backoffLimit || 3,
+        ttlSecondsAfterFinished: config.ttlSeconds || 3600,
+        template: {
+          spec: {
+            restartPolicy: 'OnFailure',
+            containers: [
+              {
+                name: 'worker',
+                image: config.image,
+                command: config.command,
+                env: config.env
+                  ? Object.entries(config.env).map(([name, value]) => ({
+                      name,
+                      value,
+                    }))
+                  : [],
+              },
+            ],
+          },
+        },
+      },
+    });
+  }
+
+  async watchJob(
+    name: string,
+    namespace: string
+  ): Promise<'succeeded' | 'failed'> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Job timeout')), 3600000);
+
+      const poll = async () => {
+        const job = await this.batchApi.readNamespacedJob(name, namespace);
+        const status = job.body.status;
+
+        if (status?.succeeded && status.succeeded > 0) {
+          clearTimeout(timeout);
+          resolve('succeeded');
+          return;
+        }
+
+        if (status?.failed && status.failed >= (job.body.spec?.backoffLimit || 3)) {
+          clearTimeout(timeout);
+          resolve('failed');
+          return;
+        }
+
+        setTimeout(poll, 5000);
+      };
+
+      poll();
+    });
+  }
+}
+```
+
+---
+
+## 4. Custom Resource Definitions (CRD)
+
+```yaml
+# crd-definition.yaml
+# Custom Resource Definition สำหรับ OrderPipeline
+
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: microservicedeployments.platform.example.com
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.13.0
+  name: orderpipelines.company.io
 spec:
-  group: platform.example.com
+  group: company.io
   versions:
-    - name: v1
+    - name: v1alpha1
       served: true
       storage: true
       schema:
         openAPIV3Schema:
           type: object
           properties:
-            apiVersion:
-              type: string
-            kind:
-              type: string
-            metadata:
-              type: object
             spec:
               type: object
-              required:
-                - image
-                - port
+              required: ["steps", "trigger"]
               properties:
-                image:
-                  type: string
-                  description: "Container image to deploy"
-                  pattern: "^[a-z0-9/:._-]+$"
-                port:
-                  type: integer
-                  minimum: 1
-                  maximum: 65535
-                  description: "Port the service listens on"
-                replicas:
-                  type: object
-                  properties:
-                    min:
-                      type: integer
-                      minimum: 1
-                      default: 2
-                    max:
-                      type: integer
-                      minimum: 1
-                      default: 10
-                    targetCPUUtilization:
-                      type: integer
-                      minimum: 1
-                      maximum: 100
-                      default: 70
-                resources:
-                  type: object
-                  properties:
-                    cpu:
-                      type: object
-                      properties:
-                        request:
-                          type: string
-                          default: "100m"
-                          pattern: "^[0-9]+(m|[.][0-9]+)?$"
-                        limit:
-                          type: string
-                          default: "1000m"
-                    memory:
-                      type: object
-                      properties:
-                        request:
-                          type: string
-                          default: "128Mi"
-                        limit:
-                          type: string
-                          default: "512Mi"
-                environment:
+                steps:
                   type: array
                   items:
                     type: object
-                    required:
-                      - name
+                    required: ["name", "image"]
                     properties:
                       name:
                         type: string
-                      value:
+                      image:
                         type: string
-                      valueFrom:
+                      command:
+                        type: array
+                        items:
+                          type: string
+                      env:
                         type: object
-                        properties:
-                          secretKeyRef:
-                            type: object
-                            properties:
-                              name:
-                                type: string
-                              key:
-                                type: string
-                          configMapKeyRef:
-                            type: object
-                            properties:
-                              name:
-                                type: string
-                              key:
-                                type: string
-                ingress:
-                  type: object
-                  properties:
-                    enabled:
-                      type: boolean
-                      default: false
-                    host:
-                      type: string
-                    path:
-                      type: string
-                      default: "/"
-                    tlsEnabled:
-                      type: boolean
-                      default: true
-                healthCheck:
-                  type: object
-                  properties:
-                    path:
-                      type: string
-                      default: "/health"
-                    port:
-                      type: integer
-                    initialDelaySeconds:
-                      type: integer
-                      default: 10
-                    periodSeconds:
-                      type: integer
-                      default: 10
-                monitoring:
-                  type: object
-                  properties:
-                    enabled:
-                      type: boolean
-                      default: true
-                    path:
-                      type: string
-                      default: "/metrics"
-                    interval:
-                      type: string
-                      default: "30s"
-                serviceAccount:
-                  type: string
-                  description: "Service account name"
-                configMaps:
-                  type: array
-                  items:
-                    type: string
-                secrets:
-                  type: array
-                  items:
-                    type: string
-                strategy:
+                        additionalProperties:
+                          type: string
+                      dependsOn:
+                        type: array
+                        items:
+                          type: string
+                trigger:
                   type: object
                   properties:
                     type:
                       type: string
-                      enum:
-                        - RollingUpdate
-                        - Recreate
-                        - BlueGreen
-                        - Canary
-                      default: "RollingUpdate"
-                    canaryWeight:
-                      type: integer
-                      minimum: 0
-                      maximum: 100
-                      default: 10
+                      enum: ["manual", "schedule", "webhook"]
+                    schedule:
+                      type: string
+                    webhookSecret:
+                      type: string
+                timeout:
+                  type: string
+                  pattern: '^[0-9]+(s|m|h)$'
             status:
               type: object
               properties:
                 phase:
                   type: string
-                  enum:
-                    - Pending
-                    - Deploying
-                    - Running
-                    - Failed
-                    - Terminating
-                replicas:
-                  type: integer
-                readyReplicas:
-                  type: integer
-                availableReplicas:
-                  type: integer
-                conditions:
+                  enum: ["Pending", "Running", "Succeeded", "Failed"]
+                startTime:
+                  type: string
+                  format: date-time
+                completionTime:
+                  type: string
+                  format: date-time
+                steps:
                   type: array
                   items:
                     type: object
                     properties:
-                      type:
+                      name:
                         type: string
                       status:
                         type: string
-                      reason:
+                      startTime:
                         type: string
-                      message:
+                      completionTime:
                         type: string
-                      lastTransitionTime:
-                        type: string
-                observedGeneration:
-                  type: integer
-                  format: int64
-                deploymentRef:
-                  type: string
-                serviceRef:
-                  type: string
-                ingressRef:
-                  type: string
       additionalPrinterColumns:
         - name: Phase
           type: string
           jsonPath: .status.phase
-        - name: Replicas
-          type: integer
-          jsonPath: .status.replicas
-        - name: Ready
-          type: integer
-          jsonPath: .status.readyReplicas
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
       subresources:
         status: {}
-        scale:
-          specReplicasPath: .spec.replicas.min
-          statusReplicasPath: .status.replicas
   scope: Namespaced
   names:
-    plural: microservicedeployments
-    singular: microservicedeployment
-    kind: MicroserviceDeployment
+    plural: orderpipelines
+    singular: orderpipeline
+    kind: OrderPipeline
     shortNames:
-      - msd
-    categories:
-      - platform
-      - all
-```
-
-### TypeScript CRD Schema ด้วย zod
-
-```typescript
-// microservice-deployment-schema.ts
-import { z } from 'zod';
-
-// Resource definition schema
-const ResourceAmountSchema = z.string().regex(/^\d+(m|([.]\d+))?$/, {
-  message: 'Must be valid Kubernetes resource amount (e.g., "100m", "0.5")',
-});
-
-const MemoryAmountSchema = z.string().regex(/^\d+(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$/, {
-  message: 'Must be valid memory amount (e.g., "128Mi", "1Gi")',
-});
-
-const ResourcesSchema = z.object({
-  cpu: z.object({
-    request: ResourceAmountSchema.default('100m'),
-    limit: ResourceAmountSchema.default('1000m'),
-  }).optional(),
-  memory: z.object({
-    request: MemoryAmountSchema.default('128Mi'),
-    limit: MemoryAmountSchema.default('512Mi'),
-  }).optional(),
-});
-
-const EnvVarSchema = z.union([
-  z.object({
-    name: z.string().min(1),
-    value: z.string(),
-  }),
-  z.object({
-    name: z.string().min(1),
-    valueFrom: z.union([
-      z.object({
-        secretKeyRef: z.object({
-          name: z.string(),
-          key: z.string(),
-        }),
-      }),
-      z.object({
-        configMapKeyRef: z.object({
-          name: z.string(),
-          key: z.string(),
-        }),
-      }),
-    ]),
-  }),
-]);
-
-const ReplicasSchema = z.object({
-  min: z.number().int().min(1).default(2),
-  max: z.number().int().min(1).default(10),
-  targetCPUUtilization: z.number().int().min(1).max(100).default(70),
-}).refine(data => data.max >= data.min, {
-  message: 'max replicas must be >= min replicas',
-});
-
-const IngressSchema = z.object({
-  enabled: z.boolean().default(false),
-  host: z.string().optional(),
-  path: z.string().default('/'),
-  tlsEnabled: z.boolean().default(true),
-});
-
-const HealthCheckSchema = z.object({
-  path: z.string().default('/health'),
-  port: z.number().int().optional(),
-  initialDelaySeconds: z.number().int().default(10),
-  periodSeconds: z.number().int().default(10),
-  failureThreshold: z.number().int().default(3),
-});
-
-const MonitoringSchema = z.object({
-  enabled: z.boolean().default(true),
-  path: z.string().default('/metrics'),
-  interval: z.string().default('30s'),
-});
-
-const StrategySchema = z.object({
-  type: z.enum(['RollingUpdate', 'Recreate', 'BlueGreen', 'Canary']).default('RollingUpdate'),
-  canaryWeight: z.number().int().min(0).max(100).default(10),
-});
-
-const MicroserviceDeploymentSpecSchema = z.object({
-  image: z.string().regex(/^[a-z0-9/:._-]+$/, {
-    message: 'Image must be a valid container image reference',
-  }),
-  port: z.number().int().min(1).max(65535),
-  replicas: ReplicasSchema.optional(),
-  resources: ResourcesSchema.optional(),
-  environment: z.array(EnvVarSchema).optional(),
-  ingress: IngressSchema.optional(),
-  healthCheck: HealthCheckSchema.optional(),
-  monitoring: MonitoringSchema.optional(),
-  serviceAccount: z.string().optional(),
-  configMaps: z.array(z.string()).optional(),
-  secrets: z.array(z.string()).optional(),
-  strategy: StrategySchema.optional(),
-});
-
-const MicroserviceDeploymentStatusSchema = z.object({
-  phase: z.enum(['Pending', 'Deploying', 'Running', 'Failed', 'Terminating']).optional(),
-  replicas: z.number().int().optional(),
-  readyReplicas: z.number().int().optional(),
-  availableReplicas: z.number().int().optional(),
-  conditions: z.array(z.object({
-    type: z.string(),
-    status: z.string(),
-    reason: z.string().optional(),
-    message: z.string().optional(),
-    lastTransitionTime: z.string().optional(),
-  })).optional(),
-  observedGeneration: z.number().int().optional(),
-  deploymentRef: z.string().optional(),
-  serviceRef: z.string().optional(),
-  ingressRef: z.string().optional(),
-});
-
-const MicroserviceDeploymentSchema = z.object({
-  apiVersion: z.literal('platform.example.com/v1'),
-  kind: z.literal('MicroserviceDeployment'),
-  metadata: z.object({
-    name: z.string().min(1).max(253),
-    namespace: z.string().optional(),
-    labels: z.record(z.string()).optional(),
-    annotations: z.record(z.string()).optional(),
-  }),
-  spec: MicroserviceDeploymentSpecSchema,
-  status: MicroserviceDeploymentStatusSchema.optional(),
-});
-
-type MicroserviceDeploymentSpec = z.infer<typeof MicroserviceDeploymentSpecSchema>;
-type MicroserviceDeployment = z.infer<typeof MicroserviceDeploymentSchema>;
-
-function validateMicroserviceDeployment(data: unknown): MicroserviceDeployment {
-  return MicroserviceDeploymentSchema.parse(data);
-}
-
-export {
-  MicroserviceDeploymentSchema,
-  MicroserviceDeploymentSpecSchema,
-  validateMicroserviceDeployment,
-  type MicroserviceDeployment,
-  type MicroserviceDeploymentSpec,
-};
+      - op
+---
+# Custom Resource instance
+apiVersion: company.io/v1alpha1
+kind: OrderPipeline
+metadata:
+  name: order-fulfillment-pipeline
+  namespace: production
+spec:
+  trigger:
+    type: webhook
+    webhookSecret: my-webhook-secret
+  
+  timeout: 30m
+  
+  steps:
+    - name: validate-order
+      image: order-validator:latest
+      command: ["./validate"]
+      env:
+        ORDER_SERVICE_URL: "http://order-service:3000"
+    
+    - name: reserve-inventory
+      image: inventory-service:latest
+      command: ["./reserve"]
+      dependsOn: ["validate-order"]
+    
+    - name: process-payment
+      image: payment-service:latest
+      command: ["./process"]
+      dependsOn: ["reserve-inventory"]
+    
+    - name: create-shipment
+      image: shipping-service:latest
+      command: ["./ship"]
+      dependsOn: ["process-payment"]
 ```
 
 ---
 
-## 80.2 Kubernetes Operator ด้วย TypeScript
-
-### TypeScript Operator ใช้ @kubernetes/client-node
+## 5. Kubernetes Operators with operator-sdk
 
 ```typescript
-// microservice-operator.ts
-import * as k8s from '@kubernetes/client-node';
+// order-pipeline-operator.ts
+// TypeScript Operator สำหรับ OrderPipeline CRD
+
+import {
+  KubeConfig,
+  CustomObjectsApi,
+  BatchV1Api,
+  CoreV1Api,
+  AppsV1Api,
+} from '@kubernetes/client-node';
 import { EventEmitter } from 'events';
 
-// Types
-interface MicroserviceDeployment {
+interface OrderPipelineSpec {
+  steps: Array<{
+    name: string;
+    image: string;
+    command?: string[];
+    env?: Record<string, string>;
+    dependsOn?: string[];
+  }>;
+  trigger: {
+    type: 'manual' | 'schedule' | 'webhook';
+    schedule?: string;
+    webhookSecret?: string;
+  };
+  timeout?: string;
+}
+
+interface OrderPipelineStatus {
+  phase: 'Pending' | 'Running' | 'Succeeded' | 'Failed';
+  startTime?: string;
+  completionTime?: string;
+  steps?: Array<{
+    name: string;
+    status: string;
+    startTime?: string;
+    completionTime?: string;
+  }>;
+}
+
+interface OrderPipeline {
   apiVersion: string;
   kind: string;
-  metadata: k8s.V1ObjectMeta;
-  spec: {
-    image: string;
-    port: number;
-    replicas?: {
-      min: number;
-      max: number;
-      targetCPUUtilization: number;
-    };
-    resources?: {
-      cpu?: { request: string; limit: string };
-      memory?: { request: string; limit: string };
-    };
-    environment?: Array<{ name: string; value?: string }>;
-    ingress?: {
-      enabled: boolean;
-      host?: string;
-      path: string;
-    };
-    healthCheck?: {
-      path: string;
-      initialDelaySeconds: number;
-      periodSeconds: number;
-    };
+  metadata: {
+    name: string;
+    namespace: string;
+    resourceVersion?: string;
+    uid?: string;
+    generation?: number;
   };
-  status?: {
-    phase?: string;
-    replicas?: number;
-    readyReplicas?: number;
-    conditions?: Array<{
-      type: string;
-      status: string;
-      reason?: string;
-      message?: string;
-      lastTransitionTime?: string;
-    }>;
-    observedGeneration?: number;
-  };
+  spec: OrderPipelineSpec;
+  status?: OrderPipelineStatus;
 }
 
-type ReconcileAction = 'create' | 'update' | 'delete' | 'noop';
-
-interface ReconcileResult {
-  action: ReconcileAction;
-  success: boolean;
-  error?: string;
-  requeue?: boolean;
-  requeueAfterMs?: number;
-}
-
-// Operator Class
-class MicroserviceOperator extends EventEmitter {
-  private kc: k8s.KubeConfig;
-  private coreApi: k8s.CoreV1Api;
-  private appsApi: k8s.AppsV1Api;
-  private customApi: k8s.CustomObjectsApi;
-  private autoscalingApi: k8s.AutoscalingV2Api;
-  private networkingApi: k8s.NetworkingV1Api;
-  private informer: k8s.Informer<MicroserviceDeployment> | null = null;
-  private reconcileQueue: Map<string, MicroserviceDeployment>;
-  private isProcessing = false;
-
-  private readonly GROUP = 'platform.example.com';
-  private readonly VERSION = 'v1';
-  private readonly PLURAL = 'microservicedeployments';
-  private readonly FINALIZER = 'platform.example.com/cleanup';
-  private readonly FIELD_MANAGER = 'microservice-operator';
+class OrderPipelineOperator {
+  private customApi: CustomObjectsApi;
+  private batchApi: BatchV1Api;
+  private kubeConfig: KubeConfig;
+  private reconciling: Set<string> = new Set();
 
   constructor() {
-    super();
-    this.kc = new k8s.KubeConfig();
-    this.kc.loadFromDefault();
-    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
-    this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
-    this.customApi = this.kc.makeApiClient(k8s.CustomObjectsApi);
-    this.autoscalingApi = this.kc.makeApiClient(k8s.AutoscalingV2Api);
-    this.networkingApi = this.kc.makeApiClient(k8s.NetworkingV1Api);
-    this.reconcileQueue = new Map();
+    this.kubeConfig = new KubeConfig();
+    this.kubeConfig.loadFromDefault();
+    this.customApi = this.kubeConfig.makeApiClient(CustomObjectsApi);
+    this.batchApi = this.kubeConfig.makeApiClient(BatchV1Api);
   }
 
   async start(): Promise<void> {
-    console.log('Starting MicroserviceDeployment Operator...');
+    console.log('Starting OrderPipeline Operator');
     
-    await this.setupInformer();
-    await this.processQueue();
-    
-    console.log('Operator started successfully');
+    // Watch for OrderPipeline resources
+    await this.watchResources();
   }
 
-  private async setupInformer(): Promise<void> {
-    const listFn = () => this.customApi.listClusterCustomObject(
-      this.GROUP,
-      this.VERSION,
-      this.PLURAL
+  private async watchResources(): Promise<void> {
+    const watch = require('@kubernetes/client-node').Watch;
+    const watcher = new watch(this.kubeConfig);
+
+    await watcher.watch(
+      '/apis/company.io/v1alpha1/orderpipelines',
+      {},
+      (type: string, obj: OrderPipeline) => {
+        if (type === 'ADDED' || type === 'MODIFIED') {
+          this.reconcile(obj).catch(err =>
+            console.error(`Reconcile failed for ${obj.metadata.name}:`, err)
+          );
+        } else if (type === 'DELETED') {
+          this.cleanup(obj).catch(err =>
+            console.error(`Cleanup failed for ${obj.metadata.name}:`, err)
+          );
+        }
+      },
+      (err: Error) => {
+        console.error('Watch error:', err);
+        // Restart watch after delay
+        setTimeout(() => this.watchResources(), 5000);
+      }
     );
-
-    this.informer = k8s.makeInformer(
-      this.kc,
-      `/apis/${this.GROUP}/${this.VERSION}/${this.PLURAL}`,
-      listFn as any
-    );
-
-    this.informer.on('add', (obj: MicroserviceDeployment) => {
-      console.log(`[ADD] ${obj.metadata.namespace}/${obj.metadata.name}`);
-      this.enqueueReconcile(obj);
-    });
-
-    this.informer.on('update', (obj: MicroserviceDeployment) => {
-      console.log(`[UPDATE] ${obj.metadata.namespace}/${obj.metadata.name}`);
-      this.enqueueReconcile(obj);
-    });
-
-    this.informer.on('delete', (obj: MicroserviceDeployment) => {
-      console.log(`[DELETE] ${obj.metadata.namespace}/${obj.metadata.name}`);
-      // ลบออกจาก queue
-      const key = `${obj.metadata.namespace}/${obj.metadata.name}`;
-      this.reconcileQueue.delete(key);
-    });
-
-    this.informer.on('error', (err: Error) => {
-      console.error('Informer error:', err.message);
-      // Restart informer after 5 seconds
-      setTimeout(() => this.setupInformer(), 5000);
-    });
-
-    await this.informer.start();
   }
 
-  private enqueueReconcile(obj: MicroserviceDeployment): void {
-    const key = `${obj.metadata.namespace}/${obj.metadata.name}`;
-    this.reconcileQueue.set(key, obj);
+  private async reconcile(pipeline: OrderPipeline): Promise<void> {
+    const key = `${pipeline.metadata.namespace}/${pipeline.metadata.name}`;
     
-    if (!this.isProcessing) {
+    // Prevent concurrent reconciliation
+    if (this.reconciling.has(key)) {
+      console.log(`Already reconciling ${key}, skipping`);
+      return;
+    }
+
+    this.reconciling.add(key);
+
+    try {
+      console.log(`Reconciling ${key}`);
+
+      const currentStatus = pipeline.status?.phase || 'Pending';
+
+      if (currentStatus === 'Pending') {
+        await this.startPipeline(pipeline);
+      } else if (currentStatus === 'Running') {
+        await this.checkPipelineProgress(pipeline);
+      }
+
+    } finally {
+      this.reconciling.delete(key);
+    }
+  }
+
+  private async startPipeline(pipeline: OrderPipeline): Promise<void> {
+    // Update status to Running
+    await this.updateStatus(pipeline, {
+      phase: 'Running',
+      startTime: new Date().toISOString(),
+      steps: pipeline.spec.steps.map(step => ({
+        name: step.name,
+        status: 'Pending',
+      })),
+    });
+
+    // Execute steps in dependency order
+    await this.executeSteps(pipeline);
+  }
+
+  private async executeSteps(pipeline: OrderPipeline): Promise<void> {
+    const completed = new Set<string>();
+    const steps = pipeline.spec.steps;
+
+    while (completed.size < steps.length) {
+      // Find steps ready to run (all dependencies completed)
+      const ready = steps.filter(step => {
+        if (completed.has(step.name)) return false;
+        if (!step.dependsOn || step.dependsOn.length === 0) return true;
+        return step.dependsOn.every(dep => completed.has(dep));
+      });
+
+      if (ready.length === 0) break; // No progress possible
+
+      // Execute ready steps in parallel
+      await Promise.all(
+        ready.map(async step => {
+          await this.executeStep(pipeline, step);
+          completed.add(step.name);
+        })
+      );
+    }
+
+    // Update final status
+    if (completed.size === steps.length) {
+      await this.updateStatus(pipeline, {
+        phase: 'Succeeded',
+        completionTime: new Date().toISOString(),
+      });
+    } else {
+      await this.updateStatus(pipeline, {
+        phase: 'Failed',
+        completionTime: new Date().toISOString(),
+      });
+    }
+  }
+
+  private async executeStep(
+    pipeline: OrderPipeline,
+    step: OrderPipelineSpec['steps'][0]
+  ): Promise<void> {
+    const jobName = `${pipeline.metadata.name}-${step.name}`;
+
+    // Create Job for this step
+    await this.batchApi.createNamespacedJob(pipeline.metadata.namespace, {
+      apiVersion: 'batch/v1',
+      kind: 'Job',
+      metadata: {
+        name: jobName,
+        namespace: pipeline.metadata.namespace,
+        ownerReferences: [
+          {
+            apiVersion: 'company.io/v1alpha1',
+            kind: 'OrderPipeline',
+            name: pipeline.metadata.name,
+            uid: pipeline.metadata.uid!,
+            controller: true,
+            blockOwnerDeletion: true,
+          },
+        ],
+      },
+      spec: {
+        backoffLimit: 2,
+        template: {
+          spec: {
+            restartPolicy: 'OnFailure',
+            containers: [
+              {
+                name: step.name,
+                image: step.image,
+                command: step.command,
+                env: step.env
+                  ? Object.entries(step.env).map(([name, value]) => ({
+                      name,
+                      value,
+                    }))
+                  : [],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    // Wait for job completion
+    const result = await this.waitForJob(jobName, pipeline.metadata.namespace);
+
+    if (result !== 'succeeded') {
+      throw new Error(`Step ${step.name} failed`);
+    }
+  }
+
+  private async waitForJob(name: string, namespace: string): Promise<string> {
+    const timeout = 3600000; // 1 hour
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+      const job = await this.batchApi.readNamespacedJob(name, namespace);
+      const status = job.body.status;
+
+      if (status?.succeeded && status.succeeded > 0) return 'succeeded';
+      if (status?.failed && status.failed >= 3) return 'failed';
+
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+
+    return 'timeout';
+  }
+
+  private async updateStatus(
+    pipeline: OrderPipeline,
+    status: Partial<OrderPipelineStatus>
+  ): Promise<void> {
+    await this.customApi.patchNamespacedCustomObjectStatus(
+      'company.io',
+      'v1alpha1',
+      pipeline.metadata.namespace,
+      'orderpipelines',
+      pipeline.metadata.name,
+      [{ op: 'replace', path: '/status', value: { ...pipeline.status, ...status } }],
+      undefined, undefined, undefined,
+      { headers: { 'Content-Type': 'application/json-patch+json' } }
+    );
+  }
+
+  private async checkPipelineProgress(pipeline: OrderPipeline): Promise<void> {
+    // Check if any jobs have completed/failed
+    console.log(`Checking progress for ${pipeline.metadata.name}`);
+  }
+
+  private async cleanup(pipeline: OrderPipeline): Promise<void> {
+    // Owner references handle cascading deletion
+    console.log(`Cleanup triggered for ${pipeline.metadata.name}`);
+  }
+}
+
+// Start operator
+const operator = new OrderPipelineOperator();
+operator.start().catch(console.error);
+```
+
+---
+
+## 6. Controller Pattern Implementation
+
+```typescript
+// controller-pattern.ts
+// Generic Controller pattern สำหรับ Kubernetes
+
+interface ReconcileResult {
+  requeue: boolean;
+  requeueAfter?: number; // milliseconds
+}
+
+abstract class Controller<T> {
+  private queue: Array<{ key: string; object: T }> = [];
+  private processing = false;
+
+  protected abstract reconcile(obj: T): Promise<ReconcileResult>;
+  protected abstract getKey(obj: T): string;
+
+  enqueue(obj: T): void {
+    const key = this.getKey(obj);
+    
+    // Dedup: remove existing if already in queue
+    const existing = this.queue.findIndex(item => item.key === key);
+    if (existing !== -1) {
+      this.queue.splice(existing, 1);
+    }
+    
+    this.queue.push({ key, object: obj });
+    
+    if (!this.processing) {
       this.processQueue();
     }
   }
 
   private async processQueue(): Promise<void> {
-    this.isProcessing = true;
+    this.processing = true;
     
-    while (this.reconcileQueue.size > 0) {
-      const [key, obj] = this.reconcileQueue.entries().next().value;
-      this.reconcileQueue.delete(key);
+    while (this.queue.length > 0) {
+      const item = this.queue.shift()!;
       
       try {
-        const result = await this.reconcile(obj);
+        const result = await this.reconcile(item.object);
         
         if (result.requeue) {
-          const delay = result.requeueAfterMs ?? 5000;
-          setTimeout(() => this.enqueueReconcile(obj), delay);
+          const delay = result.requeueAfter || 0;
+          setTimeout(() => this.enqueue(item.object), delay);
         }
-      } catch (err: any) {
-        console.error(`Reconcile error for ${key}:`, err.message);
+      } catch (error) {
+        console.error(`Reconcile failed for ${item.key}:`, error);
         // Requeue with backoff
-        setTimeout(() => this.enqueueReconcile(obj), 10000);
+        setTimeout(() => this.enqueue(item.object), 5000);
       }
     }
     
-    this.isProcessing = false;
-  }
-
-  async reconcile(msd: MicroserviceDeployment): Promise<ReconcileResult> {
-    const { name, namespace, generation, finalizers } = msd.metadata;
-    const ns = namespace ?? 'default';
-
-    console.log(`Reconciling ${ns}/${name} (generation: ${generation})`);
-
-    // Handle deletion
-    if (msd.metadata.deletionTimestamp) {
-      return this.handleDeletion(msd, ns);
-    }
-
-    // Add finalizer if not present
-    if (!finalizers?.includes(this.FINALIZER)) {
-      await this.addFinalizer(msd, ns);
-    }
-
-    // Update status to Deploying
-    await this.updateStatus(msd, ns, {
-      phase: 'Deploying',
-      conditions: [{
-        type: 'Progressing',
-        status: 'True',
-        reason: 'ReconcileStarted',
-        message: 'Reconciliation started',
-        lastTransitionTime: new Date().toISOString(),
-      }],
-    });
-
-    try {
-      // Reconcile Deployment
-      await this.reconcileDeployment(msd, ns);
-      
-      // Reconcile Service
-      await this.reconcileService(msd, ns);
-      
-      // Reconcile HPA
-      await this.reconcileHPA(msd, ns);
-      
-      // Reconcile Ingress if enabled
-      if (msd.spec.ingress?.enabled) {
-        await this.reconcileIngress(msd, ns);
-      }
-
-      // Check deployment readiness
-      const deployment = await this.appsApi.readNamespacedDeployment(name, ns);
-      const readyReplicas = deployment.body.status?.readyReplicas ?? 0;
-      const totalReplicas = deployment.body.status?.replicas ?? 0;
-
-      await this.updateStatus(msd, ns, {
-        phase: readyReplicas === totalReplicas ? 'Running' : 'Deploying',
-        replicas: totalReplicas,
-        readyReplicas,
-        observedGeneration: generation,
-        conditions: [{
-          type: 'Available',
-          status: readyReplicas > 0 ? 'True' : 'False',
-          reason: readyReplicas > 0 ? 'MinimumReplicasAvailable' : 'MinimumReplicasUnavailable',
-          message: `${readyReplicas}/${totalReplicas} replicas ready`,
-          lastTransitionTime: new Date().toISOString(),
-        }],
-      });
-
-      // Requeue if not fully ready
-      if (readyReplicas < totalReplicas) {
-        return { action: 'update', success: true, requeue: true, requeueAfterMs: 10000 };
-      }
-
-      return { action: 'update', success: true, requeue: false };
-    } catch (err: any) {
-      await this.updateStatus(msd, ns, {
-        phase: 'Failed',
-        conditions: [{
-          type: 'Failed',
-          status: 'True',
-          reason: 'ReconcileError',
-          message: err.message,
-          lastTransitionTime: new Date().toISOString(),
-        }],
-      });
-
-      return {
-        action: 'update',
-        success: false,
-        error: err.message,
-        requeue: true,
-        requeueAfterMs: 30000,
-      };
-    }
-  }
-
-  private async reconcileDeployment(
-    msd: MicroserviceDeployment,
-    namespace: string
-  ): Promise<void> {
-    const { name } = msd.metadata;
-    const spec = msd.spec;
-    
-    const deploymentSpec: k8s.V1Deployment = {
-      metadata: {
-        name,
-        namespace,
-        labels: {
-          'app': name,
-          'managed-by': 'microservice-operator',
-          'platform.example.com/msd': name,
-        },
-        ownerReferences: [{
-          apiVersion: `${this.GROUP}/${this.VERSION}`,
-          kind: 'MicroserviceDeployment',
-          name,
-          uid: msd.metadata.uid!,
-          controller: true,
-          blockOwnerDeletion: true,
-        }],
-      },
-      spec: {
-        replicas: spec.replicas?.min ?? 2,
-        selector: {
-          matchLabels: { app: name },
-        },
-        template: {
-          metadata: {
-            labels: { app: name },
-            annotations: {
-              'prometheus.io/scrape': 'true',
-              'prometheus.io/path': '/metrics',
-              'prometheus.io/port': spec.port.toString(),
-            },
-          },
-          spec: {
-            containers: [{
-              name,
-              image: spec.image,
-              ports: [{ containerPort: spec.port }],
-              env: spec.environment as k8s.V1EnvVar[],
-              resources: {
-                requests: {
-                  cpu: spec.resources?.cpu?.request ?? '100m',
-                  memory: spec.resources?.memory?.request ?? '128Mi',
-                },
-                limits: {
-                  cpu: spec.resources?.cpu?.limit ?? '1000m',
-                  memory: spec.resources?.memory?.limit ?? '512Mi',
-                },
-              },
-              readinessProbe: {
-                httpGet: {
-                  path: spec.healthCheck?.path ?? '/health',
-                  port: spec.port as any,
-                },
-                initialDelaySeconds: spec.healthCheck?.initialDelaySeconds ?? 10,
-                periodSeconds: spec.healthCheck?.periodSeconds ?? 10,
-              },
-              livenessProbe: {
-                httpGet: {
-                  path: spec.healthCheck?.path ?? '/health',
-                  port: spec.port as any,
-                },
-                initialDelaySeconds: (spec.healthCheck?.initialDelaySeconds ?? 10) * 3,
-                periodSeconds: spec.healthCheck?.periodSeconds ?? 10,
-              },
-            }],
-          },
-        },
-        strategy: {
-          type: 'RollingUpdate',
-          rollingUpdate: {
-            maxSurge: 1,
-            maxUnavailable: 0,
-          },
-        },
-      },
-    };
-
-    try {
-      await this.appsApi.readNamespacedDeployment(name, namespace);
-      // Update existing
-      await this.appsApi.patchNamespacedDeployment(
-        name,
-        namespace,
-        deploymentSpec,
-        undefined,
-        undefined,
-        this.FIELD_MANAGER,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/apply-patch+yaml' } }
-      );
-    } catch (err: any) {
-      if (err.statusCode === 404) {
-        await this.appsApi.createNamespacedDeployment(namespace, deploymentSpec);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  private async reconcileService(
-    msd: MicroserviceDeployment,
-    namespace: string
-  ): Promise<void> {
-    const { name } = msd.metadata;
-    
-    const service: k8s.V1Service = {
-      metadata: {
-        name,
-        namespace,
-        labels: { app: name, 'managed-by': 'microservice-operator' },
-        ownerReferences: [{
-          apiVersion: `${this.GROUP}/${this.VERSION}`,
-          kind: 'MicroserviceDeployment',
-          name,
-          uid: msd.metadata.uid!,
-          controller: true,
-          blockOwnerDeletion: true,
-        }],
-      },
-      spec: {
-        selector: { app: name },
-        ports: [{
-          port: 80,
-          targetPort: msd.spec.port as any,
-          protocol: 'TCP',
-          name: 'http',
-        }],
-        type: 'ClusterIP',
-      },
-    };
-
-    try {
-      await this.coreApi.readNamespacedService(name, namespace);
-      await this.coreApi.patchNamespacedService(
-        name,
-        namespace,
-        service,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/merge-patch+json' } }
-      );
-    } catch (err: any) {
-      if (err.statusCode === 404) {
-        await this.coreApi.createNamespacedService(namespace, service);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  private async reconcileHPA(
-    msd: MicroserviceDeployment,
-    namespace: string
-  ): Promise<void> {
-    const { name } = msd.metadata;
-    const replicas = msd.spec.replicas;
-    
-    if (!replicas) return;
-
-    const hpa: k8s.V2HorizontalPodAutoscaler = {
-      metadata: {
-        name,
-        namespace,
-        ownerReferences: [{
-          apiVersion: `${this.GROUP}/${this.VERSION}`,
-          kind: 'MicroserviceDeployment',
-          name,
-          uid: msd.metadata.uid!,
-          controller: true,
-          blockOwnerDeletion: true,
-        }],
-      },
-      spec: {
-        scaleTargetRef: {
-          apiVersion: 'apps/v1',
-          kind: 'Deployment',
-          name,
-        },
-        minReplicas: replicas.min,
-        maxReplicas: replicas.max,
-        metrics: [{
-          type: 'Resource',
-          resource: {
-            name: 'cpu',
-            target: {
-              type: 'Utilization',
-              averageUtilization: replicas.targetCPUUtilization,
-            },
-          },
-        }],
-      },
-    };
-
-    try {
-      await this.autoscalingApi.readNamespacedHorizontalPodAutoscaler(name, namespace);
-      await this.autoscalingApi.patchNamespacedHorizontalPodAutoscaler(
-        name,
-        namespace,
-        hpa,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/merge-patch+json' } }
-      );
-    } catch (err: any) {
-      if (err.statusCode === 404) {
-        await this.autoscalingApi.createNamespacedHorizontalPodAutoscaler(namespace, hpa);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  private async reconcileIngress(
-    msd: MicroserviceDeployment,
-    namespace: string
-  ): Promise<void> {
-    const { name } = msd.metadata;
-    const ingressSpec = msd.spec.ingress!;
-    
-    if (!ingressSpec.host) {
-      throw new Error('Ingress requires a host');
-    }
-
-    const ingress: k8s.V1Ingress = {
-      metadata: {
-        name,
-        namespace,
-        annotations: {
-          'kubernetes.io/ingress.class': 'nginx',
-          'cert-manager.io/cluster-issuer': 'letsencrypt-prod',
-        },
-      },
-      spec: {
-        tls: ingressSpec.tlsEnabled ? [{
-          hosts: [ingressSpec.host],
-          secretName: `${name}-tls`,
-        }] : undefined,
-        rules: [{
-          host: ingressSpec.host,
-          http: {
-            paths: [{
-              path: ingressSpec.path,
-              pathType: 'Prefix',
-              backend: {
-                service: {
-                  name,
-                  port: { number: 80 },
-                },
-              },
-            }],
-          },
-        }],
-      },
-    };
-
-    try {
-      await this.networkingApi.readNamespacedIngress(name, namespace);
-      await this.networkingApi.patchNamespacedIngress(
-        name,
-        namespace,
-        ingress,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/merge-patch+json' } }
-      );
-    } catch (err: any) {
-      if (err.statusCode === 404) {
-        await this.networkingApi.createNamespacedIngress(namespace, ingress);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  private async handleDeletion(
-    msd: MicroserviceDeployment,
-    namespace: string
-  ): Promise<ReconcileResult> {
-    const { name, finalizers } = msd.metadata;
-    
-    if (!finalizers?.includes(this.FINALIZER)) {
-      return { action: 'delete', success: true };
-    }
-
-    console.log(`Handling deletion of ${namespace}/${name}`);
-    
-    // Cleanup logic here (e.g., external resources)
-    
-    // Remove finalizer
-    await this.removeFinalizer(msd, namespace);
-    
-    return { action: 'delete', success: true };
-  }
-
-  private async addFinalizer(msd: MicroserviceDeployment, namespace: string): Promise<void> {
-    const { name, finalizers = [] } = msd.metadata;
-    
-    await this.customApi.patchNamespacedCustomObject(
-      this.GROUP,
-      this.VERSION,
-      namespace,
-      this.PLURAL,
-      name,
-      { metadata: { finalizers: [...finalizers, this.FINALIZER] } },
-      undefined,
-      undefined,
-      undefined,
-      { headers: { 'Content-Type': 'application/merge-patch+json' } }
-    );
-  }
-
-  private async removeFinalizer(msd: MicroserviceDeployment, namespace: string): Promise<void> {
-    const { name, finalizers = [] } = msd.metadata;
-    const newFinalizers = finalizers.filter(f => f !== this.FINALIZER);
-    
-    await this.customApi.patchNamespacedCustomObject(
-      this.GROUP,
-      this.VERSION,
-      namespace,
-      this.PLURAL,
-      name,
-      { metadata: { finalizers: newFinalizers } },
-      undefined,
-      undefined,
-      undefined,
-      { headers: { 'Content-Type': 'application/merge-patch+json' } }
-    );
-  }
-
-  private async updateStatus(
-    msd: MicroserviceDeployment,
-    namespace: string,
-    status: Partial<MicroserviceDeployment['status']>
-  ): Promise<void> {
-    const { name } = msd.metadata;
-    
-    try {
-      await this.customApi.patchNamespacedCustomObjectStatus(
-        this.GROUP,
-        this.VERSION,
-        namespace,
-        this.PLURAL,
-        name,
-        { status },
-        undefined,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/merge-patch+json' } }
-      );
-    } catch (err: any) {
-      console.warn(`Failed to update status for ${namespace}/${name}:`, err.message);
-    }
-  }
-
-  async stop(): Promise<void> {
-    if (this.informer) {
-      await this.informer.stop();
-    }
+    this.processing = false;
   }
 }
 
-// Main entry point
-async function main() {
-  const operator = new MicroserviceOperator();
+// Concrete controller implementation
+class DeploymentHealthController extends Controller<any> {
+  private k8sAppsApi: AppsV1Api;
 
-  process.on('SIGTERM', async () => {
-    console.log('Received SIGTERM, shutting down...');
-    await operator.stop();
-    process.exit(0);
-  });
+  constructor(k8sAppsApi: AppsV1Api) {
+    super();
+    this.k8sAppsApi = k8sAppsApi;
+  }
 
-  process.on('SIGINT', async () => {
-    console.log('Received SIGINT, shutting down...');
-    await operator.stop();
-    process.exit(0);
-  });
+  protected getKey(obj: any): string {
+    return `${obj.metadata.namespace}/${obj.metadata.name}`;
+  }
 
-  await operator.start();
+  protected async reconcile(deployment: any): Promise<ReconcileResult> {
+    const { name, namespace } = deployment.metadata;
+    
+    // Check deployment health
+    const deplResult = await this.k8sAppsApi.readNamespacedDeployment(name, namespace);
+    const depl = deplResult.body;
+    
+    const desired = depl.spec?.replicas || 1;
+    const ready = depl.status?.readyReplicas || 0;
+    
+    if (ready < desired) {
+      console.warn(`${name}: only ${ready}/${desired} replicas ready`);
+      
+      // Check for stale pods and delete them
+      const staleDurationMs = 10 * 60 * 1000; // 10 minutes
+      
+      // Requeue to check again in 30 seconds
+      return { requeue: true, requeueAfter: 30000 };
+    }
+    
+    return { requeue: false };
+  }
 }
 
-main().catch(console.error);
+import { AppsV1Api } from '@kubernetes/client-node';
 ```
 
 ---
 
-## 80.3 Controller Pattern: TypeScript ReconcileController with Exponential Backoff
+## 7. Admission Webhooks (ValidatingWebhookConfiguration)
 
 ```typescript
-// reconcile-controller.ts
+// admission-webhook.ts
+// Validating Admission Webhook
 
-interface ReconcileRequest {
-  name: string;
-  namespace: string;
-  generation?: number;
-}
-
-interface ReconcileError extends Error {
-  retryable: boolean;
-  suggestedDelayMs?: number;
-}
-
-abstract class BaseController<T> {
-  private workQueue: Map<string, ReconcileRequest>;
-  private retryMap: Map<string, { count: number; nextRetryMs: number }>;
-  private isRunning = false;
-  protected maxRetries = 5;
-  protected baseDelayMs = 1000;
-  protected maxDelayMs = 300000; // 5 minutes
-
-  constructor() {
-    this.workQueue = new Map();
-    this.retryMap = new Map();
-  }
-
-  protected abstract reconcile(request: ReconcileRequest): Promise<ReconcileResult>;
-
-  enqueue(request: ReconcileRequest): void {
-    const key = `${request.namespace}/${request.name}`;
-    
-    // Deduplication: only keep latest request per object
-    this.workQueue.set(key, request);
-    
-    if (!this.isRunning) {
-      this.runLoop();
-    }
-  }
-
-  private async runLoop(): Promise<void> {
-    this.isRunning = true;
-    
-    while (this.workQueue.size > 0) {
-      const entries = Array.from(this.workQueue.entries());
-      const now = Date.now();
-      
-      // Process only requests that are ready (not in backoff)
-      const readyEntries = entries.filter(([key]) => {
-        const retry = this.retryMap.get(key);
-        return !retry || now >= retry.nextRetryMs;
-      });
-
-      if (readyEntries.length === 0) {
-        // All in backoff, wait a bit
-        await this.sleep(100);
-        continue;
-      }
-
-      // Process one at a time (can be parallelized for performance)
-      const [key, request] = readyEntries[0];
-      this.workQueue.delete(key);
-
-      await this.processRequest(key, request);
-    }
-    
-    this.isRunning = false;
-  }
-
-  private async processRequest(
-    key: string,
-    request: ReconcileRequest
-  ): Promise<void> {
-    try {
-      const result = await this.reconcile(request);
-      
-      if (result.success) {
-        // Clear retry state on success
-        this.retryMap.delete(key);
-        
-        if (result.requeue) {
-          setTimeout(
-            () => this.enqueue(request),
-            result.requeueAfterMs ?? 10000
-          );
-        }
-      } else if (result.requeue) {
-        this.handleRetry(key, request, result.requeueAfterMs);
-      }
-    } catch (err: any) {
-      const isRetryable = (err as ReconcileError).retryable !== false;
-      
-      if (isRetryable) {
-        this.handleRetry(key, request, (err as ReconcileError).suggestedDelayMs);
-      } else {
-        console.error(`[Controller] Non-retryable error for ${key}:`, err.message);
-        this.retryMap.delete(key);
-      }
-    }
-  }
-
-  private handleRetry(
-    key: string,
-    request: ReconcileRequest,
-    suggestedDelayMs?: number
-  ): void {
-    const existing = this.retryMap.get(key) ?? { count: 0, nextRetryMs: 0 };
-    
-    if (existing.count >= this.maxRetries) {
-      console.error(`[Controller] Max retries (${this.maxRetries}) exceeded for ${key}`);
-      this.retryMap.delete(key);
-      return;
-    }
-
-    // Exponential backoff: delay = base * 2^count + jitter
-    const exponentialDelay = Math.min(
-      this.baseDelayMs * Math.pow(2, existing.count),
-      this.maxDelayMs
-    );
-    
-    // Add ±20% jitter to prevent thundering herd
-    const jitter = exponentialDelay * 0.2 * (Math.random() - 0.5) * 2;
-    const delayMs = suggestedDelayMs ?? Math.round(exponentialDelay + jitter);
-
-    const newRetry = {
-      count: existing.count + 1,
-      nextRetryMs: Date.now() + delayMs,
-    };
-    
-    this.retryMap.set(key, newRetry);
-    this.workQueue.set(key, request);
-    
-    console.log(
-      `[Controller] Retry ${newRetry.count}/${this.maxRetries} for ${key} ` +
-      `in ${(delayMs / 1000).toFixed(1)}s`
-    );
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
-
-// Concrete Controller implementation
-class MicroserviceReconcileController extends BaseController<any> {
-  protected async reconcile(request: ReconcileRequest): Promise<ReconcileResult> {
-    console.log(`[MicroserviceController] Reconciling ${request.namespace}/${request.name}`);
-    
-    // ตัวอย่าง reconcile logic
-    // ในความเป็นจริงจะ interact กับ Kubernetes API
-    await this.doReconcile(request.name, request.namespace);
-    
-    return { action: 'update', success: true, requeue: false };
-  }
-
-  private async doReconcile(name: string, namespace: string): Promise<void> {
-    // Implement actual reconcile logic here
-    console.log(`  Processing ${namespace}/${name}`);
-  }
-}
-
-export { BaseController, MicroserviceReconcileController };
-```
-
----
-
-## 80.4 Admission Webhook: TypeScript ValidatingWebhookServer
-
-```typescript
-// validating-webhook-server.ts
-import * as https from 'https';
-import * as fs from 'fs';
-import * as express from 'express';
+import express, { Request, Response } from 'express';
+import https from 'https';
+import fs from 'fs';
 
 interface AdmissionRequest {
-  apiVersion: string;
-  kind: string;
-  request: {
-    uid: string;
-    kind: { group: string; version: string; kind: string };
-    resource: { group: string; version: string; resource: string };
-    name: string;
-    namespace: string;
-    operation: 'CREATE' | 'UPDATE' | 'DELETE' | 'CONNECT';
-    object: any;
-    oldObject?: any;
-    dryRun: boolean;
-    userInfo: {
-      username: string;
-      uid?: string;
-      groups?: string[];
-    };
-  };
+  uid: string;
+  kind: { group: string; version: string; kind: string };
+  resource: { group: string; version: string; resource: string };
+  operation: 'CREATE' | 'UPDATE' | 'DELETE' | 'CONNECT';
+  object: Record<string, unknown>;
+  oldObject?: Record<string, unknown>;
+  options?: Record<string, unknown>;
 }
 
 interface AdmissionResponse {
-  apiVersion: string;
-  kind: string;
-  response: {
-    uid: string;
-    allowed: boolean;
-    status?: {
-      code: number;
-      message: string;
-    };
-    warnings?: string[];
+  uid: string;
+  allowed: boolean;
+  status?: {
+    code: number;
+    message: string;
   };
+  warnings?: string[];
+  patch?: string;
+  patchType?: 'JSONPatch';
 }
 
-type ValidationResult = {
-  allowed: true;
-  warnings?: string[];
-} | {
-  allowed: false;
-  code: number;
-  message: string;
-};
-
-class ValidatingWebhookServer {
+class AdmissionWebhookServer {
   private app: express.Application;
-  private validators: Map<string, (req: AdmissionRequest['request']) => Promise<ValidationResult>>;
 
   constructor() {
     this.app = express();
-    this.validators = new Map();
-    this.setupMiddleware();
+    this.app.use(express.json());
     this.setupRoutes();
   }
 
-  private setupMiddleware(): void {
-    this.app.use(express.json());
-    this.app.use((req, res, next) => {
-      console.log(`${req.method} ${req.path} from ${req.ip}`);
-      next();
-    });
-  }
-
   private setupRoutes(): void {
-    this.app.post('/validate/:resource', async (req, res) => {
-      const resource = req.params.resource;
-      const admissionReview = req.body as AdmissionRequest;
-
-      const validator = this.validators.get(resource);
-      
-      if (!validator) {
-        return res.json(this.buildResponse(admissionReview.request.uid, {
-          allowed: false,
-          code: 400,
-          message: `No validator registered for resource: ${resource}`,
-        }));
-      }
-
-      try {
-        const result = await validator(admissionReview.request);
-        return res.json(this.buildResponse(admissionReview.request.uid, result));
-      } catch (err: any) {
-        console.error(`Validation error for ${resource}:`, err.message);
-        return res.json(this.buildResponse(admissionReview.request.uid, {
-          allowed: false,
-          code: 500,
-          message: `Internal webhook error: ${err.message}`,
-        }));
-      }
-    });
-
-    this.app.get('/healthz', (req, res) => {
-      res.json({ status: 'ok', time: new Date().toISOString() });
-    });
+    this.app.post('/validate/pods', this.validatePod.bind(this));
+    this.app.post('/validate/deployments', this.validateDeployment.bind(this));
+    this.app.post('/mutate/pods', this.mutatePod.bind(this));
   }
 
-  registerValidator(
-    resource: string,
-    validator: (req: AdmissionRequest['request']) => Promise<ValidationResult>
-  ): void {
-    this.validators.set(resource, validator);
-    console.log(`Registered validator for resource: ${resource}`);
-  }
+  // Validate Pod: ตรวจสอบ security requirements
+  private validatePod(req: Request, res: Response): void {
+    const admissionRequest = req.body.request as AdmissionRequest;
+    const pod = admissionRequest.object as any;
+    
+    const warnings: string[] = [];
+    const errors: string[] = [];
 
-  private buildResponse(uid: string, result: ValidationResult): AdmissionResponse {
-    const response: AdmissionResponse = {
-      apiVersion: 'admission.k8s.io/v1',
-      kind: 'AdmissionReview',
-      response: {
-        uid,
-        allowed: result.allowed,
-      },
-    };
+    // Check 1: ต้อง run as non-root
+    for (const container of pod.spec?.containers || []) {
+      if (!container.securityContext?.runAsNonRoot) {
+        warnings.push(`Container ${container.name} should run as non-root`);
+      }
 
-    if (!result.allowed) {
-      response.response.status = {
-        code: result.code,
-        message: result.message,
-      };
-    } else if (result.warnings) {
-      response.response.warnings = result.warnings;
+      // Check 2: ต้องมี resource limits
+      if (!container.resources?.limits?.memory) {
+        errors.push(`Container ${container.name} must have memory limits`);
+      }
+
+      if (!container.resources?.limits?.cpu) {
+        errors.push(`Container ${container.name} must have CPU limits`);
+      }
+
+      // Check 3: Image must have specific tag
+      if (container.image?.endsWith(':latest')) {
+        errors.push(`Container ${container.name} must not use 'latest' tag`);
+      }
+
+      // Check 4: Privileged containers not allowed
+      if (container.securityContext?.privileged) {
+        errors.push(`Container ${container.name} cannot run as privileged`);
+      }
     }
 
-    return response;
-  }
-
-  start(port: number, certFile: string, keyFile: string): void {
-    const serverOptions: https.ServerOptions = {
-      cert: fs.readFileSync(certFile),
-      key: fs.readFileSync(keyFile),
+    const response: AdmissionResponse = {
+      uid: admissionRequest.uid,
+      allowed: errors.length === 0,
+      warnings: warnings.length > 0 ? warnings : undefined,
     };
 
-    const server = https.createServer(serverOptions, this.app);
-    
+    if (errors.length > 0) {
+      response.status = {
+        code: 400,
+        message: `Validation failed: ${errors.join('; ')}`,
+      };
+    }
+
+    res.json({ response });
+  }
+
+  // Validate Deployment
+  private validateDeployment(req: Request, res: Response): void {
+    const admissionRequest = req.body.request as AdmissionRequest;
+    const deployment = admissionRequest.object as any;
+
+    const errors: string[] = [];
+
+    // Check replicas
+    if (deployment.spec?.replicas === 1) {
+      errors.push('Production deployments must have at least 2 replicas');
+    }
+
+    // Check rolling update strategy
+    if (deployment.spec?.strategy?.type !== 'RollingUpdate') {
+      errors.push('Deployments must use RollingUpdate strategy');
+    }
+
+    // Check required labels
+    const requiredLabels = ['app', 'version', 'team'];
+    for (const label of requiredLabels) {
+      if (!deployment.metadata?.labels?.[label]) {
+        errors.push(`Deployment must have label: ${label}`);
+      }
+    }
+
+    res.json({
+      response: {
+        uid: admissionRequest.uid,
+        allowed: errors.length === 0,
+        status: errors.length > 0
+          ? { code: 400, message: errors.join('; ') }
+          : undefined,
+      },
+    });
+  }
+
+  // Mutate Pod: inject sidecar, labels, etc.
+  private mutatePod(req: Request, res: Response): void {
+    const admissionRequest = req.body.request as AdmissionRequest;
+    const pod = admissionRequest.object as any;
+
+    const patches: Array<{ op: string; path: string; value: unknown }> = [];
+
+    // Add default labels
+    if (!pod.metadata?.labels?.['app.kubernetes.io/managed-by']) {
+      patches.push({
+        op: 'add',
+        path: '/metadata/labels/app.kubernetes.io~1managed-by',
+        value: 'company-operator',
+      });
+    }
+
+    // Inject log level env var if not present
+    for (let i = 0; i < (pod.spec?.containers?.length || 0); i++) {
+      const container = pod.spec.containers[i];
+      const hasLogLevel = container.env?.some((e: any) => e.name === 'LOG_LEVEL');
+      
+      if (!hasLogLevel) {
+        patches.push({
+          op: 'add',
+          path: `/spec/containers/${i}/env`,
+          value: [...(container.env || []), { name: 'LOG_LEVEL', value: 'info' }],
+        });
+      }
+    }
+
+    const patchStr = patches.length > 0
+      ? Buffer.from(JSON.stringify(patches)).toString('base64')
+      : undefined;
+
+    res.json({
+      response: {
+        uid: admissionRequest.uid,
+        allowed: true,
+        patch: patchStr,
+        patchType: patchStr ? 'JSONPatch' : undefined,
+      },
+    });
+  }
+
+  start(port: number): void {
+    const server = https.createServer(
+      {
+        key: fs.readFileSync('/certs/tls.key'),
+        cert: fs.readFileSync('/certs/tls.crt'),
+      },
+      this.app
+    );
+
     server.listen(port, () => {
-      console.log(`Validating webhook server listening on port ${port}`);
+      console.log(`Admission webhook listening on port ${port}`);
     });
   }
 }
-
-// MicroserviceDeployment Validator
-async function microserviceDeploymentValidator(
-  req: AdmissionRequest['request']
-): Promise<ValidationResult> {
-  const msd = req.object;
-  const warnings: string[] = [];
-
-  // Validate image is not using 'latest' tag
-  if (msd.spec?.image?.endsWith(':latest')) {
-    return {
-      allowed: false,
-      code: 400,
-      message: 'Image tag "latest" is not allowed in production. Please use a specific version tag.',
-    };
-  }
-
-  // Validate resource limits are set
-  if (!msd.spec?.resources?.cpu?.limit || !msd.spec?.resources?.memory?.limit) {
-    return {
-      allowed: false,
-      code: 400,
-      message: 'Resource limits (CPU and memory) are required for all deployments.',
-    };
-  }
-
-  // Validate max replicas doesn't exceed cluster policy
-  const maxAllowedReplicas = 50;
-  if (msd.spec?.replicas?.max > maxAllowedReplicas) {
-    return {
-      allowed: false,
-      code: 400,
-      message: `Maximum replicas (${msd.spec.replicas.max}) exceeds cluster limit (${maxAllowedReplicas}).`,
-    };
-  }
-
-  // Warning: no ingress but in production namespace
-  if (!msd.spec?.ingress?.enabled && req.namespace === 'production') {
-    warnings.push('Ingress is not enabled. Service will only be accessible within the cluster.');
-  }
-
-  // Warning: no monitoring
-  if (!msd.spec?.monitoring?.enabled) {
-    warnings.push('Monitoring is not enabled. Consider enabling Prometheus metrics scraping.');
-  }
-
-  return { allowed: true, warnings: warnings.length > 0 ? warnings : undefined };
-}
-
-// Server setup
-const webhookServer = new ValidatingWebhookServer();
-webhookServer.registerValidator('microservicedeployments', microserviceDeploymentValidator);
-webhookServer.start(
-  8443,
-  process.env.TLS_CERT_FILE ?? '/tls/tls.crt',
-  process.env.TLS_KEY_FILE ?? '/tls/tls.key'
-);
 ```
-
-### ValidatingWebhookConfiguration YAML
 
 ```yaml
 # validating-webhook-config.yaml
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  name: microservice-deployment-validator
+  name: company-validating-webhook
   annotations:
-    cert-manager.io/inject-ca-from: "platform-system/webhook-server-cert"
-webhooks:
-  - name: validate.microservicedeployments.platform.example.com
-    admissionReviewVersions: ["v1"]
-    clientConfig:
-      service:
-        name: microservice-webhook-server
-        namespace: platform-system
-        path: /validate/microservicedeployments
-        port: 443
-    rules:
-      - apiGroups: ["platform.example.com"]
-        apiVersions: ["v1"]
-        resources: ["microservicedeployments"]
-        operations:
-          - CREATE
-          - UPDATE
-        scope: Namespaced
-    namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values:
-            - kube-system
-            - kube-public
-            - platform-system
-    failurePolicy: Fail
-    sideEffects: None
-    timeoutSeconds: 10
-```
-
+    cert-manager.io/inject-ca-from: company-system/webhook-cert
+spec:
+  webhooks:
+    - name: validate-pods.company.io
+      admissionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          name: admission-webhook
+          namespace: company-system
+          path: /validate/pods
+          port: 443
+      rules:
+        - apiGroups: [""]
+          apiVersions: ["v1"]
+          operations: ["CREATE", "UPDATE"]
+          resources: ["pods"]
+          scope: Namespaced
+      namespaceSelector:
+        matchLabels:
+          admission.company.io/enabled: "true"
+      failurePolicy: Fail
+      sideEffects: None
+      timeoutSeconds: 5
+    
+    - name: validate-deployments.company.io
+      admissionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          name: admission-webhook
+          namespace: company-system
+          path: /validate/deployments
+          port: 443
+      rules:
+        - apiGroups: ["apps"]
+          apiVersions: ["v1"]
+          operations: ["CREATE", "UPDATE"]
+          resources: ["deployments"]
+          scope: Namespaced
+      namespaceSelector:
+        matchLabels:
+          env: production
+      failurePolicy: Fail
+      sideEffects: None
 ---
-
-## 80.5 MutatingWebhookConfiguration: Auto-inject Sidecar
-
-```yaml
-# mutating-webhook-config.yaml
+# MutatingWebhookConfiguration
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: sidecar-injector
-  annotations:
-    cert-manager.io/inject-ca-from: "platform-system/webhook-server-cert"
-webhooks:
-  - name: inject-sidecar.platform.example.com
-    admissionReviewVersions: ["v1"]
-    clientConfig:
-      service:
-        name: sidecar-injector
-        namespace: platform-system
-        path: /mutate/pods
-        port: 443
-    rules:
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        resources: ["pods"]
-        operations:
-          - CREATE
-        scope: Namespaced
-    namespaceSelector:
-      matchLabels:
-        sidecar-injection: enabled
-    objectSelector:
-      matchExpressions:
-        - key: sidecar-injector/inject
-          operator: NotIn
-          values: ["false"]
-    failurePolicy: Ignore  # Don't block pod creation if webhook fails
-    sideEffects: None
-    timeoutSeconds: 5
-    reinvocationPolicy: IfNeeded
-```
-
-### TypeScript Mutating Webhook สำหรับ Sidecar Injection
-
-```typescript
-// mutating-webhook-server.ts
-import * as express from 'express';
-import * as https from 'https';
-import * as fs from 'fs';
-
-interface MutatingAdmissionResponse {
-  apiVersion: string;
-  kind: string;
-  response: {
-    uid: string;
-    allowed: boolean;
-    patchType?: 'JSONPatch';
-    patch?: string;
-    status?: { message: string };
-  };
-}
-
-interface JSONPatch {
-  op: 'add' | 'remove' | 'replace' | 'copy' | 'move' | 'test';
-  path: string;
-  value?: any;
-  from?: string;
-}
-
-class MutatingSidecarInjector {
-  private app: express.Application;
-
-  private readonly SIDECAR_CONTAINER = {
-    name: 'monitoring-sidecar',
-    image: 'myregistry/monitoring-sidecar:v1.0.0',
-    ports: [{ containerPort: 9091, name: 'metrics' }],
-    resources: {
-      requests: { cpu: '50m', memory: '64Mi' },
-      limits: { cpu: '200m', memory: '128Mi' },
-    },
-    env: [
-      { name: 'SIDECAR_ENABLED', value: 'true' },
-      { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
-      { name: 'POD_NAMESPACE', valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
-    ],
-    readinessProbe: {
-      httpGet: { path: '/ready', port: 9091 },
-      initialDelaySeconds: 5,
-      periodSeconds: 10,
-    },
-  };
-
-  constructor() {
-    this.app = express();
-    this.app.use(express.json());
-    this.setupRoutes();
-  }
-
-  private setupRoutes(): void {
-    this.app.post('/mutate/pods', async (req, res) => {
-      const admissionReview = req.body;
-      const pod = admissionReview.request?.object;
-      const uid = admissionReview.request?.uid;
-
-      // ตรวจสอบว่า sidecar ถูก inject แล้วหรือยัง
-      const alreadyInjected = pod?.metadata?.annotations?.['sidecar-injected'] === 'true';
-      const skipInjection = pod?.metadata?.annotations?.['sidecar-injector/inject'] === 'false';
-
-      if (alreadyInjected || skipInjection) {
-        return res.json(this.allowWithoutPatch(uid));
-      }
-
-      const patches = this.buildPatches(pod);
-      return res.json(this.buildMutatingResponse(uid, patches));
-    });
-
-    this.app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
-  }
-
-  private buildPatches(pod: any): JSONPatch[] {
-    const patches: JSONPatch[] = [];
-    const containers = pod.spec?.containers ?? [];
-
-    // Add sidecar container
-    patches.push({
-      op: 'add',
-      path: '/spec/containers/-',
-      value: this.SIDECAR_CONTAINER,
-    });
-
-    // Add volume for shared metrics data
-    const volumes = pod.spec?.volumes ?? [];
-    if (volumes.length === 0) {
-      patches.push({ op: 'add', path: '/spec/volumes', value: [] });
-    }
-    patches.push({
-      op: 'add',
-      path: '/spec/volumes/-',
-      value: {
-        name: 'monitoring-data',
-        emptyDir: { medium: 'Memory', sizeLimit: '10Mi' },
-      },
-    });
-
-    // Add annotation to mark as injected
-    const annotations = pod.metadata?.annotations ?? {};
-    if (Object.keys(annotations).length === 0) {
-      patches.push({ op: 'add', path: '/metadata/annotations', value: {} });
-    }
-    patches.push({
-      op: 'add',
-      path: '/metadata/annotations/sidecar-injected',
-      value: 'true',
-    });
-    patches.push({
-      op: 'add',
-      path: '/metadata/annotations/sidecar-injected-at',
-      value: new Date().toISOString(),
-    });
-
-    return patches;
-  }
-
-  private buildMutatingResponse(uid: string, patches: JSONPatch[]): MutatingAdmissionResponse {
-    const patchBytes = Buffer.from(JSON.stringify(patches)).toString('base64');
-    
-    return {
-      apiVersion: 'admission.k8s.io/v1',
-      kind: 'AdmissionReview',
-      response: {
-        uid,
-        allowed: true,
-        patchType: 'JSONPatch',
-        patch: patchBytes,
-      },
-    };
-  }
-
-  private allowWithoutPatch(uid: string): MutatingAdmissionResponse {
-    return {
-      apiVersion: 'admission.k8s.io/v1',
-      kind: 'AdmissionReview',
-      response: { uid, allowed: true },
-    };
-  }
-
-  start(port: number, certFile: string, keyFile: string): void {
-    const server = https.createServer(
-      { cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) },
-      this.app
-    );
-    
-    server.listen(port, () => {
-      console.log(`Mutating webhook server listening on port ${port}`);
-    });
-  }
-}
-
-const injector = new MutatingSidecarInjector();
-injector.start(
-  8443,
-  process.env.TLS_CERT_FILE ?? '/tls/tls.crt',
-  process.env.TLS_KEY_FILE ?? '/tls/tls.key'
-);
+  name: company-mutating-webhook
+spec:
+  webhooks:
+    - name: mutate-pods.company.io
+      admissionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          name: admission-webhook
+          namespace: company-system
+          path: /mutate/pods
+          port: 443
+      rules:
+        - apiGroups: [""]
+          apiVersions: ["v1"]
+          operations: ["CREATE"]
+          resources: ["pods"]
+      failurePolicy: Ignore  # ไม่บล็อกถ้า webhook ล้มเหลว
+      sideEffects: None
+      reinvocationPolicy: Never
 ```
 
 ---
 
-## 80.6 Multi-tenancy: Namespace per Tenant, ResourceQuota, NetworkPolicy
+## 8. Multi-tenancy with Namespaces and RBAC
 
 ```yaml
-# tenant-namespace.yaml
-# สำหรับ tenant แต่ละ tenant จะมี namespace ของตัวเอง
+# multi-tenancy.yaml
+# Multi-tenancy setup สำหรับ Kubernetes
+
+# Tenant A namespace
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: tenant-acme
+  name: tenant-a
   labels:
-    tenant: acme
-    tenant-tier: premium
-    environment: production
-  annotations:
-    tenant/owner: "admin@acme.com"
-    tenant/cost-center: "CC-001"
-    tenant/created-at: "2024-01-01"
+    tenant: a
+    env: production
+    admission.company.io/enabled: "true"
 ---
-# ResourceQuota จำกัด resource ต่อ tenant
+# Resource Quota per tenant
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: tenant-acme-quota
-  namespace: tenant-acme
+  name: tenant-a-quota
+  namespace: tenant-a
 spec:
   hard:
-    # Compute
-    requests.cpu: "20"
-    limits.cpu: "40"
-    requests.memory: "40Gi"
-    limits.memory: "80Gi"
-    
-    # Storage
-    requests.storage: "500Gi"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    services: "10"
     persistentvolumeclaims: "20"
-    
-    # Objects
-    pods: "100"
-    services: "20"
-    secrets: "50"
-    configmaps: "50"
-    deployments.apps: "20"
-    statefulsets.apps: "10"
-    
-    # Load balancers (cost control)
-    services.loadbalancers: "2"
-    services.nodeports: "0"
+    count/deployments.apps: "20"
+    count/secrets: "50"
+    count/configmaps: "50"
 ---
-# LimitRange default limits
+# LimitRange สำหรับ default values
 apiVersion: v1
 kind: LimitRange
 metadata:
-  name: tenant-acme-limits
-  namespace: tenant-acme
+  name: tenant-a-limits
+  namespace: tenant-a
 spec:
   limits:
     - type: Container
-      default:          # ค่า default limit ถ้าไม่ระบุ
-        cpu: "500m"
-        memory: "512Mi"
-      defaultRequest:   # ค่า default request ถ้าไม่ระบุ
-        cpu: "100m"
-        memory: "128Mi"
-      max:              # ค่าสูงสุดที่อนุญาต
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
         cpu: "4"
-        memory: "8Gi"
-      min:              # ค่าต่ำสุด
-        cpu: "50m"
-        memory: "64Mi"
+        memory: 4Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+    
+    - type: Pod
+      max:
+        cpu: "8"
+        memory: 8Gi
+    
     - type: PersistentVolumeClaim
       max:
-        storage: "50Gi"
+        storage: 50Gi
       min:
-        storage: "1Gi"
+        storage: 1Gi
 ---
-# NetworkPolicy ป้องกัน cross-tenant communication
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: tenant-isolation
-  namespace: tenant-acme
-spec:
-  podSelector: {}  # Apply to all pods in namespace
-  policyTypes:
-    - Ingress
-    - Egress
-  ingress:
-    # Allow traffic only from same tenant namespace
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              tenant: acme
-    # Allow from ingress controller
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ingress-nginx
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ingress-nginx
-    # Allow from monitoring
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: monitoring
-      ports:
-        - protocol: TCP
-          port: 9090   # Prometheus metrics
-  egress:
-    # Allow traffic to same namespace
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              tenant: acme
-    # Allow DNS
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    # Allow external HTTPS
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-      ports:
-        - protocol: TCP
-          port: 443
----
-# RBAC สำหรับ tenant admin
+# Tenant admin Role
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: tenant-admin
-  namespace: tenant-acme
+  namespace: tenant-a
 rules:
   - apiGroups: [""]
-    resources: ["pods", "services", "configmaps", "secrets"]
+    resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets", "replicasets"]
+    resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["resourcequotas", "limitranges"]
-    verbs: ["get", "list", "watch"]
+  # Cannot manage RBAC (prevent privilege escalation)
+  # Cannot access other namespaces
 ---
+# Tenant developer Role (read + limited write)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tenant-developer
+  namespace: tenant-a
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/exec"]
+    verbs: ["get", "create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+# Bind roles to users/groups
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: tenant-acme-admin-binding
-  namespace: tenant-acme
+  name: tenant-a-admins
+  namespace: tenant-a
 subjects:
-  - kind: User
-    name: admin@acme.com
+  - kind: Group
+    name: tenant-a-admins
     apiGroup: rbac.authorization.k8s.io
   - kind: ServiceAccount
-    name: tenant-acme-sa
-    namespace: tenant-acme
+    name: tenant-a-ci-sa
+    namespace: tenant-a
 roleRef:
   kind: Role
-  name: tenant-admin
   apiGroup: rbac.authorization.k8s.io
+  name: tenant-admin
 ```
 
 ---
 
-## 80.7 GitOps กับ ArgoCD
-
-### Application YAML
+## 9. GitOps with ArgoCD
 
 ```yaml
 # argocd-application.yaml
+# ArgoCD Application สำหรับ GitOps workflow
+
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: order-service
   namespace: argocd
-  labels:
-    team: platform
-    environment: production
   finalizers:
     - resources-finalizer.argocd.argoproj.io
+  labels:
+    app: order-service
+    team: order-team
 spec:
-  project: microservices-production
+  project: microservices
   
   source:
-    repoURL: https://github.com/myorg/k8s-manifests.git
+    repoURL: https://github.com/company/microservices-k8s.git
     targetRevision: main
-    path: apps/order-service/production
+    path: services/order-service/production
     
     # Helm chart support
-    # helm:
-    #   valueFiles:
-    #     - values.yaml
-    #     - values-production.yaml
-    #   parameters:
-    #     - name: image.tag
-    #       value: "v1.2.3"
-    
-    # Kustomize support
-    kustomize:
-      images:
-        - myregistry/order-service:v1.2.3
-      nameSuffix: -production
-      commonLabels:
-        environment: production
-
+    helm:
+      valueFiles:
+        - values.production.yaml
+      parameters:
+        - name: image.tag
+          value: "1.2.3"
+        - name: replicaCount
+          value: "3"
+  
   destination:
     server: https://kubernetes.default.svc
     namespace: production
-
+  
   syncPolicy:
     automated:
-      prune: true           # ลบ resources ที่ไม่อยู่ใน Git
-      selfHeal: true        # Auto-heal drift
-      allowEmpty: false     # ไม่อนุญาต empty commit
+      prune: true    # ลบ resources ที่ไม่อยู่ใน Git
+      selfHeal: true # auto-fix drift
+      allowEmpty: false
+    
     syncOptions:
       - Validate=true
       - CreateNamespace=true
       - PrunePropagationPolicy=foreground
       - PruneLast=true
-      - ApplyOutOfSyncOnly=true  # Apply only changed resources
-      - RespectIgnoreDifferences=true
+      - ApplyOutOfSyncOnly=true
+    
     retry:
       limit: 5
       backoff:
         duration: 5s
         factor: 2
         maxDuration: 3m
-
+  
+  revisionHistoryLimit: 10
+  
   ignoreDifferences:
     - group: apps
       kind: Deployment
       jsonPointers:
-        - /spec/replicas    # ไม่สนใจ replicas (managed by HPA)
-    - group: ""
-      kind: Service
-      jsonPointers:
-        - /spec/clusterIP   # IP assigned by Kubernetes
-    - group: autoscaling
-      kind: HorizontalPodAutoscaler
-      jsonPointers:
-        - /spec/metrics    # May be modified by KEDA
-
-  revisionHistoryLimit: 10
-
-  info:
-    - name: slack-channel
-      value: "#deployments"
-    - name: team
-      value: "Platform Team"
+        - /spec/replicas  # ignore HPA-managed replicas
 ---
-# AppProject สำหรับ organization-level governance
+# ArgoCD AppProject สำหรับ multi-team
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
-  name: microservices-production
+  name: microservices
   namespace: argocd
 spec:
-  description: "Production microservices project"
+  description: Microservices project
   
-  # Source repositories ที่อนุญาต
   sourceRepos:
-    - "https://github.com/myorg/k8s-manifests.git"
-    - "https://charts.mycompany.com/*"
+    - 'https://github.com/company/*'
+    - 'https://charts.company.com/*'
   
-  # Destination clusters/namespaces ที่อนุญาต
   destinations:
-    - server: https://kubernetes.default.svc
-      namespace: "production"
-    - server: https://kubernetes.default.svc
-      namespace: "staging"
+    - namespace: production
+      server: https://kubernetes.default.svc
+    - namespace: staging
+      server: https://kubernetes.default.svc
   
-  # Cluster resources ที่อนุญาต (cluster-scoped)
   clusterResourceWhitelist:
-    - group: ""
+    - group: ''
       kind: Namespace
-    - group: rbac.authorization.k8s.io
-      kind: ClusterRole
-    - group: rbac.authorization.k8s.io
-      kind: ClusterRoleBinding
   
-  # Namespace resources ที่อนุญาต
-  namespaceResourceWhitelist:
-    - group: "*"
-      kind: "*"
-  
-  # ห้ามใช้ resources เหล่านี้
   namespaceResourceBlacklist:
-    - group: ""
-      kind: ResourceQuota
-    - group: ""
+    - group: ''
       kind: LimitRange
+    - group: ''
+      kind: ResourceQuota
   
-  # Sync windows - control when syncs are allowed
-  syncWindows:
-    - kind: allow
-      schedule: "0 8-18 * * 1-5"   # Allow weekdays 8am-6pm
-      duration: 10h
-      applications:
-        - "*"
-      manualSync: true
-    - kind: deny
-      schedule: "0 0 * * 5"         # Deny Friday midnight
-      duration: 24h
-      applications:
-        - "*"
-  
-  # Roles within project
   roles:
     - name: developer
-      description: "Allow read access and manual sync"
+      description: Developer role
       policies:
-        - p, proj:microservices-production:developer, applications, get, microservices-production/*, allow
-        - p, proj:microservices-production:developer, applications, sync, microservices-production/*, allow
+        - p, proj:microservices:developer, applications, get, microservices/*, allow
+        - p, proj:microservices:developer, applications, sync, microservices/*, allow
       groups:
-        - "developers"
-    - name: platform-admin
-      description: "Full access"
+        - company:developers
+    
+    - name: ops
+      description: Operations role
       policies:
-        - p, proj:microservices-production:platform-admin, applications, *, microservices-production/*, allow
+        - p, proj:microservices:ops, applications, *, microservices/*, allow
       groups:
-        - "platform-team"
+        - company:ops
+---
+# ApplicationSet สำหรับ multi-environment deployment
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: order-service-environments
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - env: staging
+            namespace: staging
+            values_file: values.staging.yaml
+            cluster: staging-cluster
+          - env: production
+            namespace: production
+            values_file: values.production.yaml
+            cluster: production-cluster
   
-  # Orphaned resources
-  orphanedResources:
-    warn: true
-    ignore:
-      - group: apps
-        kind: ReplicaSet
-```
-
----
-
-## 80.8 Namespace Lifecycle Management TypeScript Script
-
-```typescript
-// namespace-lifecycle.ts
-import * as k8s from '@kubernetes/client-node';
-import * as yaml from 'js-yaml';
-
-interface NamespaceConfig {
-  name: string;
-  tenant: string;
-  tier: 'free' | 'standard' | 'premium';
-  environment: 'development' | 'staging' | 'production';
-  owner: string;
-  costCenter: string;
-  labels?: Record<string, string>;
-  annotations?: Record<string, string>;
-}
-
-const TIER_QUOTAS = {
-  free: {
-    'requests.cpu': '2',
-    'limits.cpu': '4',
-    'requests.memory': '4Gi',
-    'limits.memory': '8Gi',
-    'pods': '20',
-    'services': '5',
-  },
-  standard: {
-    'requests.cpu': '10',
-    'limits.cpu': '20',
-    'requests.memory': '20Gi',
-    'limits.memory': '40Gi',
-    'pods': '50',
-    'services': '15',
-  },
-  premium: {
-    'requests.cpu': '20',
-    'limits.cpu': '40',
-    'requests.memory': '40Gi',
-    'limits.memory': '80Gi',
-    'pods': '100',
-    'services': '30',
-  },
-};
-
-class NamespaceLifecycleManager {
-  private kc: k8s.KubeConfig;
-  private coreApi: k8s.CoreV1Api;
-  private rbacApi: k8s.RbacAuthorizationV1Api;
-  private networkingApi: k8s.NetworkingV1Api;
-
-  constructor() {
-    this.kc = new k8s.KubeConfig();
-    this.kc.loadFromDefault();
-    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
-    this.rbacApi = this.kc.makeApiClient(k8s.RbacAuthorizationV1Api);
-    this.networkingApi = this.kc.makeApiClient(k8s.NetworkingV1Api);
-  }
-
-  async provisionTenantNamespace(config: NamespaceConfig): Promise<void> {
-    console.log(`Provisioning namespace: ${config.name}`);
-
-    // 1. Create namespace
-    await this.createNamespace(config);
-    
-    // 2. Apply ResourceQuota
-    await this.applyResourceQuota(config);
-    
-    // 3. Apply LimitRange
-    await this.applyLimitRange(config);
-    
-    // 4. Apply NetworkPolicy
-    await this.applyNetworkPolicy(config);
-    
-    // 5. Create ServiceAccount
-    await this.createServiceAccount(config);
-    
-    // 6. Setup RBAC
-    await this.setupRBAC(config);
-    
-    console.log(`Namespace ${config.name} provisioned successfully`);
-  }
-
-  private async createNamespace(config: NamespaceConfig): Promise<void> {
-    const namespace: k8s.V1Namespace = {
-      metadata: {
-        name: config.name,
-        labels: {
-          tenant: config.tenant,
-          'tenant-tier': config.tier,
-          environment: config.environment,
-          'managed-by': 'namespace-lifecycle-manager',
-          ...config.labels,
-        },
-        annotations: {
-          'tenant/owner': config.owner,
-          'tenant/cost-center': config.costCenter,
-          'tenant/created-at': new Date().toISOString(),
-          'tenant/provisioned-by': 'namespace-lifecycle-manager',
-          ...config.annotations,
-        },
-      },
-    };
-
-    try {
-      await this.coreApi.createNamespace(namespace);
-      console.log(`  Created namespace: ${config.name}`);
-    } catch (err: any) {
-      if (err.statusCode === 409) {
-        console.log(`  Namespace ${config.name} already exists, updating...`);
-        await this.coreApi.patchNamespace(
-          config.name,
-          namespace,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          { headers: { 'Content-Type': 'application/merge-patch+json' } }
-        );
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  private async applyResourceQuota(config: NamespaceConfig): Promise<void> {
-    const quota = TIER_QUOTAS[config.tier];
-    
-    const resourceQuota: k8s.V1ResourceQuota = {
-      metadata: {
-        name: 'tenant-quota',
-        namespace: config.name,
-      },
-      spec: {
-        hard: quota as any,
-      },
-    };
-
-    try {
-      await this.coreApi.createNamespacedResourceQuota(config.name, resourceQuota);
-    } catch (err: any) {
-      if (err.statusCode === 409) {
-        await this.coreApi.replaceNamespacedResourceQuota(
-          'tenant-quota',
-          config.name,
-          resourceQuota
-        );
-      } else {
-        throw err;
-      }
-    }
-
-    console.log(`  Applied ResourceQuota for tier: ${config.tier}`);
-  }
-
-  private async applyLimitRange(config: NamespaceConfig): Promise<void> {
-    const limitRange: k8s.V1LimitRange = {
-      metadata: {
-        name: 'default-limits',
-        namespace: config.name,
-      },
-      spec: {
-        limits: [
-          {
-            type: 'Container' as any,
-            default: { cpu: '500m', memory: '512Mi' },
-            defaultRequest: { cpu: '100m', memory: '128Mi' },
-            max: { cpu: '4', memory: '8Gi' },
-            min: { cpu: '50m', memory: '64Mi' },
-          },
-        ],
-      },
-    };
-
-    try {
-      await this.coreApi.createNamespacedLimitRange(config.name, limitRange);
-    } catch (err: any) {
-      if (err.statusCode === 409) {
-        await this.coreApi.replaceNamespacedLimitRange(
-          'default-limits',
-          config.name,
-          limitRange
-        );
-      } else {
-        throw err;
-      }
-    }
-
-    console.log(`  Applied LimitRange`);
-  }
-
-  private async applyNetworkPolicy(config: NamespaceConfig): Promise<void> {
-    const networkPolicy: k8s.V1NetworkPolicy = {
-      metadata: {
-        name: 'tenant-isolation',
-        namespace: config.name,
-      },
-      spec: {
-        podSelector: {},
-        policyTypes: ['Ingress', 'Egress'],
-        ingress: [
-          {
-            from: [
-              { namespaceSelector: { matchLabels: { tenant: config.tenant } } },
-              { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' } } },
-              { namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'monitoring' } } },
-            ],
-          },
-        ],
-        egress: [
-          {
-            to: [{ namespaceSelector: { matchLabels: { tenant: config.tenant } } }],
-          },
-          {
-            to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } }],
-            ports: [{ protocol: 'UDP' as any, port: 53 as any }],
-          },
-        ],
-      },
-    };
-
-    try {
-      await this.networkingApi.createNamespacedNetworkPolicy(config.name, networkPolicy);
-    } catch (err: any) {
-      if (err.statusCode === 409) {
-        await this.networkingApi.replaceNamespacedNetworkPolicy(
-          'tenant-isolation',
-          config.name,
-          networkPolicy
-        );
-      } else {
-        throw err;
-      }
-    }
-
-    console.log(`  Applied NetworkPolicy`);
-  }
-
-  private async createServiceAccount(config: NamespaceConfig): Promise<void> {
-    const sa: k8s.V1ServiceAccount = {
-      metadata: {
-        name: `${config.tenant}-sa`,
-        namespace: config.name,
-      },
-    };
-
-    try {
-      await this.coreApi.createNamespacedServiceAccount(config.name, sa);
-    } catch (err: any) {
-      if (err.statusCode !== 409) throw err;
-    }
-
-    console.log(`  Created ServiceAccount: ${config.tenant}-sa`);
-  }
-
-  private async setupRBAC(config: NamespaceConfig): Promise<void> {
-    // Create Role
-    const role: k8s.V1Role = {
-      metadata: { name: 'tenant-developer', namespace: config.name },
-      rules: [
-        {
-          apiGroups: ['', 'apps', 'autoscaling'],
-          resources: ['pods', 'services', 'deployments', 'configmaps', 'horizontalpodautoscalers'],
-          verbs: ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete'],
-        },
-      ],
-    };
-
-    try {
-      await this.rbacApi.createNamespacedRole(config.name, role);
-    } catch (err: any) {
-      if (err.statusCode !== 409) throw err;
-    }
-
-    console.log(`  Setup RBAC`);
-  }
-
-  async deprovisionNamespace(namespaceName: string, dryRun = false): Promise<void> {
-    console.log(`${dryRun ? '[DRY RUN] ' : ''}Deprovisioning namespace: ${namespaceName}`);
-
-    if (!dryRun) {
-      await this.coreApi.deleteNamespace(namespaceName);
-      console.log(`  Namespace ${namespaceName} deleted`);
-    } else {
-      console.log(`  Would delete namespace: ${namespaceName}`);
-    }
-  }
-
-  async listTenantNamespaces(tenant?: string): Promise<k8s.V1Namespace[]> {
-    const labelSelector = tenant
-      ? `tenant=${tenant}`
-      : 'managed-by=namespace-lifecycle-manager';
-    
-    const result = await this.coreApi.listNamespace(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      labelSelector
-    );
-    
-    return result.body.items;
-  }
-}
-
-// ตัวอย่างการใช้งาน
-async function main() {
-  const manager = new NamespaceLifecycleManager();
-
-  // สร้าง namespace สำหรับ tenant ใหม่
-  await manager.provisionTenantNamespace({
-    name: 'tenant-acme',
-    tenant: 'acme',
-    tier: 'premium',
-    environment: 'production',
-    owner: 'admin@acme.com',
-    costCenter: 'CC-001',
-  });
-
-  // List ทุก tenant namespaces
-  const namespaces = await manager.listTenantNamespaces();
-  console.log('\nTenant namespaces:');
-  namespaces.forEach(ns => {
-    const labels = ns.metadata?.labels ?? {};
-    console.log(`  ${ns.metadata?.name} (tenant: ${labels.tenant}, tier: ${labels['tenant-tier']})`);
-  });
-}
-
-main().catch(console.error);
-```
-
----
-
-## 80.9 Kubernetes API Aggregation: APIService Registration
-
-```yaml
-# api-service-registration.yaml
-apiVersion: apiregistration.k8s.io/v1
-kind: APIService
-metadata:
-  name: v1alpha1.platform.example.com
-  labels:
-    app: platform-api-server
-spec:
-  service:
-    name: platform-api-server
-    namespace: platform-system
-    port: 443
-  group: platform.example.com
-  version: v1alpha1
-  insecureSkipTLSVerify: false
-  caBundle: <base64-encoded-CA-bundle>
-  groupPriorityMinimum: 1000
-  versionPriority: 15
----
-# Platform API Server Deployment
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: platform-api-server
-  namespace: platform-system
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: platform-api-server
   template:
     metadata:
-      labels:
-        app: platform-api-server
+      name: 'order-service-{{env}}'
     spec:
-      serviceAccountName: platform-api-server
-      containers:
-        - name: platform-api-server
-          image: myregistry/platform-api-server:v1.0.0
-          ports:
-            - containerPort: 443
-              name: https
-          args:
-            - --tls-cert-file=/tls/tls.crt
-            - --tls-private-key-file=/tls/tls.key
-            - --audit-log-path=/var/log/audit.log
-            - --audit-log-maxage=30
-            - --v=4
-          volumeMounts:
-            - name: tls
-              mountPath: /tls
-              readOnly: true
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 443
-              scheme: HTTPS
-            initialDelaySeconds: 10
-            periodSeconds: 5
-      volumes:
-        - name: tls
-          secret:
-            secretName: platform-api-server-tls
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: platform-api-server
-  namespace: platform-system
-spec:
-  selector:
-    app: platform-api-server
-  ports:
-    - port: 443
-      targetPort: 443
-  type: ClusterIP
+      project: microservices
+      source:
+        repoURL: https://github.com/company/microservices-k8s.git
+        targetRevision: HEAD
+        path: services/order-service
+        helm:
+          valueFiles:
+            - '{{values_file}}'
+      destination:
+        server: 'https://{{cluster}}.company.com'
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
 ```
-
----
-
-## 80.10 Kubernetes Event-driven Automation: TypeScript EventWatcher
 
 ```typescript
-// event-watcher.ts
-import * as k8s from '@kubernetes/client-node';
+// argocd-integration.ts
+// TypeScript integration กับ ArgoCD API
 
-interface WatchRule {
-  resourceType: string;
-  eventTypes: Array<'ADDED' | 'MODIFIED' | 'DELETED'>;
-  labelSelector?: string;
-  fieldSelector?: string;
-  namespaces?: string[];
-  handler: (event: WatchEvent) => Promise<void>;
-}
-
-interface WatchEvent {
-  type: 'ADDED' | 'MODIFIED' | 'DELETED';
-  object: k8s.KubernetesObject;
-  namespace?: string;
-  name?: string;
-  labels?: Record<string, string>;
-  annotations?: Record<string, string>;
-}
-
-interface AutomationAction {
+interface ArgoCDApp {
   name: string;
-  condition: (event: WatchEvent) => boolean;
-  action: (event: WatchEvent) => Promise<void>;
+  namespace: string;
+  project: string;
+  status: {
+    sync: { status: string };
+    health: { status: string };
+    reconciledAt: string;
+    operationState?: { phase: string };
+  };
 }
 
-class KubernetesEventWatcher {
-  private kc: k8s.KubeConfig;
-  private coreApi: k8s.CoreV1Api;
-  private appsApi: k8s.AppsV1Api;
-  private watchers: k8s.Watch;
-  private activeWatches: Map<string, any>;
-  private rules: WatchRule[];
-  private automations: AutomationAction[];
+class ArgoCDClient {
+  private baseUrl: string;
+  private token: string;
 
-  constructor() {
-    this.kc = new k8s.KubeConfig();
-    this.kc.loadFromDefault();
-    this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
-    this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
-    this.watchers = new k8s.Watch(this.kc);
-    this.activeWatches = new Map();
-    this.rules = [];
-    this.automations = [];
+  constructor(baseUrl: string, token: string) {
+    this.baseUrl = baseUrl;
+    this.token = token;
   }
 
-  addRule(rule: WatchRule): void {
-    this.rules.push(rule);
-  }
-
-  addAutomation(automation: AutomationAction): void {
-    this.automations.push(automation);
-  }
-
-  async watchPods(namespace: string = ''): Promise<void> {
-    const path = namespace
-      ? `/api/v1/namespaces/${namespace}/pods`
-      : '/api/v1/pods';
-
-    const watch = await this.watchers.watch(
-      path,
-      { watch: true },
-      async (type, obj: k8s.V1Pod) => {
-        const event: WatchEvent = {
-          type: type as any,
-          object: obj,
-          namespace: obj.metadata?.namespace,
-          name: obj.metadata?.name,
-          labels: obj.metadata?.labels,
-          annotations: obj.metadata?.annotations,
-        };
-
-        await this.processEvent(event, 'pod');
-      },
-      (err) => {
-        if (err) {
-          console.error('Watch error:', err.message);
-          // Restart watch after delay
-          setTimeout(() => this.watchPods(namespace), 5000);
-        }
+  async syncApplication(appName: string): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/applications/${appName}/sync`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          revision: 'HEAD',
+          prune: false,
+          dryRun: false,
+          force: false,
+          strategy: {
+            hook: { force: false },
+          },
+        }),
       }
     );
 
-    this.activeWatches.set(`pods-${namespace}`, watch);
-    console.log(`Watching pods in ${namespace || 'all namespaces'}`);
-  }
-
-  async watchDeployments(namespace: string = ''): Promise<void> {
-    const path = namespace
-      ? `/apis/apps/v1/namespaces/${namespace}/deployments`
-      : '/apis/apps/v1/deployments';
-
-    const watch = await this.watchers.watch(
-      path,
-      {},
-      async (type, obj: k8s.V1Deployment) => {
-        const event: WatchEvent = {
-          type: type as any,
-          object: obj,
-          namespace: obj.metadata?.namespace,
-          name: obj.metadata?.name,
-          labels: obj.metadata?.labels,
-          annotations: obj.metadata?.annotations,
-        };
-
-        await this.processEvent(event, 'deployment');
-      },
-      (err) => {
-        if (err) {
-          setTimeout(() => this.watchDeployments(namespace), 5000);
-        }
-      }
-    );
-
-    this.activeWatches.set(`deployments-${namespace}`, watch);
-  }
-
-  async watchKubernetesEvents(namespace: string = ''): Promise<void> {
-    const path = namespace
-      ? `/api/v1/namespaces/${namespace}/events`
-      : '/api/v1/events';
-
-    const watch = await this.watchers.watch(
-      path,
-      {},
-      async (type, event: k8s.CoreV1Event) => {
-        if (event.type === 'Warning') {
-          await this.handleWarningEvent(event);
-        }
-      },
-      (err) => {
-        if (err) {
-          setTimeout(() => this.watchKubernetesEvents(namespace), 5000);
-        }
-      }
-    );
-
-    this.activeWatches.set(`events-${namespace}`, watch);
-  }
-
-  private async processEvent(event: WatchEvent, resourceType: string): Promise<void> {
-    // Run all matching automations
-    for (const automation of this.automations) {
-      try {
-        if (automation.condition(event)) {
-          console.log(`[EventWatcher] Triggering automation: ${automation.name}`);
-          await automation.action(event);
-        }
-      } catch (err: any) {
-        console.error(`[EventWatcher] Automation ${automation.name} failed:`, err.message);
-      }
+    if (!response.ok) {
+      throw new Error(`Sync failed: ${await response.text()}`);
     }
+
+    console.log(`Sync triggered for ${appName}`);
   }
 
-  private async handleWarningEvent(event: k8s.CoreV1Event): Promise<void> {
-    const reason = event.reason ?? '';
-    const message = event.message ?? '';
-    const name = event.involvedObject.name;
-    const namespace = event.involvedObject.namespace;
+  async waitForSync(appName: string, timeout: number = 300000): Promise<void> {
+    const start = Date.now();
 
-    console.log(`[Warning] ${namespace}/${name}: ${reason} - ${message}`);
+    while (Date.now() - start < timeout) {
+      const app = await this.getApplication(appName);
 
-    // Auto-remediation actions
-    if (reason === 'OOMKilled') {
-      await this.handleOOMKilled(namespace!, name!, event);
-    } else if (reason === 'BackOff') {
-      await this.handleCrashLoopBackOff(namespace!, name!, event);
-    } else if (reason === 'FailedScheduling') {
-      await this.handleFailedScheduling(namespace!, name!, event);
+      if (
+        app.status.sync.status === 'Synced' &&
+        app.status.health.status === 'Healthy'
+      ) {
+        console.log(`${appName} is synced and healthy`);
+        return;
+      }
+
+      if (app.status.operationState?.phase === 'Failed') {
+        throw new Error(`Sync failed for ${appName}`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 5000));
     }
+
+    throw new Error(`Timeout waiting for ${appName} to sync`);
   }
 
-  private async handleOOMKilled(
-    namespace: string,
-    podName: string,
-    event: k8s.CoreV1Event
+  async getApplication(name: string): Promise<ArgoCDApp> {
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/applications/${name}`,
+      {
+        headers: { Authorization: `Bearer ${this.token}` },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to get app: ${name}`);
+    }
+
+    return response.json() as Promise<ArgoCDApp>;
+  }
+
+  async createImageUpdaterAnnotation(
+    appName: string,
+    image: string,
+    newTag: string
   ): Promise<void> {
-    console.log(`[AutoRemediation] OOMKilled detected for ${namespace}/${podName}`);
-    
-    // ดึง deployment ที่เกี่ยวข้อง
-    const pod = await this.coreApi.readNamespacedPod(podName, namespace);
-    const deploymentName = pod.body.metadata?.ownerReferences?.find(
-      o => o.kind === 'ReplicaSet'
-    )?.name;
-    
-    if (!deploymentName) return;
-
-    // เพิ่ม memory limit อัตโนมัติ 20%
-    const deployment = await this.appsApi.readNamespacedDeployment(
-      deploymentName.replace(/-\w+$/, ''),  // Remove ReplicaSet suffix
-      namespace
-    );
-
-    const containers = deployment.body.spec?.template?.spec?.containers ?? [];
-    
-    for (const container of containers) {
-      const currentLimit = container.resources?.limits?.memory ?? '512Mi';
-      const newLimit = this.increaseMemory(currentLimit, 1.2);
-      
-      console.log(`  Increasing memory limit for ${container.name}: ${currentLimit} -> ${newLimit}`);
-      
-      // Patch deployment
-      if (container.resources?.limits) {
-        container.resources.limits.memory = newLimit;
+    // Patch application with new image tag annotation
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/applications/${appName}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          'Content-Type': 'application/merge-patch+json',
+        },
+        body: JSON.stringify({
+          metadata: {
+            annotations: {
+              'argocd-image-updater.argoproj.io/image-list': `${image}:${newTag}`,
+            },
+          },
+        }),
       }
-    }
-
-    // Send notification (webhook/Slack)
-    await this.sendNotification(
-      `OOMKilled: Increased memory for ${namespace}/${deploymentName}`
     );
-  }
 
-  private async handleCrashLoopBackOff(
-    namespace: string,
-    podName: string,
-    event: k8s.CoreV1Event
-  ): Promise<void> {
-    console.log(`[AutoRemediation] CrashLoopBackOff for ${namespace}/${podName}`);
-    
-    // ดึง logs จาก pod ที่ crash
-    try {
-      const logs = await this.coreApi.readNamespacedPodLog(podName, namespace, undefined, undefined, false, undefined, undefined, undefined, 100);
-      console.log(`  Last 100 lines of logs:\n${logs.body.slice(-2000)}`);
-    } catch (err) {
-      console.log(`  Failed to get logs: ${err}`);
+    if (!response.ok) {
+      throw new Error(`Failed to update annotation: ${await response.text()}`);
     }
-  }
-
-  private async handleFailedScheduling(
-    namespace: string,
-    podName: string,
-    event: k8s.CoreV1Event
-  ): Promise<void> {
-    console.log(`[AutoRemediation] FailedScheduling for ${namespace}/${podName}: ${event.message}`);
-    
-    if (event.message?.includes('Insufficient memory')) {
-      await this.sendNotification(
-        `ALERT: Cluster running low on memory! Pod ${namespace}/${podName} cannot be scheduled.`
-      );
-    }
-  }
-
-  private increaseMemory(current: string, factor: number): string {
-    const units: Record<string, number> = {
-      'Ki': 1024,
-      'Mi': 1024 * 1024,
-      'Gi': 1024 * 1024 * 1024,
-    };
-
-    const match = current.match(/^(\d+)(Ki|Mi|Gi)$/);
-    if (!match) return current;
-
-    const value = parseInt(match[1]);
-    const unit = match[2];
-    const newValue = Math.ceil(value * factor);
-    
-    return `${newValue}${unit}`;
-  }
-
-  private async sendNotification(message: string): Promise<void> {
-    const webhookUrl = process.env.SLACK_WEBHOOK_URL;
-    if (!webhookUrl) return;
-
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: `🤖 K8s Auto-Remediation: ${message}`,
-        channel: '#alerts',
-      }),
-    });
-  }
-
-  stopAll(): void {
-    this.activeWatches.forEach((watch, key) => {
-      console.log(`Stopping watch: ${key}`);
-      watch.abort();
-    });
-    this.activeWatches.clear();
   }
 }
-
-// Setup Event-driven Automations
-async function main() {
-  const watcher = new KubernetesEventWatcher();
-
-  // Automation: Auto-label new pods from specific deployments
-  watcher.addAutomation({
-    name: 'auto-label-cost-center',
-    condition: (event) => {
-      return event.type === 'ADDED' &&
-        event.labels?.['auto-cost-label'] !== 'done' &&
-        event.namespace === 'production';
-    },
-    action: async (event) => {
-      console.log(`Auto-labeling pod: ${event.namespace}/${event.name}`);
-      // Implement labeling logic
-    },
-  });
-
-  // Automation: Send notification when deployment fails
-  watcher.addAutomation({
-    name: 'deployment-failure-alert',
-    condition: (event) => {
-      const deployment = event.object as k8s.V1Deployment;
-      const conditions = deployment.status?.conditions ?? [];
-      const progressing = conditions.find(c => c.type === 'Progressing');
-      return event.type === 'MODIFIED' &&
-        progressing?.status === 'False' &&
-        progressing?.reason === 'ProgressDeadlineExceeded';
-    },
-    action: async (event) => {
-      console.log(`ALERT: Deployment ${event.namespace}/${event.name} failed!`);
-      // Send notification
-    },
-  });
-
-  // Start watching
-  await Promise.all([
-    watcher.watchPods('production'),
-    watcher.watchDeployments('production'),
-    watcher.watchKubernetesEvents('production'),
-  ]);
-
-  process.on('SIGTERM', () => {
-    watcher.stopAll();
-    process.exit(0);
-  });
-
-  console.log('Event watcher started. Watching for Kubernetes events...');
-}
-
-main().catch(console.error);
 ```
 
 ---
 
-## สรุปบทที่ 80
+## สรุปตาราง Kubernetes Patterns
 
-| Pattern | เทคโนโลยี | ใช้สำหรับ |
-|---------|-----------|----------|
-| CRD | apiextensions.k8s.io/v1 | Custom Kubernetes resources |
-| Operator | @kubernetes/client-node + Informer | Automate complex application lifecycle |
-| ReconcileController | TypeScript + Exponential Backoff | Reliable state reconciliation |
-| ValidatingWebhook | Express + TLS | Enforce policies before resource creation |
-| MutatingWebhook | JSON Patch | Auto-inject sidecars, defaults |
-| API Aggregation | APIService | Extend Kubernetes API |
-| Multi-tenancy | Namespace + ResourceQuota + NetworkPolicy | Tenant isolation |
-| GitOps ArgoCD | Application + AppProject | Declarative, Git-driven deployments |
-| Namespace Lifecycle | TypeScript Manager | Automated tenant onboarding |
-| EventWatcher | k8s Watch API | Event-driven automation and auto-remediation |
+| Pattern | Use Case | Key Features |
+|---------|---------|-------------|
+| Deployment | Stateless services | Rolling updates, scaling |
+| StatefulSet | Databases, queues | Stable identity, ordered ops |
+| DaemonSet | Node agents, monitoring | One pod per node |
+| Job | One-time tasks, migration | Completion tracking |
+| CronJob | Scheduled tasks | Cron expression |
+| CRD + Operator | Custom automation | Domain-specific logic |
 
-### Key Takeaways
+| Kubernetes Feature | Purpose | Complexity |
+|-------------------|---------|-----------|
+| HPA | Auto CPU/memory scaling | Low |
+| VPA | Right-sizing resources | Medium |
+| KEDA | Event-driven scaling | Medium |
+| Admission Webhook | Policy enforcement | High |
+| CRD + Operator | Custom controllers | High |
+| GitOps (ArgoCD) | Declarative deployment | Medium |
+| Multi-tenancy RBAC | Team isolation | Medium |
 
-1. **CRD = Custom Kubernetes Resources**: สร้าง abstraction layer บน Kubernetes API
-2. **Operator Pattern = Automated Operations**: Replace manual runbooks ด้วย code
-3. **Exponential Backoff = Resilient Reconciliation**: ป้องกัน thundering herd ใน controller
-4. **Admission Webhooks = Policy Enforcement**: บังคับ best practices ก่อน resource สร้าง
-5. **Multi-tenancy ต้อง Defense-in-Depth**: Namespace + ResourceQuota + NetworkPolicy + RBAC
-6. **GitOps = Single Source of Truth**: Git เป็น desired state, ArgoCD sync เป็น actual state
-7. **EventWatcher = Proactive Operations**: ตอบสนองต่อ events อัตโนมัติ ลด MTTR
+| GitOps Principle | Implementation | Tool |
+|----------------|---------------|------|
+| Single source of truth | Git repository | GitHub/GitLab |
+| Declarative config | Kubernetes YAML | kubectl/Helm |
+| Automated sync | Pull-based CD | ArgoCD/Flux |
+| Drift detection | Continuous reconciliation | ArgoCD |
+| Audit trail | Git history | Git |
 
 ---
 
-*Part 80 จบแล้ว - จบ Series: Service Mesh Advanced, Scalability Patterns, Kubernetes Advanced Patterns*
+## สรุป
+
+Kubernetes Patterns ครอบคลุม:
+
+1. **StatefulSet** สำหรับ stateful workloads เช่น databases ที่ต้องการ stable identity
+2. **DaemonSet** สำหรับ infrastructure agents บนทุก node
+3. **Jobs/CronJobs** สำหรับ batch processing และ scheduled tasks
+4. **CRDs** ขยาย Kubernetes API ด้วย domain-specific resources
+5. **Operators** automate complex operational tasks ด้วย controller pattern
+6. **Admission Webhooks** enforce policies และ mutate resources ก่อน save
+7. **Multi-tenancy** ด้วย Namespace, RBAC, ResourceQuota, LimitRange
+8. **GitOps ด้วย ArgoCD** declarative deployment ที่ sync จาก Git repository
+9. **Custom Controllers** implement reconciliation loops สำหรับ custom behavior
+10. **ApplicationSets** deploy ไปหลาย environments อัตโนมัติ
